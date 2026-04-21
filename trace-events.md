@@ -138,6 +138,127 @@ The `ref_id` field is omitted for leaf values (Int, Float, Bool, String, None) t
 - Old decoders encountering `ValueRef` treat it as an unknown variant (graceful degradation)
 - The `ref_id` adds 0 bytes for leaf values and ~5-10 bytes for compound values (CBOR map entry)
 
+## Streaming Value Encoder API
+
+### The Problem
+
+Current flow: `Python object -> ValueRecord tree (heap allocated) -> CBOR bytes -> output buffer`
+
+Each value encoding allocates `Vec<ValueRecord>` for sequences, `Box<ValueRecord>` for variants/references, `String` for text values -- all thrown away after CBOR serialization. For a moderately complex object (e.g. a 50-field struct containing nested lists), a single value event may allocate dozens of heap objects that exist only to be serialized and immediately freed.
+
+### The Solution
+
+Direct flow: `Python object -> CBOR bytes in output buffer` (single pass, zero intermediate allocation)
+
+The recorder walks the object graph in the target language (Python, Ruby, JS, etc.) and calls streaming encoder methods that append CBOR bytes directly to the output buffer. A hash table (keyed by object identity) tracks visited objects for cycle detection. No intermediate `ValueRecord` tree is constructed.
+
+### C FFI API
+
+```c
+// Start encoding a value event (tag 5: variable_id + CBOR payload)
+void trace_writer_begin_value(trace_writer_t w, uint64_t variable_id);
+
+// Compound value openers -- append CBOR map/array header, register ref_id
+void trace_value_begin_struct(trace_writer_t w, uint32_t type_id, 
+                               uint32_t field_count, uint32_t ref_id);
+void trace_value_begin_sequence(trace_writer_t w, uint32_t type_id,
+                                 uint32_t element_count, int is_slice,
+                                 uint32_t ref_id);
+void trace_value_begin_tuple(trace_writer_t w, uint32_t type_id,
+                              uint32_t element_count, uint32_t ref_id);
+void trace_value_begin_variant(trace_writer_t w, uint32_t type_id,
+                                const char* discriminator, uint32_t ref_id);
+void trace_value_begin_reference(trace_writer_t w, uint32_t type_id,
+                                  uint64_t address, int is_mutable,
+                                  uint32_t ref_id);
+
+// Leaf value writers -- append complete CBOR value
+void trace_value_write_int(trace_writer_t w, int64_t value, uint32_t type_id);
+void trace_value_write_float(trace_writer_t w, double value, uint32_t type_id);
+void trace_value_write_bool(trace_writer_t w, int value, uint32_t type_id);
+void trace_value_write_string(trace_writer_t w, const char* text, uint32_t type_id);
+void trace_value_write_none(trace_writer_t w, uint32_t type_id);
+void trace_value_write_raw(trace_writer_t w, const char* text, uint32_t type_id);
+void trace_value_write_error(trace_writer_t w, const char* msg, uint32_t type_id);
+
+// Cycle reference -- append ValueRef record
+void trace_value_write_ref(trace_writer_t w, uint32_t ref_id);
+
+// Close compound value
+void trace_value_end(trace_writer_t w);
+
+// Finish the value event (closes the CBOR payload, writes to output stream)
+void trace_writer_end_value(trace_writer_t w);
+```
+
+### Usage Example (Python recorder pseudocode)
+
+```python
+def encode_value(writer, obj, seen):
+    obj_id = id(obj)
+    if obj_id in seen:
+        trace_value_write_ref(writer, seen[obj_id])
+        return
+    
+    ref_id = len(seen)
+    seen[obj_id] = ref_id
+    
+    if isinstance(obj, int):
+        trace_value_write_int(writer, obj, ensure_type_id(writer, "Int"))
+    elif isinstance(obj, list):
+        type_id = ensure_type_id(writer, "List")
+        trace_value_begin_sequence(writer, type_id, len(obj), False, ref_id)
+        for elem in obj:
+            encode_value(writer, elem, seen)
+        trace_value_end(writer)
+    elif isinstance(obj, dict):
+        # ... similar
+```
+
+### Internal Implementation
+
+The streaming encoder maintains a stack of compound values being built:
+
+```nim
+type
+  CompoundFrame = object
+    kind: CompoundKind  # struct, sequence, tuple, variant, reference
+    expectedChildren: int
+    writtenChildren: int
+
+  StreamingValueEncoder = object
+    buffer: ptr SafeBuffer     # Points to the TraceWriter's event buffer
+    stack: array[32, CompoundFrame]  # Fixed-size stack (max nesting depth 32)
+    stackDepth: int
+    payloadStart: int          # Position where CBOR payload began (for length patching)
+```
+
+When `begin_struct` is called:
+1. Write CBOR map header (field_count + 2 for "kind" and "type_id" and optionally "ref_id")
+2. Write "kind" key + variant name
+3. Write "type_id" key + value
+4. If ref_id != 0: write "ref_id" key + value
+5. Push frame onto stack
+
+When leaf value writers are called within a compound:
+- Write the CBOR field name (for structs) or just the value (for sequences)
+- Increment writtenChildren
+
+When `end` is called:
+- Pop frame, verify writtenChildren == expectedChildren
+
+When `end_value` is called:
+- Verify stack is empty
+- The CBOR payload is complete in the buffer
+
+### Key Properties
+
+1. **Zero intermediate allocation**: No ValueRecord tree, no Vec, no Box, no String copying
+2. **Single pass**: Bytes are appended during the object walk, not after
+3. **Bounded stack**: Fixed 32-entry stack (max nesting depth) -- no heap allocation
+4. **Cycle safe**: The `seen` hash table is maintained by the caller (the recorder), not by the encoder
+5. **Compatible**: The CBOR output is byte-identical to what the current two-pass approach produces
+
 ### TypeRecord
 
 - `kind: TypeKind` (u8 enum -- Seq, Set, HashSet, OrderedSet, Array, Varargs, Struct, Int, Float, String, CString, Char, Bool, Literal, Ref, Recursion, Raw, Enum, Enum16, Enum32, C, TableKind, Union, Pointer, Error, FunctionKind, TypeValue, Tuple, Variant, Html, None, NonExpanded, Any, Slice)
