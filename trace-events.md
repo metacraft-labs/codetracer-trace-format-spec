@@ -287,6 +287,67 @@ When `end_value` is called:
 | 12 | TraceLogEvent |
 | 13 | EvmEvent |
 
+## Raw Byte Fidelity
+
+Trace recorders must preserve the exact bytes present in memory for all captured values. The trace format must not transform, validate, or sanitize value data during recording.
+
+### Requirements
+
+1. **No UTF-8 validation**: String values may contain invalid UTF-8, surrogate pairs, or arbitrary byte sequences. The recorder captures the raw bytes without validation or replacement.
+
+2. **No null termination**: Byte buffers may contain embedded null bytes (`\0`). The recorder uses length-prefixed encoding, not null-terminated C strings.
+
+3. **No encoding conversion**: The recorder does not convert between encodings (e.g., Latin-1 to UTF-8). The original bytes are stored as-is.
+
+4. **Byte string encoding**: All captured values use CBOR **byte strings** (major type 2) in the wire format, not text strings (major type 3). Text strings (major type 3) are reserved for trace metadata (field names, type names, function names) where UTF-8 validity is guaranteed by the recorder itself.
+
+### Wire Format
+
+In the CBOR payload of value events:
+
+| Field | CBOR type | Reason |
+|-------|-----------|--------|
+| ValueRecord string values (`text` in String, `r` in Raw) | Byte string (type 2) | May contain invalid UTF-8 |
+| Variable names | Text string (type 3) | Controlled by recorder, always valid UTF-8 |
+| Function names | Text string (type 3) | Controlled by language runtime |
+| Type names | Text string (type 3) | Controlled by language runtime |
+| CBOR map keys ("kind", "type_id", etc.) | Text string (type 3) | Fixed vocabulary |
+
+### C FFI Implications
+
+The streaming value encoder C API uses `const uint8_t* data, size_t len` pairs instead of `const char*` for value data:
+
+```c
+// Old (wrong — truncates at null, assumes UTF-8):
+void trace_value_write_string(trace_writer_t w, const char* text, uint32_t type_id);
+
+// New (correct — preserves arbitrary bytes):
+void trace_value_write_string(trace_writer_t w, const uint8_t* data, size_t len, uint32_t type_id);
+void trace_value_write_raw(trace_writer_t w, const uint8_t* data, size_t len, uint32_t type_id);
+```
+
+### Display Layer
+
+The debugger UI (not the recorder) is responsible for:
+- Attempting UTF-8 decoding for display
+- Showing hex escape sequences for non-UTF-8 bytes
+- Indicating encoding issues (e.g., "contains invalid UTF-8")
+
+This separation ensures the trace is a faithful record of program state, regardless of how the UI chooses to present it.
+
+### Known Issues in Current Recorders
+
+These must be fixed as part of the byte fidelity audit:
+
+| Recorder | Issue | Fix |
+|----------|-------|-----|
+| Python (PyO3) | `value.extract::<String>()` does UTF-8 validation, may reject or transform surrogates | Use `value.extract::<Vec<u8>>()` or `value.as_bytes()` |
+| Python (PyO3) | `value.str()` calls Python `str()` which may transform repr | Capture `bytes` representation where possible |
+| C FFI | `const char*` parameters truncate at `\0` | Use `(const uint8_t*, size_t)` pairs |
+| Nim FFI | `cstring` parameters truncate at `\0` | Use `(ptr byte, cint)` pairs |
+| Ruby | `to_s` may transcode strings | Use `bytes` method to get raw encoding |
+| All | CBOR text string (type 3) for values | Switch to byte string (type 2) |
+
 ## Split-Binary Encoding (default)
 
 The split-binary format uses compact binary encoding for event envelopes (fixed-size fields) and falls back to CBOR only for dynamic payloads (ValueRecord, TypeRecord, AssignmentRecord). This gives better compression ratios and faster decoding than pure CBOR.
