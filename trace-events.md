@@ -52,6 +52,91 @@ CodeTracer records program execution as a stream of `TraceLowLevelEvent` values.
 | `Cell` | `place: i64` |
 | `BigInt` | `b: Vec<u8>` (base64 in JSON), `negative: bool`, `type_id: usize` |
 | `Char` | `c: char`, `type_id: usize` |
+| `ValueRef` | `ref_id: u32` |
+
+All compound variants (`Sequence`, `Tuple`, `Struct`, `Variant`, `Reference`) carry an optional `ref_id: Option<u32>` field used for cyclic value encoding (see below). The field is omitted for leaf values.
+
+## Cyclic Value Encoding
+
+Languages like Python, Ruby, and JavaScript allow cyclic object references:
+
+```python
+a = []
+a.append(a)  # a[0] is a itself
+```
+
+The `ValueRecord` type supports cycles through two mechanisms:
+
+### Value Reference (ValueRecord variant)
+
+A new `ValueRecord` variant:
+
+```
+ValueRef { ref_id: u32 }
+```
+
+Tag in CBOR: map with `{"kind": "ValueRef", "ref_id": N}`
+
+### Encoding Protocol
+
+During value encoding, the encoder maintains a mapping from object identity (memory address or language-level `id()`) to a monotonically increasing reference ID:
+
+```
+seen: HashMap<ObjectId, u32>
+next_ref_id: u32 = 0
+
+function encode(obj):
+    if obj.id in seen:
+        return ValueRef { ref_id: seen[obj.id] }
+    
+    ref_id = next_ref_id
+    next_ref_id += 1
+    seen[obj.id] = ref_id
+    
+    // Encode normally (recurse into children)
+    record = encode_fields(obj)
+    record.ref_id = ref_id  // Tag this node with its ref_id for the decoder
+    return record
+```
+
+### Decoding Protocol
+
+The decoder builds the inverse mapping:
+
+```
+refs: HashMap<u32, ValueRecord>
+
+function decode(record):
+    if record is ValueRef:
+        return refs[record.ref_id]  // Return previously decoded node
+    
+    refs[record.ref_id] = record  // Register before recursing (handles cycles)
+    decode children...
+    return record
+```
+
+### Wire Format
+
+In the CBOR payload of value events, each `ValueRecord` that might be part of a cycle carries an optional `ref_id` field:
+
+```json
+{
+  "kind": "Struct",
+  "ref_id": 0,
+  "field_values": [
+    {"kind": "ValueRef", "ref_id": 0}
+  ],
+  "type_id": 5
+}
+```
+
+The `ref_id` field is omitted for leaf values (Int, Float, Bool, String, None) that cannot be part of cycles.
+
+### Impact on Existing Traces
+
+- Old traces without `ref_id` fields remain readable (the field is optional)
+- Old decoders encountering `ValueRef` treat it as an unknown variant (graceful degradation)
+- The `ref_id` adds 0 bytes for leaf values and ~5-10 bytes for compound values (CBOR map entry)
 
 ### TypeRecord
 
