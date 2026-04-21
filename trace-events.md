@@ -27,7 +27,7 @@ The `ensure_*_id()` API in the trace writer appends a record to the correspondin
 
 Different UI panels need different data, so the event stream is split into separate streams. Each stream is stored in its own CTFS internal file and can be loaded, compressed, and cached independently.
 
-#### 1. Execution Stream (`exec.dat`) — the main timeline, one record per step
+#### 1. Execution Stream (`steps.dat`) — the main timeline, one record per step
 
 This is what the debugger steps through. Each record is compact and fixed-size where possible.
 
@@ -45,7 +45,7 @@ DeltaStep inherits the previous step's call_key (same function, sequential lines
 
 Raise is emitted when an exception is raised (before unwinding). Catch is emitted when a `try/except` handler catches the exception.
 
-#### 2. Value Stream (`values.dat`) — variable values, parallel-indexed by step
+#### 2. Value Stream (`steps.dat`) — variable values, parallel-indexed by step
 
 One record per step, containing all variable values visible at that step. This is the largest stream (values are variable-length and numerous).
 
@@ -62,7 +62,7 @@ One record per step, containing all variable values visible at that step. This i
 | 8 | VariableCell | variable_id: varint, place: varint |
 | 9 | Assignment | to: varint, pass_by: u8, from: varint |
 
-The value stream is indexed in parallel with the execution stream — record N in `values.dat` corresponds to step N in `exec.dat`. For steps with no variables (possible), the record is empty (just a zero count).
+The value stream is indexed in parallel with the execution stream — record N in `steps.dat` corresponds to step N in `steps.dat`. For steps with no variables (possible), the record is empty (just a zero count).
 
 #### 3. Call Stream (`calls.dat`) — call tree records, one per function call
 
@@ -93,14 +93,14 @@ Call records are written when the function returns (not at call entry), so they 
 | metadata | length-prefixed bytes |
 | content | length-prefixed bytes |
 
-`step_id` serves as the time coordinate — it references the step in `exec.dat` when this I/O event occurred. The event log pane loads pages from `events.dat` directly without touching the execution or value streams.
+`step_id` serves as the time coordinate — it references the step in `steps.dat` when this I/O event occurred. The event log pane loads pages from `events.dat` directly without touching the execution or value streams.
 
 #### Stream Summary
 
 | Stream | CTFS File | Purpose | Access Pattern | Typical Record Size |
 |--------|-----------|---------|----------------|-------------------|
-| Execution | `exec.dat` | Step-by-step timeline | Sequential scan, point lookup | 2-4 bytes |
-| Values | `values.dat` | Variable values per step | Point lookup (parallel to exec) | 50-500 bytes |
+| Execution | `steps.dat` | Step-by-step timeline | Sequential scan, point lookup | 2-4 bytes |
+| Values | `steps.dat` | Variable values per step | Point lookup (parallel to exec) | 50-500 bytes |
 | Calls | `calls.dat` | Call tree | Random access by call_key | 20-200 bytes |
 | IO Events | `events.dat` | I/O event log | Paginated scan | 20-1000 bytes |
 | Interning | `*.dat` + `*.off` | Paths, functions, types, names | Loaded at startup | Total 1-5MB |
@@ -109,9 +109,9 @@ Call records are written when the function returns (not at call entry), so they 
 
 1. **Event log loads instantly**: `events.dat` is independent, small, directly paginated
 2. **Call tree loads independently**: `calls.dat` is indexed by call_key, no step scanning needed
-3. **Step navigation is fast**: `exec.dat` records are tiny (2-4 bytes), so chunks hold thousands of steps
-4. **Value loading is on-demand**: `values.dat` only loaded for the current step's variables
-5. **Streams compress independently**: DeltaStep-heavy `exec.dat` compresses extremely well; value-heavy `values.dat` gets different Zstd settings
+3. **Step navigation is fast**: `steps.dat` records are tiny (2-4 bytes), so chunks hold thousands of steps
+4. **Value loading is on-demand**: `steps.dat` only loaded for the current step's variables
+5. **Streams compress independently**: DeltaStep-heavy `steps.dat` compresses extremely well; value-heavy `steps.dat` gets different Zstd settings
 
 ### Varint IDs
 
@@ -126,7 +126,7 @@ This dramatically reduces per-event size. Combined with DeltaStep, the average e
 
 Events are no longer in a single stream. Each event type belongs to exactly one of the four streams described above.
 
-### Execution Stream Events (`exec.dat`)
+### Execution Stream Events (`steps.dat`)
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
@@ -136,7 +136,7 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
 | 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
 
-### Value Stream Events (`values.dat`)
+### Value Stream Events (`steps.dat`)
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
