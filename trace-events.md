@@ -2,17 +2,69 @@
 
 CodeTracer records program execution as a stream of `TraceLowLevelEvent` values. Each event captures one atomic action: a step to a source line, a function call, a variable binding, etc.
 
+## Event Stream Redesign
+
+Interning events (Path, Function, Type, VariableName) are not part of the event stream. They are stored as CTFS interning tables — append-only variable-size record tables with offset indices:
+
+| Old Event | CTFS Table | Record Content |
+|-----------|------------|----------------|
+| Path (tag 1) | `paths.dat` + `paths.off` | File path (bytes) |
+| VariableName (tag 2) | `varnames.dat` + `varnames.off` | Variable name (bytes) |
+| Variable (tag 3) | Removed (legacy) | — |
+| Type (tag 4) | `types.dat` + `types.off` | TypeKind (u8) + lang_type (bytes) + specific_info (binary) |
+| Function (tag 6) | `functions.dat` + `functions.off` | global_line_index (varint) + name (bytes) |
+
+The `ensure_*_id()` API in the trace writer appends a record to the corresponding table and returns its index (0-based). The index is used in subsequent events (Step references path via global line index, Call references function by index, Value references variable name and type by index).
+
+### Benefits
+
+1. **Smaller event stream**: Interning events were ~15-20% of stream volume. Removing them reduces stream size and improves compression ratio.
+2. **Random-access interning**: The seek-based reader loads interning tables at startup (they're small: typically 1-5MB total). No need to scan the event stream to discover paths/functions/types.
+3. **No ordering dependency**: Events no longer require "Path must appear before Step referencing it." The interning tables are self-contained.
+4. **Simpler encoder**: The `ensure_*_id()` call either finds an existing entry or appends a new one. No event emission needed.
+
+### Remaining Event Stream Events
+
+The event stream contains only execution flow, values, and I/O:
+
+| Tag | Event | Fields | Size |
+|-----|-------|--------|------|
+| 0 | AbsoluteStep | global_line_index: varint | 1 + varint (2-4 bytes) |
+| 24 | DeltaStep | delta: signed varint | 1 + varint (2 bytes typical) |
+| 5 | Value | name_id: varint, value: (streaming CBOR) | 1 + varint + value_bytes |
+| 7 | Call | function_id: varint, has_args: bit flag | 1 + varint (+ args if present) |
+| 8 | Return | has_value: bit flag | 1 byte (void) or 1 + value_bytes |
+| 25 | VoidReturn | *(none)* | 1 byte |
+| 9 | Event | kind: u8, metadata: bytes, content: bytes | 2 + meta + content |
+| 10 | Asm | lines: [bytes] | 5 + sum |
+| 11 | BindVariable | variable_id: varint, place: varint | 1 + 2 varints |
+| 12 | Assignment | to: varint, pass_by: u8, from: varint | 1 + varints |
+| 13 | DropVariables | count: varint, ids: [varint] | 1 + varints |
+| 14-18 | Cell/Compound | place: varint, value: (streaming CBOR) | varies |
+| 19 | DropVariable | variable_id: varint | 1 + varint |
+| 20-22 | Thread events | thread_id: varint | 1 + varint |
+| 23 | DropLastStep | *(none)* | 1 byte |
+
+### Varint IDs
+
+Note that ALL IDs in the redesigned events use **varints** instead of fixed u64 LE:
+- variable_id, function_id, type_id, name_id: typically 1-2 bytes (values < 16384)
+- global_line_index: typically 2-3 bytes
+- place: varint (signed zigzag for negative places)
+
+This dramatically reduces per-event size. Combined with DeltaStep, the average event size drops from ~15 bytes to ~4 bytes.
+
 ## TraceLowLevelEvent Variants
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
 | 0 | `Step` | `path_id: usize`, `line: i64` | Execution stepped to a source line |
-| 1 | `Path` | `path: String` (PathBuf) | Register a source file path (must appear before any Step referencing it) |
-| 2 | `VariableName` | `name: String` | Intern a new variable name |
-| 3 | `Variable` | `name: String` | Intern a variable name (legacy, backward compat) |
-| 4 | `Type` | `record: TypeRecord` | Register a type (must appear before Value referencing it) |
+| 1 | `Path` | `path: String` (PathBuf) | **Removed from event stream** — stored in CTFS interning tables (`paths.dat` + `paths.off`) |
+| 2 | `VariableName` | `name: String` | **Removed from event stream** — stored in CTFS interning tables (`varnames.dat` + `varnames.off`) |
+| 3 | `Variable` | `name: String` | **Removed from event stream** — stored in CTFS interning tables (legacy, removed) |
+| 4 | `Type` | `record: TypeRecord` | **Removed from event stream** — stored in CTFS interning tables (`types.dat` + `types.off`) |
 | 5 | `Value` | `variable_id: usize`, `value: ValueRecord` | Full value for a variable |
-| 6 | `Function` | `path_id: usize`, `line: i64`, `name: String` | Register a function (must appear before Call referencing it) |
+| 6 | `Function` | `path_id: usize`, `line: i64`, `name: String` | **Removed from event stream** — stored in CTFS interning tables (`functions.dat` + `functions.off`) |
 | 7 | `Call` | `function_id: usize`, `args: Vec<FullValueRecord>` | Function call |
 | 8 | `Return` | `return_value: ValueRecord` | Function return |
 | 9 | `Event` | `kind: EventLogKind (u8)`, `metadata: String`, `content: String` | I/O or log event |
@@ -30,6 +82,8 @@ CodeTracer records program execution as a stream of `TraceLowLevelEvent` values.
 | 21 | `ThreadExit` | `thread_id: u64` | A thread exited |
 | 22 | `ThreadSwitch` | `thread_id: u64` | Execution switched to a different thread |
 | 23 | `DropLastStep` | *(none)* | Discard the previous Step (workaround for append-only streams) |
+| 24 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index |
+| 25 | `VoidReturn` | *(none)* | Function return with no value (1 byte, no payload) |
 
 ## Key Sub-types
 
