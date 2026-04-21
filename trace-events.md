@@ -125,6 +125,54 @@ Each event is encoded as a concatenation of:
 
 Where `str` means: `length(u32 LE) + utf8_bytes`, and `cbor(T)` means: `cbor_length(u32 LE) + cbor_bytes`.
 
+## Compact Step Encoding
+
+Step events use two variants for efficient encoding:
+
+### AbsoluteStep (Tag 0)
+
+Used at function entry, after large jumps, or when the delta would exceed DeltaStep's range.
+
+```
+[Tag: 0x00] [global_line_index: u64 LE]
+Total: 9 bytes
+```
+
+### DeltaStep (Tag 24)
+
+Used for consecutive steps within the same function or nearby code. Stores the signed delta from the previous step's global line index.
+
+```
+[Tag: 0x18] [delta: signed varint]
+Total: 2 bytes typical (1 tag + 1 varint for delta ±63)
+```
+
+The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then unsigned LEB128.
+
+| Delta range | Varint size | Total event size |
+|-------------|------------|-----------------|
+| ±63 | 1 byte | 2 bytes |
+| ±8191 | 2 bytes | 3 bytes |
+| ±1048575 | 3 bytes | 4 bytes |
+| Larger | Use AbsoluteStep | 9 bytes |
+
+### Encoding Rules
+
+1. The first step in a trace is always AbsoluteStep
+2. After a Call event, the next step is AbsoluteStep (new function context)
+3. After a Return event, the next step is AbsoluteStep (returning to caller)
+4. All other steps use DeltaStep if the delta fits in 3 varint bytes (±1048575), otherwise AbsoluteStep
+
+### Compression Impact
+
+In a typical trace, ~80-90% of steps are sequential lines within a function (delta +1 or small positive). With DeltaStep:
+
+- Most steps: 2 bytes (down from 17 bytes) — 8.5x reduction
+- Function entry/return: 9 bytes (same as before)
+- Weighted average: ~3 bytes per step
+
+Combined with Zstd compression on the already-compact delta stream, effective per-step storage drops below 1 byte.
+
 ### Chunked compression
 
 In split-binary mode, events are grouped into **chunks** of `chunk_size` events (default: 4096). Each chunk is independently Zstd-compressed with an inline 16-byte header:
