@@ -23,27 +23,95 @@ The `ensure_*_id()` API in the trace writer appends a record to the correspondin
 3. **No ordering dependency**: Events no longer require "Path must appear before Step referencing it." The interning tables are self-contained.
 4. **Simpler encoder**: The `ensure_*_id()` call either finds an existing entry or appends a new one. No event emission needed.
 
-### Remaining Event Stream Events
+### Multi-Stream Architecture
 
-The event stream contains only execution flow, values, and I/O:
+Different UI panels need different data, so the event stream is split into separate streams. Each stream is stored in its own CTFS internal file and can be loaded, compressed, and cached independently.
+
+#### 1. Execution Stream (`exec.dat`) — the main timeline, one record per step
+
+This is what the debugger steps through. Each record is compact and fixed-size where possible.
 
 | Tag | Event | Fields | Size |
 |-----|-------|--------|------|
-| 0 | AbsoluteStep | global_line_index: varint | 1 + varint (2-4 bytes) |
-| 24 | DeltaStep | delta: signed varint | 1 + varint (2 bytes typical) |
-| 5 | Value | name_id: varint, value: (streaming CBOR) | 1 + varint + value_bytes |
-| 7 | Call | function_id: varint, has_args: bit flag | 1 + varint (+ args if present) |
-| 8 | Return | has_value: bit flag | 1 byte (void) or 1 + value_bytes |
-| 25 | VoidReturn | *(none)* | 1 byte |
-| 9 | Event | kind: u8, metadata: bytes, content: bytes | 2 + meta + content |
-| 10 | Asm | lines: [bytes] | 5 + sum |
-| 11 | BindVariable | variable_id: varint, place: varint | 1 + 2 varints |
-| 12 | Assignment | to: varint, pass_by: u8, from: varint | 1 + varints |
-| 13 | DropVariables | count: varint, ids: [varint] | 1 + varints |
-| 14-18 | Cell/Compound | place: varint, value: (streaming CBOR) | varies |
-| 19 | DropVariable | variable_id: varint | 1 + varint |
-| 20-22 | Thread events | thread_id: varint | 1 + varint |
-| 23 | DropLastStep | *(none)* | 1 byte |
+| 0 | AbsoluteStep | global_line_index: varint, call_key: varint | ~4 bytes |
+| 1 | DeltaStep | delta: signed varint | 2 bytes |
+| 2 | Raise | exception_type_id: varint, message_len: varint, message: bytes | varies |
+| 3 | Catch | exception_type_id: varint | ~2 bytes |
+| 4 | ThreadSwitch | thread_id: varint | 2 bytes |
+
+Note: AbsoluteStep now includes `call_key` (the call this step belongs to). This is the "embedded call context" from the Seek-Based CTFS Reader spec — it means looking up a step's call doesn't require a separate seek.
+
+DeltaStep inherits the previous step's call_key (same function, sequential lines).
+
+Raise is emitted when an exception is raised (before unwinding). Catch is emitted when a `try/except` handler catches the exception.
+
+#### 2. Value Stream (`values.dat`) — variable values, parallel-indexed by step
+
+One record per step, containing all variable values visible at that step. This is the largest stream (values are variable-length and numerous).
+
+| Tag | Event | Fields |
+|-----|-------|--------|
+| 0 | StepValues | count: varint, then count × (name_id: varint, value: streaming CBOR) |
+| 1 | BindVariable | variable_id: varint, place: varint |
+| 2 | DropVariable | variable_id: varint |
+| 3 | DropVariables | count: varint, ids: [varint] |
+| 4 | CellValue | place: varint, value: streaming CBOR |
+| 5 | CompoundValue | place: varint, value: streaming CBOR |
+| 6 | AssignCell | place: varint, new_value: streaming CBOR |
+| 7 | AssignCompoundItem | place: varint, index: varint, item_place: varint |
+| 8 | VariableCell | variable_id: varint, place: varint |
+| 9 | Assignment | to: varint, pass_by: u8, from: varint |
+
+The value stream is indexed in parallel with the execution stream — record N in `values.dat` corresponds to step N in `exec.dat`. For steps with no variables (possible), the record is empty (just a zero count).
+
+#### 3. Call Stream (`calls.dat`) — call tree records, one per function call
+
+Each record represents a complete function call with entry/exit information.
+
+| Field | Type |
+|-------|------|
+| call_key | varint |
+| function_id | varint |
+| parent_key | varint (-1 for root) |
+| first_step_id | varint |
+| last_step_id | varint |
+| depth | varint |
+| children_count | varint |
+| children_keys | [varint] × children_count |
+| args | streaming CBOR (or empty if no args) |
+| return_value | streaming CBOR (or VoidReturn marker) |
+| raised_exception | optional: streaming CBOR (if call ended with unhandled raise) |
+
+Call records are written when the function returns (not at call entry), so they contain complete information. The `call_key` is a sequential index assigned at call entry.
+
+#### 4. IO Event Stream (`events.dat`) — I/O events for the event log pane
+
+| Field | Type |
+|-------|------|
+| kind | u8 (EventLogKind) |
+| step_id | varint (cross-reference to execution stream) |
+| metadata | length-prefixed bytes |
+| content | length-prefixed bytes |
+
+`step_id` serves as the time coordinate — it references the step in `exec.dat` when this I/O event occurred. The event log pane loads pages from `events.dat` directly without touching the execution or value streams.
+
+#### Stream Summary
+
+| Stream | CTFS File | Purpose | Access Pattern | Typical Record Size |
+|--------|-----------|---------|----------------|-------------------|
+| Execution | `exec.dat` | Step-by-step timeline | Sequential scan, point lookup | 2-4 bytes |
+| Values | `values.dat` | Variable values per step | Point lookup (parallel to exec) | 50-500 bytes |
+| Calls | `calls.dat` | Call tree | Random access by call_key | 20-200 bytes |
+| IO Events | `events.dat` | I/O event log | Paginated scan | 20-1000 bytes |
+| Interning | `*.dat` + `*.off` | Paths, functions, types, names | Loaded at startup | Total 1-5MB |
+
+#### Benefits
+
+1. **Event log loads instantly**: `events.dat` is independent, small, directly paginated
+2. **Call tree loads independently**: `calls.dat` is indexed by call_key, no step scanning needed
+3. **Step navigation is fast**: `exec.dat` records are tiny (2-4 bytes), so chunks hold thousands of steps
+4. **Value loading is on-demand**: `values.dat` only loaded for the current step's variables
+5. **Streams compress independently**: DeltaStep-heavy `exec.dat` compresses extremely well; value-heavy `values.dat` gets different Zstd settings
 
 ### Varint IDs
 
@@ -54,36 +122,88 @@ Note that ALL IDs in the redesigned events use **varints** instead of fixed u64 
 
 This dramatically reduces per-event size. Combined with DeltaStep, the average event size drops from ~15 bytes to ~4 bytes.
 
-## TraceLowLevelEvent Variants
+## Event Variants by Stream
+
+Events are no longer in a single stream. Each event type belongs to exactly one of the four streams described above.
+
+### Execution Stream Events (`exec.dat`)
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
-| 0 | `Step` | `path_id: usize`, `line: i64` | Execution stepped to a source line |
-| 1 | `Path` | `path: String` (PathBuf) | **Removed from event stream** — stored in CTFS interning tables (`paths.dat` + `paths.off`) |
-| 2 | `VariableName` | `name: String` | **Removed from event stream** — stored in CTFS interning tables (`varnames.dat` + `varnames.off`) |
-| 3 | `Variable` | `name: String` | **Removed from event stream** — stored in CTFS interning tables (legacy, removed) |
-| 4 | `Type` | `record: TypeRecord` | **Removed from event stream** — stored in CTFS interning tables (`types.dat` + `types.off`) |
-| 5 | `Value` | `variable_id: usize`, `value: ValueRecord` | Full value for a variable |
-| 6 | `Function` | `path_id: usize`, `line: i64`, `name: String` | **Removed from event stream** — stored in CTFS interning tables (`functions.dat` + `functions.off`) |
-| 7 | `Call` | `function_id: usize`, `args: Vec<FullValueRecord>` | Function call |
-| 8 | `Return` | `return_value: ValueRecord` | Function return |
-| 9 | `Event` | `kind: EventLogKind (u8)`, `metadata: String`, `content: String` | I/O or log event |
-| 10 | `Asm` | `lines: Vec<String>` | Assembly instructions |
-| 11 | `BindVariable` | `variable_id: usize`, `place: i64` | Bind a variable to a memory place |
-| 12 | `Assignment` | `record: AssignmentRecord` | Variable assignment or parameter passing |
-| 13 | `DropVariables` | `ids: Vec<usize>` | Drop multiple variables (end of scope) |
-| 14 | `CompoundValue` | `place: i64`, `value: ValueRecord` | Experimental: compound value at a place |
-| 15 | `CellValue` | `place: i64`, `value: ValueRecord` | Experimental: cell value at a place |
-| 16 | `AssignCompoundItem` | `place: i64`, `index: usize`, `item_place: i64` | Experimental: assign to compound item |
-| 17 | `AssignCell` | `place: i64`, `new_value: ValueRecord` | Experimental: assign to cell |
-| 18 | `VariableCell` | `variable_id: usize`, `place: i64` | Experimental: associate variable with cell |
-| 19 | `DropVariable` | `variable_id: usize` | Drop a single variable |
-| 20 | `ThreadStart` | `thread_id: u64` | A new thread started |
-| 21 | `ThreadExit` | `thread_id: u64` | A thread exited |
-| 22 | `ThreadSwitch` | `thread_id: u64` | Execution switched to a different thread |
-| 23 | `DropLastStep` | *(none)* | Discard the previous Step (workaround for append-only streams) |
-| 24 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index |
-| 25 | `VoidReturn` | *(none)* | Function return with no value (1 byte, no payload) |
+| 0 | `AbsoluteStep` | `global_line_index: varint`, `call_key: varint` | Execution stepped to a source line (with embedded call context) |
+| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index (inherits call_key) |
+| 2 | `Raise` | `exception_type_id: varint`, `message_len: varint`, `message: bytes` | Exception raised (before unwinding) |
+| 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
+| 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
+
+### Value Stream Events (`values.dat`)
+
+| Tag | Variant | Fields | Description |
+|-----|---------|--------|-------------|
+| 0 | `StepValues` | `count: varint`, then count × (`name_id: varint`, `value: streaming CBOR`) | All variable values visible at this step |
+| 1 | `BindVariable` | `variable_id: varint`, `place: varint` | Bind a variable to a memory place |
+| 2 | `DropVariable` | `variable_id: varint` | Drop a single variable |
+| 3 | `DropVariables` | `count: varint`, `ids: [varint]` | Drop multiple variables (end of scope) |
+| 4 | `CellValue` | `place: varint`, `value: streaming CBOR` | Cell value at a place |
+| 5 | `CompoundValue` | `place: varint`, `value: streaming CBOR` | Compound value at a place |
+| 6 | `AssignCell` | `place: varint`, `new_value: streaming CBOR` | Assign to cell |
+| 7 | `AssignCompoundItem` | `place: varint`, `index: varint`, `item_place: varint` | Assign to compound item |
+| 8 | `VariableCell` | `variable_id: varint`, `place: varint` | Associate variable with cell |
+| 9 | `Assignment` | `to: varint`, `pass_by: u8`, `from: varint` | Variable assignment or parameter passing |
+
+### Call Stream Records (`calls.dat`)
+
+Call records are not tagged events — each record is a complete function call written when the function returns.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `call_key` | varint | Sequential index assigned at call entry |
+| `function_id` | varint | Reference to interning table |
+| `parent_key` | varint (-1 for root) | Parent call's call_key |
+| `first_step_id` | varint | First step in this call |
+| `last_step_id` | varint | Last step in this call |
+| `depth` | varint | Call stack depth |
+| `children_count` | varint | Number of child calls |
+| `children_keys` | [varint] × children_count | Child call keys |
+| `args` | streaming CBOR (or empty) | Function arguments |
+| `return_value` | streaming CBOR (or VoidReturn marker) | Return value |
+| `raised_exception` | optional: streaming CBOR | Present if call ended with unhandled raise |
+
+### IO Event Stream Records (`events.dat`)
+
+IO event records are not tagged — each record has a fixed structure.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kind` | u8 (EventLogKind) | Event category |
+| `step_id` | varint | Cross-reference to execution stream step |
+| `metadata` | length-prefixed bytes | Event metadata |
+| `content` | length-prefixed bytes | Event content |
+
+### Interning Tables (unchanged)
+
+| Old Event | CTFS Table | Record Content |
+|-----------|------------|----------------|
+| Path (tag 1) | `paths.dat` + `paths.off` | File path (bytes) |
+| VariableName (tag 2) | `varnames.dat` + `varnames.off` | Variable name (bytes) |
+| Variable (tag 3) | Removed (legacy) | — |
+| Type (tag 4) | `types.dat` + `types.off` | TypeKind (u8) + lang_type (bytes) + specific_info (binary) |
+| Function (tag 6) | `functions.dat` + `functions.off` | global_line_index (varint) + name (bytes) |
+
+### Removed Events
+
+The following events from the legacy single-stream format have been removed or subsumed:
+
+| Old Tag | Old Variant | Disposition |
+|---------|-------------|-------------|
+| 7 | `Call` | Subsumed by call records in `calls.dat` |
+| 8 | `Return` | Subsumed by call records in `calls.dat` (return_value field) |
+| 25 | `VoidReturn` | Subsumed by VoidReturn marker in call records |
+| 9 | `Event` | Moved to `events.dat` as IO event records |
+| 10 | `Asm` | Removed (unused by current recorders) |
+| 20 | `ThreadStart` | Removed (can be inferred from first ThreadSwitch to a new thread_id) |
+| 21 | `ThreadExit` | Removed (can be inferred from last step in a thread) |
+| 23 | `DropLastStep` | Removed (no longer needed — multi-stream writer can correct in place) |
 
 ## Key Sub-types
 
@@ -324,22 +444,19 @@ When `end_value` is called:
 
 ### EventLogKind (u8 enum)
 
-| Value | Kind |
-|-------|------|
-| 0 | Write |
-| 1 | WriteFile |
-| 2 | WriteOther |
-| 3 | Read |
-| 4 | ReadFile |
-| 5 | ReadOther |
-| 6 | ReadDir |
-| 7 | OpenDir |
-| 8 | CloseDir |
-| 9 | Socket |
-| 10 | Open |
-| 11 | Error |
-| 12 | TraceLogEvent |
-| 13 | EvmEvent |
+| Value | Kind | Description |
+|-------|------|-------------|
+| 0 | Stdout | Standard output write |
+| 1 | Stderr | Standard error write |
+| 2 | Stdin | Standard input read |
+| 3 | FileWrite | File write |
+| 4 | FileRead | File read |
+| 5 | NetworkSend | Network send |
+| 6 | NetworkRecv | Network receive |
+| 7 | Error | Uncaught exception / error |
+| 8 | Log | Application log message |
+
+Removed unused kinds (ReadDir, OpenDir, CloseDir, Socket, Open — these can be re-added when recorders actually emit them).
 
 ## Raw Byte Fidelity
 
