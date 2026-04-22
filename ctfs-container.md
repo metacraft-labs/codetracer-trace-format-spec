@@ -30,7 +30,7 @@ Block 0 begins with a 16-byte header.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0--4 | 5 | Magic | `C0 DE 72 AC E2` ("CODE TRACE") |
-| 5 | 1 | Version | `3` |
+| 5 | 1 | Version | `4` |
 | 6 | 1 | Encryption | `0` = none, `1` = AES-256-GCM |
 | 7 | 1 | MaxShards | Maximum shard count (`0` = no sharding) |
 | 8--11 | 4 | BlockSize | Block size in bytes (u32 LE, default 4096) |
@@ -39,7 +39,7 @@ Block 0 begins with a 16-byte header.
 ```c
 struct ContainerHeader {
     uint8_t  magic[5];          // C0 DE 72 AC E2
-    uint8_t  version;           // 3
+    uint8_t  version;           // 4
     uint8_t  encryption;        // 0=none, 1=AES-256-GCM
     uint8_t  max_shards;        // 0 = no sharding
     uint32_t block_size;        // default 4096
@@ -86,6 +86,7 @@ Data block allocation begins at block number `root_blocks`.
 
 | Version | Description |
 |---------|-------------|
+| 4 | Query protocol, network reader, replication, RAM cache, cached trace reader. Backward compatible: v4 readers accept v3 and v2 containers. |
 | 3 | 16-byte header with encryption; binary metadata; BlockSize 4096; MaxRootEntries 0 auto-fill; small file optimization; namespaces |
 | 2 | Extended header with BlockSize and MaxRootEntries |
 | 1 | Initial format |
