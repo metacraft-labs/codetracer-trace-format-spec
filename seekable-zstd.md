@@ -1,84 +1,90 @@
-# Seekable Zstd Compression
+# Compression and Seeking in CTFS
 
-CodeTracer uses Zstd seekable compression for the CBOR event encoding mode. This allows random access to events without decompressing the entire stream.
+CTFS uses per-chunk Zstd compression with companion index streams to provide random access within compressed data. This document describes how compression and seeking work.
 
-The seekable format is implemented by the [`zeekstd`](https://github.com/nicholasgasior/zeekstd) crate.
+## Chunked Compressed Table
 
-## Format Overview
+Records are grouped into chunks of configurable size (per-stream), each chunk independently compressed with Zstd. This is the standard compression model for all CTFS data streams.
 
-The seekable format splits data into independently-compressed Zstd frames. A seek table (stored as a Zstd skippable frame) maps frame boundaries, enabling decompression of arbitrary byte ranges without reading the entire file.
+### Chunk Format
 
-The format is compatible with standard Zstd: any Zstd decoder can decompress a seekable file by simply ignoring the skippable seek table frame. The seek table only adds random-access capability.
-
-## Frame Structure
-
-A seekable Zstd stream consists of:
-
-1. **One or more Zstd compressed frames** -- each independently decompressible
-2. **A seek table frame** -- a Zstd skippable frame containing the index
+Chunks contain **only compressed data** -- no inline headers. All metadata lives in the companion index.
 
 ```
-[Zstd Frame 0][Zstd Frame 1]...[Zstd Frame N-1][Seek Table Frame]
+foo.dat:  [compressed_chunk_0][compressed_chunk_1][compressed_chunk_2]...
 ```
 
-### Seek Table Frame
+Each chunk is independently decompressible (no cross-chunk dependencies). All chunks except the last contain exactly `chunk_size` records. The last chunk contains the remainder.
 
-The seek table is stored in a Zstd skippable frame. Two layouts exist:
+### Companion Index Stream (.idx)
 
-**Foot format** (classic, placed at end of file):
+For each chunked data stream `foo.dat`, a companion index `foo.idx` is stored as a separate CTFS internal file:
 
-| Field | Size | Description |
-|-------|------|-------------|
-| `Skippable_Magic_Number` | 4 bytes | `0x184D2A5E` |
-| `Frame_Size` | 4 bytes | Size of the rest of this frame |
-| `Seek_Table_Entries` | 8 bytes each | One per compressed frame |
-| `Seek_Table_Integrity` | 9 bytes | Frame count + descriptor + magic |
+```
+foo.idx:  [chunk_size: u32][offset_0: u64][offset_1: u64][offset_2: u64]...
+```
 
-**Head format** (v0.1.1, for standalone files):
+- `chunk_size` (u32 LE, 4 bytes): number of records per chunk, configurable per stream
+- Each subsequent u64 LE (8 bytes): byte offset of that chunk within `foo.dat`
 
-| Field | Size | Description |
-|-------|------|-------------|
-| `Skippable_Magic_Number` | 4 bytes | `0x184D2A5E` |
-| `Frame_Size` | 4 bytes | Size of the rest of this frame |
-| `Seek_Table_Integrity` | 9 bytes | Frame count + descriptor + magic |
-| `Seek_Table_Entries` | 8 bytes each | One per compressed frame |
+Different streams use different chunk sizes based on their record sizes -- `steps.dat` (2-4 byte records) benefits from larger chunks, `calls.dat` (100+ byte records) from smaller ones.
 
-### Seek Table Integrity (9 bytes)
+### Seeking -- O(1)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| `Number_Of_Frames` | 4 bytes | Number of compressed frames (u32 LE) |
-| `Seek_Table_Descriptor` | 1 byte | Bit 7: Checksum_Flag (deprecated in v0.1.1), bits 6-2: reserved (must be 0), bits 1-0: unused |
-| `Seekable_Magic_Number` | 4 bytes | `0x8F92EAB1` |
+To read record N:
 
-### Seek Table Entries (8 bytes each)
+1. Compute `chunk_number = N / chunk_size`
+2. Read `foo.idx[4 + chunk_number * 8]` -- the byte offset of chunk start
+3. Read `foo.idx[4 + (chunk_number + 1) * 8]` -- next offset (or `foo.dat` file size for last chunk)
+4. Read `foo.dat[offset..next_offset]` -- the compressed chunk
+5. Decompress with Zstd
+6. Access record `N % chunk_size` within the decompressed data
 
-| Field | Size | Description |
-|-------|------|-------------|
-| `Compressed_Size` | 4 bytes | Compressed size of this frame (u32 LE) |
-| `Decompressed_Size` | 4 bytes | Decompressed size of this frame (u32 LE) |
+This is O(1) -- the chunk number is computed directly from the record index (no binary search needed). Two u64 reads from the index + one compressed chunk read. With block caching, the index reads are typically free (the entire index fits in one or two blocks for most traces).
 
-Cumulative sum of `Compressed_Size` values gives the byte offset of each frame in the compressed stream.
+### Derived Information
 
-## CodeTracer Usage
+All of these are computable from the index without any redundant fields:
 
-### CBOR mode (legacy)
+- **Record N is in chunk** `N / chunk_size`
+- **Chunk C starts at** `foo.idx[C]` (u64 read)
+- **Chunk C ends at** `foo.idx[C+1]` (or `foo.dat` file size for last chunk)
+- **Compressed size of chunk C** = `foo.idx[C+1] - foo.idx[C]`
+- **First record in chunk C** = `C * chunk_size`
+- **Record count in chunk C** = `chunk_size` (or `total_records - C * chunk_size` for last chunk)
 
-In CBOR mode, the `zeekstd::Encoder` streams CBOR-serialized events through seekable Zstd compression. Configuration:
+The index is 8 bytes per chunk plus a 4-byte header. For a stream with 10,000 chunks, the index is ~80 KB.
 
-- **Frame size policy**: `FrameSizePolicy::Uncompressed(threshold)` -- a new Zstd frame is started after `threshold` bytes of uncompressed input. Default threshold: 64 KiB.
-- **Compression level**: 3
+## Streaming: Available During Active Recording
 
-The encoder writes compressed frames into a shared in-memory buffer. Periodically (when uncompressed data exceeds the flush threshold), the current Zstd frame is finalized and the compressed output is drained into the CTFS `events.log` file.
+The index is written **incrementally** as chunks complete. No finalization step is required.
 
-At finalization, `encoder.finish()` flushes any remaining data and writes the seek table as a trailing skippable frame.
+### Writer Protocol
 
-### Split-binary mode (default)
+1. Accumulate records into a buffer
+2. When buffer reaches `chunk_size` records:
+   a. Encode records
+   b. Compress with Zstd
+   c. Append u64 byte offset (current position in `foo.dat`) to `foo.idx`
+   d. Write compressed data to `foo.dat`
+   e. Sync both `foo.dat` and `foo.idx` file entry sizes for concurrent readers
 
-Split-binary mode does **not** use seekable Zstd. Instead, it uses the chunked compression scheme described in [trace-events.md](trace-events.md), where each chunk of events is independently Zstd-compressed with an inline 16-byte header. This provides GEID-level seeking without the overhead of a separate seek table.
+Concurrent readers see new chunks as soon as the index entry is synced. Seeking is available during active recording with no finalization step.
 
-## Reference
+## Network Access
 
-The seekable Zstd format is specified in full at [`zeekstd/seekable_format.md`](https://github.com/nicholasgasior/zeekstd/blob/main/seekable_format.md), derived from the [original Facebook/Meta specification](https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/zstd_seekable_compression_format.md).
+When reading over a network, the companion index enables efficient chunk-level fetching:
 
-All numeric fields are little-endian.
+1. Fetch the index (a single small CTFS file, typically one or two blocks)
+2. Compute chunk number from record ID
+3. Read the chunk's byte offset from the local index
+4. Issue a single HTTP range request for the target chunk
+5. Decompress locally
+
+This avoids fetching the entire data stream.
+
+## Configuration
+
+Default Zstd compression level: 3.
+
+Chunk sizes are configurable per stream. Smaller chunks give finer seek granularity but lower compression ratio. Larger chunks compress better but require decompressing more data per seek. Default: 4096 records per chunk.

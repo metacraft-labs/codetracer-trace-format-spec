@@ -609,45 +609,15 @@ In a typical trace, ~80-90% of steps are sequential lines within a function (del
 
 Combined with Zstd compression on the already-compact delta stream, effective per-step storage drops below 1 byte.
 
-### Chunked compression
+### Chunked Compression
 
-In split-binary mode, events are grouped into **chunks** of `chunk_size` events (default: 4096). Each chunk is independently Zstd-compressed with an inline 16-byte header:
+Events are grouped into **chunks** of `chunk_size` records (default: 4096). Each chunk is independently Zstd-compressed. Chunks contain **only compressed data** -- no inline headers. All metadata lives in companion index streams.
 
 ```
-+-------------------------------------------+
-| Chunk Header (16 bytes)                   |
-|  compressed_size:  u32 LE (4 bytes)       |
-|  event_count:      u32 LE (4 bytes)       |
-|  first_geid:       u64 LE (8 bytes)       |
-+-------------------------------------------+
-| Compressed Data (compressed_size bytes)   |
-|  (Zstd-compressed concatenated events)    |
-+-------------------------------------------+
+steps.dat:  [compressed_chunk_0][compressed_chunk_1][compressed_chunk_2]...
+steps.idx:  [chunk_size: u32][offset_0: u64][offset_1: u64]...
 ```
 
-Multiple chunks are concatenated back-to-back in the `events.log` file (after the HEADERV1 prefix). The chunk headers enable GEID-based seeking: to find a specific event, scan chunk headers to find the chunk whose `first_geid` range covers the target, then decompress only that chunk.
+The companion index `steps.idx` starts with the records-per-chunk count (u32 LE), followed by one u64 byte offset per chunk. To seek to a specific record, compute `chunk = record_id / chunk_size`, read the byte offset from the index, and decompress only that chunk. See [seekable-zstd.md](seekable-zstd.md) for the full companion index format.
 
 Default Zstd compression level: 3.
-
-## CBOR Encoding (legacy)
-
-In CBOR mode, each `TraceLowLevelEvent` is serialized as a complete CBOR value using `serde`-derived serialization (tagged enum encoding). Events are concatenated and streamed through a Zstd seekable encoder (via `zeekstd`), with frames flushed every 64 KiB of uncompressed data by default.
-
-The CBOR format uses serde's default tagged-enum representation. Each event is a CBOR map with a single key (the variant name) whose value contains the fields.
-
-## events.log internal header (HEADERV1)
-
-Both split-binary and CBOR modes prefix the `events.log` file with an 8-byte header before any compressed data:
-
-```
-Byte:  0     1     2     3     4     5     6     7
-     +-----+-----+-----+-----+-----+-----+-----+-----+
-     | C0  | DE  | 72  | AC  | E2  | 01  | 00  | 00  |
-     +-----+-----+-----+-----+-----+-----+-----+-----+
-```
-
-- Bytes 0-4: CTFS magic (`C0 DE 72 AC E2`)
-- Byte 5: `0x01` -- events.log format version 1
-- Bytes 6-7: Reserved, must be `0x00`
-
-This is distinct from the outer CTFS container header. Readers verify this prefix before attempting to decode events.
