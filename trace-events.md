@@ -12,7 +12,7 @@ Interning events (Path, Function, Type, VariableName) are not part of the event 
 | VariableName (tag 2) | `varnames.dat` + `varnames.off` | Variable name (bytes) |
 | Variable (tag 3) | Removed (legacy) | — |
 | Type (tag 4) | `types.dat` + `types.off` | TypeKind (u8) + lang_type (bytes) + specific_info (binary) |
-| Function (tag 6) | `functions.dat` + `functions.off` | global_line_index (varint) + name (bytes) |
+| Function (tag 6) | `funcs.dat` + `funcs.off` | global_line_index (varint) + name (bytes) |
 
 The `ensure_*_id()` API in the trace writer appends a record to the corresponding table and returns its index (0-based). The index is used in subsequent events (Step references path via global line index, Call references function by index, Value references variable name and type by index).
 
@@ -33,15 +33,13 @@ This is what the debugger steps through. Each record is compact and fixed-size w
 
 | Tag | Event | Fields | Size |
 |-----|-------|--------|------|
-| 0 | AbsoluteStep | global_line_index: varint, call_key: varint | ~4 bytes |
+| 0 | AbsoluteStep | global_line_index: varint | ~3 bytes |
 | 1 | DeltaStep | delta: signed varint | 2 bytes |
 | 2 | Raise | exception_type_id: varint, message_len: varint, message: bytes | varies |
 | 3 | Catch | exception_type_id: varint | ~2 bytes |
 | 4 | ThreadSwitch | thread_id: varint | 2 bytes |
 
-Note: AbsoluteStep now includes `call_key` (the call this step belongs to). This is the "embedded call context" from the Seek-Based CTFS Reader spec — it means looking up a step's call doesn't require a separate seek.
-
-DeltaStep inherits the previous step's call_key (same function, sequential lines).
+Step records do not carry `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` — each call record stores `[first_step_id, last_step_id]` ranges. This is O(log log C), typically 2-3 iterations, and avoids doubling the step record size.
 
 Raise is emitted when an exception is raised (before unwinding). Catch is emitted when a `try/except` handler catches the exception.
 
@@ -130,8 +128,8 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
-| 0 | `AbsoluteStep` | `global_line_index: varint`, `call_key: varint` | Execution stepped to a source line (with embedded call context) |
-| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index (inherits call_key) |
+| 0 | `AbsoluteStep` | `global_line_index: varint` | Execution stepped to a source line (full state at chunk/function boundaries) |
+| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index |
 | 2 | `Raise` | `exception_type_id: varint`, `message_len: varint`, `message: bytes` | Exception raised (before unwinding) |
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
 | 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
@@ -188,7 +186,7 @@ IO event records are not tagged — each record has a fixed structure.
 | VariableName (tag 2) | `varnames.dat` + `varnames.off` | Variable name (bytes) |
 | Variable (tag 3) | Removed (legacy) | — |
 | Type (tag 4) | `types.dat` + `types.off` | TypeKind (u8) + lang_type (bytes) + specific_info (binary) |
-| Function (tag 6) | `functions.dat` + `functions.off` | global_line_index (varint) + name (bytes) |
+| Function (tag 6) | `funcs.dat` + `funcs.off` | global_line_index (varint) + name (bytes) |
 
 ### Removed Events
 
@@ -572,16 +570,16 @@ Step events use two variants for efficient encoding:
 Used at function entry, after large jumps, or when the delta would exceed DeltaStep's range.
 
 ```
-[Tag: 0x00] [global_line_index: u64 LE]
-Total: 9 bytes
+[Tag: 0x00] [global_line_index: varint]
+Total: 3-4 bytes typical (1 tag + 2-3 varint bytes)
 ```
 
-### DeltaStep (Tag 24)
+### DeltaStep (Tag 1)
 
 Used for consecutive steps within the same function or nearby code. Stores the signed delta from the previous step's global line index.
 
 ```
-[Tag: 0x18] [delta: signed varint]
+[Tag: 0x01] [delta: signed varint]
 Total: 2 bytes typical (1 tag + 1 varint for delta ±63)
 ```
 
@@ -592,7 +590,7 @@ The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then uns
 | ±63 | 1 byte | 2 bytes |
 | ±8191 | 2 bytes | 3 bytes |
 | ±1048575 | 3 bytes | 4 bytes |
-| Larger | Use AbsoluteStep | 9 bytes |
+| Larger | Use AbsoluteStep | 3-4 bytes |
 
 ### Encoding Rules
 
@@ -606,8 +604,8 @@ The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then uns
 In a typical trace, ~80-90% of steps are sequential lines within a function (delta +1 or small positive). With DeltaStep:
 
 - Most steps: 2 bytes (down from 17 bytes) — 8.5x reduction
-- Function entry/return: 9 bytes (same as before)
-- Weighted average: ~3 bytes per step
+- Function entry/return: 3-4 bytes (AbsoluteStep with varint)
+- Weighted average: ~2-3 bytes per step
 
 Combined with Zstd compression on the already-compact delta stream, effective per-step storage drops below 1 byte.
 
