@@ -13,5 +13,5 @@ This repository is the source-of-truth specification for the CodeTracer trace fo
 
 ## Implementations
 
-- **Rust** (primary): [`codetracer-trace-format`](https://github.com/nicholasgasior/codetracer-trace-format) -- `codetracer_ctfs`, `codetracer_trace_types`, `codetracer_trace_writer`, `codetracer_trace_reader`
-- **Nim** (secondary): [`codetracer-trace-format-nim`](https://github.com/nicholasgasior/codetracer-trace-format-nim) -- `codetracer_ctfs` Nim package
+- **Rust** (primary): [`codetracer-trace-format`](https://github.com/metacraft-labs/codetracer-trace-format) -- `codetracer_ctfs`, `codetracer_trace_types`, `codetracer_trace_writer`, `codetracer_trace_reader`
+- **Nim** (secondary): [`codetracer-trace-format-nim`](https://github.com/metacraft-labs/codetracer-trace-format-nim) -- `codetracer_ctfs` Nim package
