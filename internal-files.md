@@ -93,16 +93,37 @@ Event type wire formats are specified in [trace-events.md](trace-events.md).
 
 | File | Abstraction | Purpose |
 |------|-------------|---------|
-| `meta.dat` | Binary metadata | Platform, tick source, timestamps |
+| `meta.dat` | Binary metadata | Platform, tick source, timestamps, hook profile (see Metadata section) |
 | `threads.ns` | Namespace (Type B) | Per-thread event streams (keyed by thread_id) |
 | `syncord.log` | Append-only | Global synchronization ordering |
 | `geid.idx` | Fixed-size record | GEID-to-checkpoint index |
 | `cp.dat` | Var-size record | Checkpoint data (base snapshots + delta chains) |
 | `cp.off` | Offset index | Checkpoint ID to offset in `cp.dat` |
+| `cp0.regs` | Raw binary | Initial register snapshot at record-start (152 bytes typical) |
+| `cp0.mem` | Raw binary | Initial memory snapshot at record-start (sequence of `(address, size, bytes)` tuples) |
+| `cp0.fsbase` | Raw binary | Initial `fsbase`/`gsbase` (16 bytes; x86-64 Linux only) |
+| `cp0.maps` | Raw text | Verbatim `/proc/self/maps` text at cp0 capture time |
+| `debug.dat` | Raw binary | Full ELF of the recorded binary, including `.debug_*` sections |
 | `memwrites.tc` | Namespace (Type A) | Address to write history (omniscient queries) |
 | `linehits.tc` | Namespace (Type A) | Source line to GEID lists (line hit queries) |
 
 All files are append-only during recording.
+
+**Two flavours of MCR checkpoint state coexist in the container:**
+
+- **`cp0.*` — initial-state seed (this section).** Captured once at
+  record start by the LD_PRELOAD interposer (or any future
+  ptrace-based equivalent). Seeds the emulator before replay begins:
+  `cp0.regs` flows into `mcrSetRegisters`, `cp0.mem` into a sequence
+  of `mcrLoadMemoryRegion` calls, `cp0.fsbase`/`cp0.maps` provide
+  diagnostic / rebase context, and `debug.dat` is parsed for DWARF
+  line resolution. All are MCR-only and all are optional in the sense
+  that the replay backend falls back to degraded behaviour when they
+  are absent.
+- **`cp.dat` + `cp.off` — delta-chain checkpoints (next sub-section).**
+  Periodic snapshots written during recording so the replay engine
+  can seek to an arbitrary tick without re-emulating from cp0. Also
+  MCR-only.
 
 ### Thread Streams via Namespaces
 
@@ -125,6 +146,217 @@ Checkpoints form incremental chains: a base checkpoint stores a full memory snap
 
 The variable-size record table makes this a single contiguous scan through `cp.dat`.
 
+### Initial Register Snapshot (cp0.regs)
+
+A flat, raw-bytes CTFS file carrying the GPR state of the first
+recorded thread at the moment cp0 was captured. Written by the
+LD_PRELOAD `__libc_start_main` wrapper after libc startup completes
+and just before control transfers to the user `main` (writer:
+`codetracer-native-recorder/ct_interpose/src/ct_interpose/full_snapshot.c`,
+`_ct_full_snapshot_write_regs`). Total typical size is 152 bytes (one
+thread, compact layout).
+
+**Outer wrapper** (per thread, repeated end-to-end if multiple threads
+are present; readers stop after the first thread):
+
+| Offset | Size | Field |
+|--------|------|-------|
+| +0 | 4 | `tid` (u32 LE) -- recording-thread id; 0 for the main thread |
+| +4 | 4 | `reg_data_len` (u32 LE) -- length of the inner register body |
+| +8 | `reg_data_len` | `reg_data[reg_data_len]` -- one of the two layouts below |
+
+**Inner layout A -- compact, 144 bytes (`reg_data_len = 144`).**
+Written by the LD_PRELOAD wrapper. Eighteen `u64 LE` values in the
+exact argument order of `mcrSetRegisters`:
+
+| Index | Offset | Register |
+|-------|--------|----------|
+| 0 | 0 | `rax` |
+| 1 | 8 | `rbx` |
+| 2 | 16 | `rcx` |
+| 3 | 24 | `rdx` |
+| 4 | 32 | `rsi` |
+| 5 | 40 | `rdi` |
+| 6 | 48 | `rbp` |
+| 7 | 56 | `rsp` |
+| 8 | 64 | `r8` |
+| 9 | 72 | `r9` |
+| 10 | 80 | `r10` |
+| 11 | 88 | `r11` |
+| 12 | 96 | `r12` |
+| 13 | 104 | `r13` |
+| 14 | 112 | `r14` |
+| 15 | 120 | `r15` |
+| 16 | 128 | `rip` (resume address = the user's real `main`) |
+| 17 | 136 | `rflags` |
+
+**Inner layout B -- ptrace `user_regs_struct`, 216 bytes
+(`reg_data_len = 216`).** Written by recorders that capture state via
+`PTRACE_GETREGS` (no producer ships this today; readers accept it for
+forward compatibility). Twenty-seven `u64 LE` values in Linux's
+`<sys/user.h>` order:
+
+| Index | Offset | Register |
+|-------|--------|----------|
+| 0 | 0 | `r15` |
+| 1 | 8 | `r14` |
+| 2 | 16 | `r13` |
+| 3 | 24 | `r12` |
+| 4 | 32 | `rbp` |
+| 5 | 40 | `rbx` |
+| 6 | 48 | `r11` |
+| 7 | 56 | `r10` |
+| 8 | 64 | `r9` |
+| 9 | 72 | `r8` |
+| 10 | 80 | `rax` |
+| 11 | 88 | `rcx` |
+| 12 | 96 | `rdx` |
+| 13 | 104 | `rsi` |
+| 14 | 112 | `rdi` |
+| 15 | 120 | `orig_rax` |
+| 16 | 128 | `rip` |
+| 17 | 136 | `cs` |
+| 18 | 144 | `eflags` |
+| 19 | 152 | `rsp` |
+| 20 | 160 | `ss` |
+| 21 | 168 | `fs_base` |
+| 22 | 176 | `gs_base` |
+| 23 | 184 | `ds` |
+| 24 | 192 | `es` |
+| 25 | 200 | `fs` |
+| 26 | 208 | `gs` |
+
+Readers select the layout by inspecting `reg_data_len`. Any other
+length is rejected. Reader contract: the emulator's
+`mcrSetRegisters` consumes the decoded registers verbatim; see
+`ct_emulator/src/ct_emulator/ctfs_bridge.nim::loadInitialStateFromTrace`
+(Nim) and `codetracer/src/db-backend/src/emulator_session.rs`
+(`decode_first_thread_registers`, Rust) for the canonical decoders.
+
+### Initial Memory Snapshot (cp0.mem)
+
+A flat, raw-bytes CTFS file holding the live program memory as
+captured at cp0 time. Written by the same LD_PRELOAD interposer
+(`_ct_full_snapshot_walk` in `full_snapshot.c`). Typical size scales
+with the program's resident set: a few megabytes for trivial
+programs, ~90 MB for `inventory_service`. The recorder bounds total
+size with the soft cap `CT_FULL_SNAPSHOT_LIMIT_MB` (default 256 MB)
+which emits a warning but does not truncate.
+
+**Wire format.** A sequence of `(address, size, bytes)` tuples
+concatenated end-to-end, one tuple per readable, non-skipped
+`/proc/self/maps` entry. There is no count prefix, no per-region
+header beyond `(address, size)`, no terminator, and no padding --
+parsing stops when the file ends.
+
+Per tuple:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| +0 | 8 | `address` (u64 LE) -- region start in the recorded process's VAS |
+| +8 | 8 | `size` (u64 LE) -- region length in bytes |
+| +16 | `size` | `bytes[size]` -- raw region contents read via `pread(/proc/self/mem)` |
+
+The writer drops any region for which a full read fails (e.g. EIO on
+PROT_NONE guards) and excludes regions whose pathname is in the
+recorder's skip-set (e.g. `[vvar]`, `[vsyscall]`). `[stack]` is
+included in the `__libc_start_main` wrapper's re-capture but excluded
+from the earlier library-constructor capture.
+
+Reader contract: each tuple is installed into the emulator via
+`mcrLoadMemoryRegion(address, bytes_ptr, size)`. See
+`ct_replayer/src/ct_replayer/trace_loader.nim::readMemorySnapshot`
+(Nim) and `codetracer/src/db-backend/src/emulator_session.rs`
+(Rust) for the canonical parsers.
+
+### Initial Segment Bases (cp0.fsbase)
+
+A 16-byte raw binary CTFS file holding the recording thread's
+`fsbase` and `gsbase` at cp0 time. The emulator needs `fsbase` to
+step past libc's stack-canary fetch (`mov rdi, fs:[0x28]`) inside
+`__libc_start_main`; without it the emulator faults a few hundred
+instructions into libc startup.
+
+Layout (little-endian, no header):
+
+| Offset | Size | Field |
+|--------|------|-------|
+| +0 | 8 | `fsbase` (u64 LE) -- value from `arch_prctl(ARCH_GET_FS, ...)` |
+| +8 | 8 | `gsbase` (u64 LE) -- value from `arch_prctl(ARCH_GET_GS, ...)` |
+
+Writer: `ct_full_snapshot_write_fsbase_linux` in `full_snapshot.c`.
+A read error during recording leaves the corresponding slot zero; an
+entirely absent sidecar means the emulator defaults both bases to
+zero (pre-M-EM3 behaviour), which is correct for programs that never
+touch TLS but breaks libc startup.
+
+x86-64 Linux only. Other platforms do not currently ship this file.
+
+### Address-Space Map (cp0.maps)
+
+A raw-text CTFS file containing a verbatim, byte-for-byte copy of the
+recording process's `/proc/self/maps` at cp0 capture time. No
+filtering, no normalisation, no trailing terminator beyond whatever
+the kernel emitted.
+
+**Encoding.** UTF-8-compatible 7-bit ASCII (kernel never emits
+non-ASCII bytes in this file). One mapping per line; each line follows
+the standard Linux kernel format:
+
+```
+<start>-<end> <perms> <offset> <dev>:<inode>    <pathname>
+```
+
+where `<start>` and `<end>` are lowercase hexadecimal addresses
+without a `0x` prefix, `<perms>` is the 4-character `rwxp`/`rwxs`
+string, `<offset>` is a hex file offset, `<dev>` is the
+`<major>:<minor>` device pair (also hex), `<inode>` is a decimal
+inode number, and `<pathname>` is the resolved mapping path or a
+bracketed pseudo-name such as `[heap]`, `[stack]`, `[vvar]`, or
+`[vdso]`. Anonymous mappings have an empty pathname.
+
+The recorder buffers the file through a 128 KiB stack buffer
+(`maps_buf` in `_ct_full_snapshot_walk`) and writes the truncated
+length on overflow; in practice processes with <~1500 mappings fit
+without truncation.
+
+Reader contract: the replay backend parses this text to recover the
+ASLR load base of the main executable so it can rebase runtime PCs
+into the static address space DWARF encodes. Without `cp0.maps`,
+line resolution falls back to line 1 for relocated binaries. See
+`codetracer/src/db-backend/src/emulator_session.rs` (`parse_cp0_maps`)
+for the parser.
+
+### Bundled Debug Binary (debug.dat)
+
+A raw-binary CTFS file containing the **full ELF of the recorded
+binary**, captured at record time exactly as it exists on disk -- no
+stripping, no filtering, no repackaging. Includes the regular code /
+rodata / .eh_frame sections as well as every `.debug_*` section
+present in the recorded ELF. Typical size: a few MB for ordinary
+release builds; the recorder enforces a 64 MiB soft cap
+(`MaxDwarfBundleBytes`) and skips the bundle with a warning if the
+binary is larger.
+
+Writer: `readBinaryForDwarfBundle` in
+`codetracer-native-recorder/ct_cli/src/ct_cli/dwarf_paths_extractor.nim`,
+which `readFile`s the binary path verbatim. The bundle is then
+written to the container via `tw.writeRawFile("debug.dat", bytes)`
+from `record_cmd.nim`.
+
+Reader contract: the replay backend parses the blob with
+`DwarfIndex::from_elf_bytes` to resolve emulator PCs to
+`(file, line, function)` triples. The ELF wrapper is required (the
+parser handles both the wrapper and the embedded DWARF), and future
+milestones plan to consume `.eh_frame` from the same blob for stack
+unwinding. When `debug.dat` is absent or unreadable, the backend
+falls back to producing `(paths[0], 1)` line locations.
+
+Why bundle the whole ELF instead of just `.debug_*` sections: the
+DWARF parser already understands the ELF container and would have to
+synthesise one if handed loose sections; carrying the original file
+also keeps a single, audit-friendly artifact in the trace.
+
 ---
 
 ## Metadata (meta.dat)
@@ -136,8 +368,10 @@ A single binary metadata file using split-binary encoding.
 ```
 Header (8 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (currently 1)
+  version: u16 LE (currently 2)
   flags: u16 LE
+    bit 0       -- FLAG_HAS_MCR_FIELDS (extended block present)
+    bits 1..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
   program: varint length + UTF-8 bytes
@@ -149,19 +383,62 @@ Fields (varint-prefixed):
     paths[0..path_count-1]: varint length + UTF-8 bytes each
 ```
 
+Varints are unsigned LEB128 (max 10 bytes). Strings are UTF-8 without
+a NUL terminator.
+
+### Version History
+
+- **v1** -- initial release. Removed before any external consumer
+  shipped; `meta.json` carried the `hookProfile` / `hookStrategies`
+  fields out-of-band during the v1 window.
+- **v2** (current) -- appended `hookProfile` + `hookStrategies` to the
+  end of the MCR extended-fields block. Writers always emit v2; the
+  Rust reader still parses pre-existing v1 dev fixtures by treating
+  the appended fields as empty.
+
 ### Extended Fields (flags bitmask)
 
-**Flag bit 0 -- MCR fields:**
+**Flag bit 0 -- MCR fields.** When set, the block below follows the
+paths list. Every field is varint-encoded (no fixed-width integers):
 
 ```
-  tick_source: varint (0=rdtsc, 1=monotonic, 2=perf_counter)
+  tick_source: varint (TickSource enum ordinal)
   total_threads: varint
-  atomic_mode: varint (0=relaxed, 1=seq_cst)
-  total_checkpoints: u32 LE
-  start_time_unix_us: u64 LE
+  atomic_mode: varint (AtomicMode enum ordinal)
+  total_events: varint
+  total_checkpoints: varint
+  start_time_unix_us: varint
+  platform: varint length + UTF-8 bytes
+  tick_granularity: varint length + UTF-8 bytes
+  tick_source_str: varint length + UTF-8 bytes
+  atomic_mode_str: varint length + UTF-8 bytes
+  start_time_str: varint length + UTF-8 bytes
+  hookProfile: varint length + UTF-8 bytes                  (v2+)
+  hookStrategies_count: varint                              (v2+)
+    hookStrategies[0..count-1]: varint length + UTF-8 bytes each
 ```
 
-The `compression` field specifies the default per-stream compression. This is in metadata (not container header) because different internal files may use different settings.
+Notes:
+
+- `tick_source` / `atomic_mode` are stored as raw enum ordinals; the
+  paired `tick_source_str` / `atomic_mode_str` strings carry the
+  human-readable form for diagnostic surfaces.
+- `hookProfile` names the active MCR hook profile (e.g. `"default"`,
+  `"dotnet"`, `"pal_probe"`).
+- Each `hookStrategies[i]` names one active hook strategy (e.g.
+  `"ldpreload"`, `"seccomp_unotify"`, `"callsite_patch"`). The
+  combined `(hookProfile, hookStrategies)` pair is the canonical
+  record of how a trace was recorded -- consumers must round-trip it
+  on re-record / re-export.
+- v2 writers always emit the `hookProfile` + `hookStrategies` block
+  when `FLAG_HAS_MCR_FIELDS` is set (even with empty values); v1
+  fixtures lack the tail entirely.
+
+The canonical writer is `writeMetaDatToBuffer` in
+`codetracer-trace-format-nim/src/codetracer_trace_writer/meta_dat.nim`.
+The canonical readers are the same Nim file's `readMetaDat` and the
+Rust `parse_meta_dat` in
+`codetracer/src/db-backend/src/ctfs_trace_reader/meta_dat.rs`.
 
 ---
 
