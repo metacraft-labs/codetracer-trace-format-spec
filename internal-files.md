@@ -371,8 +371,10 @@ Header (8 bytes):
   version: u16 LE (currently 2)
   flags: u16 LE
     bit 0       -- FLAG_HAS_MCR_FIELDS (extended block present)
-    bit 1       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present)
-    bits 2..15  -- reserved; readers reject when set
+    bit 1       -- FLAG_HAS_REPLAY_LAUNCH_FIELDS (M-RLP-1, see below)
+    bit 2       -- FLAG_HAS_LAYOUT_SNAPSHOT (M-RLP-2, see below)
+    bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
+    bits 4..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
   program: varint length + UTF-8 bytes
@@ -435,11 +437,42 @@ Notes:
   when `FLAG_HAS_MCR_FIELDS` is set (even with empty values); v1
   fixtures lack the tail entirely.
 
-**Flag bit 1 -- Trace filter provenance.** When set, the block below
-follows the MCR extended-fields block (or, if `FLAG_HAS_MCR_FIELDS` is
-clear, follows the `paths` list directly). The provenance captures
-which filter files were active for the recording session, in their
-composition order, per [Trace-Filters.md](Trace-Filters.md) § 7:
+**Flag bit 1 -- Replay-launch fields (M-RLP-1, §6A.5).** When set,
+the block below follows the MCR extended-fields block (or, if
+`FLAG_HAS_MCR_FIELDS` is clear, follows the `paths` list directly).
+Records replay-launch address-space hardening state captured at
+record time so the replay backend can decide between hard-pin and
+soft-pin modes:
+
+```
+  aslr_disabled: u8 (0 = false, 1 = true)
+```
+
+**Flag bit 2 -- Layout snapshot (M-RLP-2, §6B.7).** When set, the
+block below follows the replay-launch block (or, if
+`FLAG_HAS_REPLAY_LAUNCH_FIELDS` is clear, follows the MCR / `paths`
+block per the same composition rules).  Carries a fingerprint of the
+recording process's address-space layout at `__libc_start_main`
+wrapper entry; the replay side computes the same fingerprint at the
+same instrumentation point and compares against `layout_hash`:
+
+```
+  layout_hash: u64 LE (XXH64 of fingerprint bytes, seed 0)
+  fingerprint_len: varint
+  fingerprint[fingerprint_len]: bytes
+```
+
+Per-entry fingerprint layout (one tuple per `/proc/self/maps`
+entry, in stream order): `u64 start`, `u64 end`, `u32 prot_flags`
+(bit 0=R, 1=W, 2=X, 3=private), `varint name_len`, `bytes name`,
+`u8 build_id_len`, `bytes build_id`.
+
+**Flag bit 3 -- Trace filter provenance (TF-M7).** When set, the
+block below follows the layout-snapshot block (or, if upstream
+flag bits are clear, follows the most recent populated block per
+the same composition rules). The provenance captures which filter
+files were active for the recording session, in their composition
+order, per [Trace-Filters.md](Trace-Filters.md) § 7:
 
 ```
   trace_filter_count: varint
