@@ -10,6 +10,7 @@ This repository is the source-of-truth specification for the CodeTracer trace fo
 | [trace-events.md](trace-events.md) | `TraceLowLevelEvent` enum, split-binary encoding, CBOR legacy encoding |
 | [seekable-zstd.md](seekable-zstd.md) | Zstd seekable compression format as used by CodeTracer |
 | [internal-files.md](internal-files.md) | Conventions for files stored inside a CTFS container |
+| [Trace-Filters.md](Trace-Filters.md) | Cross-language trace filter contract: schema, hot-path requirement, provenance |
 
 ## Implementations
 

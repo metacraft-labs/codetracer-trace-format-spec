@@ -371,7 +371,8 @@ Header (8 bytes):
   version: u16 LE (currently 2)
   flags: u16 LE
     bit 0       -- FLAG_HAS_MCR_FIELDS (extended block present)
-    bits 1..15  -- reserved; readers reject when set
+    bit 1       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present)
+    bits 2..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
   program: varint length + UTF-8 bytes
@@ -433,6 +434,42 @@ Notes:
 - v2 writers always emit the `hookProfile` + `hookStrategies` block
   when `FLAG_HAS_MCR_FIELDS` is set (even with empty values); v1
   fixtures lack the tail entirely.
+
+**Flag bit 1 -- Trace filter provenance.** When set, the block below
+follows the MCR extended-fields block (or, if `FLAG_HAS_MCR_FIELDS` is
+clear, follows the `paths` list directly). The provenance captures
+which filter files were active for the recording session, in their
+composition order, per [Trace-Filters.md](Trace-Filters.md) § 7:
+
+```
+  trace_filter_count: varint
+    trace_filter_entries[0..count-1]:
+      path: varint length + UTF-8 bytes
+      sha256: 32 raw bytes (no length prefix)
+```
+
+Notes:
+
+- Entries appear in composition order: builtin default first, then
+  project auto-discovered filter, then env-var filters, then CLI
+  `--trace-filter:` arguments. See
+  [Trace-Filters.md](Trace-Filters.md) § 5 for the composition rules.
+- The `path` field MAY use sentinel values for filters that aren't
+  loaded from a real file path — `<inline:builtin-default>` is the
+  recommended sentinel for the recorder-embedded default. Sentinel
+  paths begin with `<` and end with `>`.
+- `sha256` is the raw 32-byte SHA-256 digest of the filter file's
+  bytes (or, for inline filters, the embedded TOML string's bytes).
+  Computed once at load time. Readers SHOULD render this as a
+  lowercase hex string for diagnostic surfaces.
+- A `trace_filter_count` of `0` is legal and means "no filters were
+  active" (distinct from the flag being clear, which means "the
+  recorder did not record provenance"). Recorders that implement
+  trace filters MUST set the flag and emit at least the builtin
+  default entry.
+- Schema-versioning for the filter chain itself lives in each filter
+  file's `[meta] version = N` field (Trace-Filters.md § 11); the
+  `meta.dat` block only records provenance, not the rules.
 
 The canonical writer is `writeMetaDatToBuffer` in
 `codetracer-trace-format-nim/src/codetracer_trace_writer/meta_dat.nim`.
