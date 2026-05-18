@@ -368,7 +368,7 @@ A single binary metadata file using split-binary encoding.
 ```
 Header (8 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (currently 2)
+  version: u16 LE (currently 3)
   flags: u16 LE
     bit 0       -- FLAG_HAS_MCR_FIELDS (extended block present)
     bit 1       -- FLAG_HAS_REPLAY_LAUNCH_FIELDS (M-RLP-1, see below)
@@ -377,6 +377,7 @@ Header (8 bytes):
     bits 4..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
+  recording_id: varint length + UTF-8 bytes (required, M-REC-1)
   program: varint length + UTF-8 bytes
   args_count: varint
     args[0..args_count-1]: varint length + UTF-8 bytes each
@@ -389,15 +390,31 @@ Fields (varint-prefixed):
 Varints are unsigned LEB128 (max 10 bytes). Strings are UTF-8 without
 a NUL terminator.
 
+**`recording_id` (M-REC-1).** The canonical identifier for this
+recording: a UUIDv7 (RFC 9562) minted by the recorder at record start
+and stored in its lowercase hyphenated 36-char text form (e.g.
+`01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb`). UUIDv7's first 48 bits are
+the Unix-epoch-ms timestamp big-endian, so two recordings made on the
+same host one millisecond apart sort by id lex-ascending — the
+load-bearing property that lets `ls <traces>/` and the SQLite
+recording index serve recordings in creation order without a separate
+timestamp column. Required as of v3; parsers reject metadata with a
+missing or malformed value. Rationale and migration roadmap:
+`codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md`.
+
 ### Version History
 
 - **v1** -- initial release. Removed before any external consumer
   shipped; `meta.json` carried the `hookProfile` / `hookStrategies`
   fields out-of-band during the v1 window.
-- **v2** (current) -- appended `hookProfile` + `hookStrategies` to the
-  end of the MCR extended-fields block. Writers always emit v2; the
-  Rust reader still parses pre-existing v1 dev fixtures by treating
-  the appended fields as empty.
+- **v2** -- appended `hookProfile` + `hookStrategies` to the end of
+  the MCR extended-fields block.
+- **v3** (current, M-REC-1, 2026-05-18) -- prepended a required
+  `recording_id` UUIDv7 string before the existing `program` field.
+  Pre-1.0 there is no backcompat shim: v2 fixtures must be
+  regenerated. Spec:
+  `codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md`
+  § 3.
 
 ### Extended Fields (flags bitmask)
 

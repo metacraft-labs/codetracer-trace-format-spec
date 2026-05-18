@@ -24,6 +24,9 @@ A small but representative CTFS container produced by the Nim `TraceWriter` API 
 
 ### Metadata
 
+- **recording_id**: UUIDv7 minted at fixture generation time (M-REC-1).
+  Pre-1.0 the value is not stable across regenerations; M-REC-12 will
+  freeze a well-known constant.
 - **program**: `factorial`
 - **args**: `["5"]`
 - **workdir**: `/home/user/demo`
@@ -32,7 +35,7 @@ A small but representative CTFS container produced by the Nim `TraceWriter` API 
 
 - `events.log` -- split-binary encoded event stream, compressed with seekable Zstd
 - `events.fmt` -- the string `split-binary`
-- `meta.json` -- `{"program":"factorial","args":["5"],"workdir":"/home/user/demo"}`
+- `meta.json` -- `{"recording_id":"<uuidv7>","program":"factorial","args":["5"],"workdir":"/home/user/demo"}`
 - `paths.json` -- `["/src/main.nim","/src/math_utils.nim"]`
 
 ### How it was generated
