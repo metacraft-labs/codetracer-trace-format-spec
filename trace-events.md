@@ -33,11 +33,12 @@ This is what the debugger steps through. Each record is compact and fixed-size w
 
 | Tag | Event | Fields | Size |
 |-----|-------|--------|------|
-| 0 | AbsoluteStep | global_line_index: varint | ~3 bytes |
+| 0 | AbsoluteStep | global_position_index: varint | ~3 bytes |
 | 1 | DeltaStep | delta: signed varint | 2 bytes |
 | 2 | Raise | exception_type_id: varint, message_len: varint, message: bytes | varies |
 | 3 | Catch | exception_type_id: varint | ~2 bytes |
 | 4 | ThreadSwitch | thread_id: varint | 2 bytes |
+| 5 | DeltaColumn | delta: signed varint | 2 bytes (column-aware traces only) |
 
 Step records do not carry `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` — each call record stores `[first_step_id, last_step_id]` ranges. This is O(log log C), typically 2-3 iterations, and avoids doubling the step record size.
 
@@ -128,11 +129,12 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
-| 0 | `AbsoluteStep` | `global_line_index: varint` | Execution stepped to a source line (full state at chunk/function boundaries) |
-| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index |
+| 0 | `AbsoluteStep` | `global_position_index: varint` | Execution stepped to a source position (full state at chunk/function boundaries) |
+| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's `global_position_index` |
 | 2 | `Raise` | `exception_type_id: varint`, `message_len: varint`, `message: bytes` | Exception raised (before unwinding) |
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
 | 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
+| 5 | `DeltaColumn` | `delta: signed varint` | Column-only step within the current line; emitted only when the trace's `meta.dat` `FLAG_HAS_COLUMN_AWARE_STEPS` bit is set (see §"Source Location Addressing") |
 
 ### Value Stream Events (`steps.dat`)
 
@@ -649,16 +651,16 @@ The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then uns
 3. After a Return event, the next step is AbsoluteStep (returning to caller)
 4. All other steps use DeltaStep if the delta fits in 3 varint bytes (±1048575), otherwise AbsoluteStep
 
-### Candidate Column Encodings
+### Column Encoding — `DeltaColumn` (chosen)
 
-The column extension introduces a second axis (column) into step records. Two on-wire encodings are under consideration; both are documented as candidates here and benchmarked in `tracing-formats-benchmarks` milestone TF-Mn. The winner is selected in P6.3 after the empirical numbers land in P6.2.
+The column extension introduces a second axis (column) into step records. Two on-wire encodings were considered; the empirical benchmark in `tracing-formats-benchmarks` (`results/ctfs_column_extension/REPORT.md`, P6.2, 2026-06-10) **selected the separate `DeltaColumn` variant (Candidate A)** as the on-wire encoding. The losing candidate is documented below for archival reasons.
 
-#### Candidate A — separate `DeltaColumn` variant (Tag 0x02)
+#### Chosen — separate `DeltaColumn` variant (Tag 0x05)
 
 Adds a third step-event tag dedicated to column-only motion.
 
 ```
-[Tag: 0x02] [delta: signed varint]
+[Tag: 0x05] [delta: signed varint]
 Total: 2 bytes typical (1 tag + 1 varint for column delta ±63)
 ```
 
@@ -671,18 +673,13 @@ Semantics:
 
 Wire-format properties:
 
-* **Non-breaking.** Pre-extension readers parsed tags 0x00, 0x01, 0x02 (Raise), 0x03 (Catch), 0x04 (ThreadSwitch). The column extension reuses 0x02 — see "Tag-Space Conflict" below.
-* **Column-only step cost:** 2 bytes (1 tag + 1 zigzag varint). Same as a column-only `DeltaStep` would have cost if the encoder modelled it as a 1-D delta.
-* **No size change on existing events.** `DeltaStep` and `AbsoluteStep` byte layouts are unchanged.
+* **Tag allocation.** Tags 0x00-0x04 are already taken (AbsoluteStep, DeltaStep, Raise, Catch, ThreadSwitch); `DeltaColumn` is allocated to tag **0x05**. This avoids any conflict with existing event types and keeps the column extension entirely additive on the wire.
+* **Column-only step cost:** 2 bytes (1 tag + 1 zigzag varint).
+* **No size change on existing events.** `DeltaStep` and `AbsoluteStep` byte layouts are unchanged. Existing column-unaware readers see the new tag, fail the `bits 4-15 reserved` check in `meta.dat`, and refuse to open the trace cleanly rather than misdecoding.
 
-**Tag-space conflict (open question, flagged for P6.3).** The current execution-stream tag table assigns 0x02 to `Raise`. Candidate A as written needs either:
+#### Rejected — extended `DeltaStep` with column-delta flag bit (after P6.2 benchmark)
 
-1. A new tag (e.g. 0x05) for `DeltaColumn` — at the cost of one extra varint-bit in tag encoding for traces that mix many `DeltaColumn` events with `Raise`/`Catch`/`ThreadSwitch` events. The 5-bit tag region is unaffected at runtime, but the table grows.
-2. A flag-bit-gated reinterpretation: when the column-extension flag is set, tag 0x02 becomes `DeltaColumn`, and `Raise`/`Catch`/`ThreadSwitch` shift down or up by one slot. This is a breaking change for pre-extension readers, defeating the "non-breaking" property.
-
-Recommended resolution (P6.3): allocate a fresh tag (0x05) and accept the one-bit cost; pre-extension readers reject tags they don't know about anyway, so we are not gaining graceful back-compat by squatting on 0x02.
-
-#### Candidate B — extended `DeltaStep` with column-delta flag bit
+**Status:** rejected after benchmark in `tracing-formats-benchmarks` P6.2. Empirically ~2× more expensive than the chosen `DeltaColumn` variant on every measured corpus (raw bytes/step +84% to +102% vs the line-only baseline, vs +1.9% to +20.3% for `DeltaColumn`). Retained here for archival / spec-history reasons only — writers MUST NOT emit this format; readers MUST NOT recognise it.
 
 Folds the column delta into the existing `DeltaStep` event by prefixing the body with a single-byte flag header.
 
@@ -705,18 +702,28 @@ Wire-format properties:
 * **Cost of a line-only step (column extension on, no column change):** `1 (tag) + 1 (flag = 0) + varint(delta_line)` = **3 bytes** (vs 2 bytes baseline) — a 1-byte regression.
 * **Breaking change.** Pre-extension readers expect `tag(0x01) + signed_varint` directly; this format inserts a `flag_byte` before the varint. An old reader will misdecode the flag byte as the start of a varint (zigzag value 0 for `flag_byte = 0`, or some other small value) and then misalign permanently. The `meta.dat` column-extension flag (see §"Reader Behaviour and Back-Compat") MUST be checked before parsing the execution stream; readers that don't know the flag MUST refuse to open the trace.
 
-#### Trade-off Summary
+#### Comparison (archival)
 
-| Property | Candidate A (separate `DeltaColumn`) | Candidate B (extended `DeltaStep`) |
-|----------|--------------------------------------|------------------------------------|
-| Wire compatibility with line-only readers | Non-breaking modulo tag allocation | Breaking — flag-byte prefix shifts every `DeltaStep` body |
+| Property | `DeltaColumn` (chosen) | Extended `DeltaStep` (rejected) |
+|----------|------------------------|--------------------------------|
+| Wire compatibility with line-only readers | Additive — new tag 0x05; old readers reject cleanly via `meta.dat` bit 4 | Breaking — flag-byte prefix shifts every `DeltaStep` body |
 | Column-only step cost | 2 bytes (separate event) | 4 bytes (flag + line delta = 0 + column delta) |
 | Line-only step cost | 2 bytes (unchanged) | 3 bytes (flag overhead) |
 | Mixed line+column step cost | 4 bytes (two events) | 4 bytes (one event) |
-| Encoder complexity | Low — pick one of two tags per step | Medium — flag-byte assembly, but no event-stream splitting |
+| Encoder complexity | Low — pick one of two tags per step | Medium — flag-byte assembly per event |
 | Decoder complexity | Low — tag dispatch | Medium — flag-byte parsing per event |
 
-**Rule of thumb:** Candidate A wins when column-only steps are rare relative to line-only steps (so the column events don't dominate stream volume). Candidate B wins when column-only steps are common (typical of fine-grained statement tracking, e.g. Ruby method chains on one line, or compound expressions stepped one operand at a time). The empirical split is what P6.2 measures.
+**Empirical result (P6.2, synthetic 100k-step corpora, raw bytes/step vs line-only baseline):**
+
+| Corpus | `DeltaColumn` | Extended `DeltaStep` |
+|--------|--------------:|---------------------:|
+| `python_co_positions`   | +4.6%  | +98.3%  |
+| `js_sourcemap_minified` | +1.9%  | +101.9% |
+| `cpp_dwarf`             | +18.3% | +86.0%  |
+| `rust_dwarf`            | +20.3% | +84.4%  |
+| `cairo`                 | +12.2% | +92.0%  |
+
+`DeltaColumn` wins on every corpus shape, including the within-line-heavy `js_sourcemap_minified` end and the line-transition-heavy `rust_dwarf` / `cpp_dwarf` end. See `tracing-formats-benchmarks/results/ctfs_column_extension/REPORT.md` for the full table and methodology.
 
 ### paths.dat per-line offset table
 
@@ -760,15 +767,15 @@ Notes:
 * Reading source-file paths (a frequent operation in the UI, e.g. populating a file picker) doesn't pull line-length data into cache.
 * Costs one extra CTFS internal file per trace.
 
-#### Recommendation
+#### Choice — Layout A
 
-Adopt **Layout A** unless P6.2 benchmarks show measurable cache-thrash on path-only lookups. The reasons:
+**Layout A is the chosen layout.** Reasons:
 
 1. `paths.dat` is already loaded at trace open as part of the interning-table warm-up; appending per-line data adds I/O exactly when the reader is already paying it.
-2. The total per-line data is small (a few hundred KB for a 10K-line trace), so cache pressure is negligible.
+2. The total per-line data is small (a few hundred KB for a 10K-line trace), estimated <1% of total trace size — cache pressure is negligible.
 3. Fewer CTFS internal files = simpler container layout, simpler sharded-trace logic (see `ctfs-container.md`).
 
-P6.2 should empirically validate this on real traces. If path-only lookups (UI file picker) measurably regress when line lengths are inline, switch to Layout B in P6.3.
+Layout B remains documented as a fallback. If a real column-aware recorder (P6.4-P6.6 in the campaign that landed this extension) surfaces measurable cache-thrash on path-only lookups (e.g. UI file picker), revisit.
 
 ### Reader Behaviour and Back-Compat
 
@@ -804,16 +811,17 @@ In a typical trace, ~80-90% of steps are sequential lines within a function (del
 
 Combined with Zstd compression on the already-compact delta stream, effective per-step storage drops below 1 byte.
 
-#### Column Extension Cost Estimate
+#### Column Extension Cost (empirical, P6.2)
 
-The column extension adds bytes to step records and to `paths.dat` (Layout A) or the new `paths.lineoffsets.dat` (Layout B). Rough pre-benchmark estimates:
+Measured on five synthetic 100k-step per-language step corpora (`python_co_positions`, `js_sourcemap_minified`, `cpp_dwarf`, `rust_dwarf`, `cairo`) with the chosen `DeltaColumn` encoding:
 
-* **Step stream growth (Candidate A):** column-only steps are ~10-20% of all steps in typical fine-grained traces (statement tracking with column resolution). Each costs 2 bytes (vs not being emitted at all in the line-only baseline). Estimated step-stream growth: **+5-10%** before Zstd, less after (column deltas cluster around ±1, ±2, which Zstd compresses very well).
-* **Step stream growth (Candidate B):** every `DeltaStep` grows by 1-2 bytes (flag + optional column delta). Same-line steps that didn't exist as separate events in baseline are now folded in for free. Net: **+8-15%** before Zstd for traces with frequent column motion; closer to **+5%** for traces dominated by line-only motion.
-* **`paths.dat` growth:** per-line offset table adds roughly `line_count × 1-2 bytes` per file. For a 10K-line trace, ~10-20 KB total — typically <1% of total trace size.
-* **Headline budget:** the column extension is targeted at **≤10% total trace size increase** on real traces. The empirical benchmark (P6.2, `tracing-formats-benchmarks` TF-Mn) lands precise per-candidate, per-language numbers.
+* **Step stream raw growth:** +1.9% to +20.3% over the line-only baseline (depending on within-line column-motion density). Best case JS-minified (almost all within-line, +1.9%); worst case Rust DWARF (mostly line transitions, +20.3%).
+* **Step stream after Zstd:** absolute cost stays under **1.0 byte/step** on every corpus (worst case 0.897 B/step on `js_sourcemap_minified`).
+* **`paths.dat` growth (Layout A):** per-line offset table adds roughly `line_count × 1-2 bytes` per file. For a 10K-line trace, ~10-20 KB total — typically <1% of total trace size.
 
-Open question (P6.3): if the empirical numbers blow the ≤10% budget on Candidate B for one or more important languages, fall back to Candidate A — the non-breaking encoding is always available as a safety net.
+**Budget framing.** The earlier "≤10% total trace size increase" target was relative to a line-only baseline that compresses extraordinarily well (0.095-0.40 B/step after Zstd, dominated by `+1` line deltas that Zstd run-length-collapses). No column-aware encoding can stay within +10% of that figure, by construction. The correct budget formulation is in **absolute bytes-per-step**: column-aware traces under the chosen `DeltaColumn` encoding cost **< 1.0 B/step after Zstd** on every measured corpus, which on a 10M-step trace is on the order of ~10 MB of column data on top of the ~4 MB line-only baseline.
+
+The synthetic-corpus numbers are subject to revision once column-aware recorders ship (Python `co_positions`, DWARF column extraction, Cairo). Re-run the bench against real traces before treating the absolute figures as final.
 
 ### Chunked Compression
 
