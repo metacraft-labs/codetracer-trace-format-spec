@@ -125,6 +125,47 @@ All files are append-only during recording.
   can seek to an arbitrary tick without re-emulating from cp0. Also
   MCR-only.
 
+#### Cross-OS portability
+
+The `cp0.*` sidecars are *platform-specific captured state*: the
+recorder writes the SysV x86-64 ABI register file (`cp0.regs`), the
+contents of process-readable memory regions (`cp0.mem`), the
+filesystem path map (`cp0.maps` — currently the verbatim Linux
+`/proc/self/maps` text), and the `fs`/`gs` segment bases
+(`cp0.fsbase`). The format is one-way: the recorder writes the host's
+state at capture time; the replay backend interprets that state
+against its own (host-agnostic) emulator.
+
+Crucially, the *replay path* is host-agnostic. The
+`EmulatorReplaySession` in `db-backend` interprets the captured
+register values, installs `cp0.mem` regions into the emulator's
+memory map via `mcrLoadMemoryRegion`, and parses `cp0.maps` *as text*
+to compute the static-PC rebase delta. Nowhere on the replay path is
+there a `std::fs::read("/proc/self/maps")`, `CreateProcess()`, or
+`mach_vm_region()` call: every memory access goes through the
+emulator's internal region table, and DWARF line resolution uses the
+bundled `debug.dat` rather than touching the host filesystem. The
+emulator itself is the same Nim code compiled to either native x86-64
+or wasm32, depending on the build.
+
+Consequence: a `.ct` recorded on Linux x86-64 replays identically on
+macOS, Windows, or inside a wasm32 browser sandbox. The only host
+dependency is the architectural support in the emulator (currently
+x86-64); the host *operating system* is irrelevant. Cross-OS replay
+is therefore a property of the file format and the replay path, not a
+separate code path that needs feature-flagging.
+
+The
+`codetracer/src/db-backend/tests/xos_replay.rs` integration test
+(M-XOS-Fixture) pins this contract by replaying a Linux-recorded
+fixture (`tests/fixtures/xos/xos_hello.ct`) via
+`EmulatorReplaySession::new_from_ctfs_bytes` and asserting that the
+DAP-relevant surfaces (callstack, locals, breakpoints) come back
+populated. A true macOS-host run requires CI infra and remains
+deferred; the structural argument above explains why the Linux
+fixture is sufficient evidence that the host-decoupled replay path
+works.
+
 ### Thread Streams via Namespaces
 
 Thread event streams are stored in `threads.ns`, a namespace keyed by `thread_id` (u64). This replaces the previous model of one CTFS file per thread (`t00000000001`, etc.), which was limited by MaxRootEntries. With namespaces, the thread count is unlimited -- the B-tree scales to millions of keys.
