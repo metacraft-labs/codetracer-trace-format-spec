@@ -38,7 +38,9 @@ This is what the debugger steps through. Each record is compact and fixed-size w
 | 2 | Raise | exception_type_id: varint, message_len: varint, message: bytes | varies |
 | 3 | Catch | exception_type_id: varint | ~2 bytes |
 | 4 | ThreadSwitch | thread_id: varint | 2 bytes |
-| 5 | DeltaColumn | delta: signed varint | 2 bytes (column-aware traces only) |
+| 5 | ThreadStart | thread_id: varint | 2 bytes (legacy — present in the current canonical Nim writer; the spec intent is to infer this from the first ThreadSwitch to a new thread_id) |
+| 6 | ThreadExit | thread_id: varint | 2 bytes (legacy — present in the current canonical Nim writer; the spec intent is to infer this from the last step in a thread) |
+| 7 | DeltaColumn | delta: signed varint | 2 bytes (column-aware traces only) |
 
 Step records do not carry `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` — each call record stores `[first_step_id, last_step_id]` ranges. This is O(log log C), typically 2-3 iterations, and avoids doubling the step record size.
 
@@ -134,7 +136,9 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 | 2 | `Raise` | `exception_type_id: varint`, `message_len: varint`, `message: bytes` | Exception raised (before unwinding) |
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
 | 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
-| 5 | `DeltaColumn` | `delta: signed varint` | Column-only step within the current line; emitted only when the trace's `meta.dat` `FLAG_HAS_COLUMN_AWARE_STEPS` bit is set (see §"Source Location Addressing") |
+| 5 | `ThreadStart` | `thread_id: varint` | Legacy — current canonical Nim writer emits this; spec intent is to infer from first ThreadSwitch |
+| 6 | `ThreadExit` | `thread_id: varint` | Legacy — current canonical Nim writer emits this; spec intent is to infer from last step |
+| 7 | `DeltaColumn` | `delta: signed varint` | Column-only step within the current line; emitted only when the trace's `meta.dat` `FLAG_HAS_COLUMN_AWARE_STEPS` bit is set (see §"Source Location Addressing") |
 
 ### Value Stream Events (`steps.dat`)
 
@@ -655,12 +659,12 @@ The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then uns
 
 The column extension introduces a second axis (column) into step records. Two on-wire encodings were considered; the empirical benchmark in `tracing-formats-benchmarks` (`results/ctfs_column_extension/REPORT.md`, P6.2, 2026-06-10) **selected the separate `DeltaColumn` variant (Candidate A)** as the on-wire encoding. The losing candidate is documented below for archival reasons.
 
-#### Chosen — separate `DeltaColumn` variant (Tag 0x05)
+#### Chosen — separate `DeltaColumn` variant (Tag 0x07)
 
 Adds a third step-event tag dedicated to column-only motion.
 
 ```
-[Tag: 0x05] [delta: signed varint]
+[Tag: 0x07] [delta: signed varint]
 Total: 2 bytes typical (1 tag + 1 varint for column delta ±63)
 ```
 
@@ -673,7 +677,7 @@ Semantics:
 
 Wire-format properties:
 
-* **Tag allocation.** Tags 0x00-0x04 are already taken (AbsoluteStep, DeltaStep, Raise, Catch, ThreadSwitch); `DeltaColumn` is allocated to tag **0x05**. This avoids any conflict with existing event types and keeps the column extension entirely additive on the wire.
+* **Tag allocation.** Tags 0x00-0x06 are already taken (AbsoluteStep, DeltaStep, Raise, Catch, ThreadSwitch, ThreadStart, ThreadExit — the last two are present in the current canonical Nim writer even though they are marked for future removal in §"Sketched Removals"). `DeltaColumn` is allocated to tag **0x07**. This avoids any conflict with existing event types and keeps the column extension entirely additive on the wire.
 * **Column-only step cost:** 2 bytes (1 tag + 1 zigzag varint).
 * **No size change on existing events.** `DeltaStep` and `AbsoluteStep` byte layouts are unchanged. Existing column-unaware readers see the new tag, fail the `bits 4-15 reserved` check in `meta.dat`, and refuse to open the trace cleanly rather than misdecoding.
 
@@ -706,7 +710,7 @@ Wire-format properties:
 
 | Property | `DeltaColumn` (chosen) | Extended `DeltaStep` (rejected) |
 |----------|------------------------|--------------------------------|
-| Wire compatibility with line-only readers | Additive — new tag 0x05; old readers reject cleanly via `meta.dat` bit 4 | Breaking — flag-byte prefix shifts every `DeltaStep` body |
+| Wire compatibility with line-only readers | Additive — new tag 0x07; old readers reject cleanly via `meta.dat` bit 4 | Breaking — flag-byte prefix shifts every `DeltaStep` body |
 | Column-only step cost | 2 bytes (separate event) | 4 bytes (flag + line delta = 0 + column delta) |
 | Line-only step cost | 2 bytes (unchanged) | 3 bytes (flag overhead) |
 | Mixed line+column step cost | 4 bytes (two events) | 4 bytes (one event) |
