@@ -375,7 +375,7 @@ Header (8 bytes):
     bit 2       -- FLAG_HAS_LAYOUT_SNAPSHOT (M-RLP-2, see below)
     bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
     bit 4       -- FLAG_HAS_COLUMN_AWARE_STEPS (column-aware step encoding, see trace-events.md §"Reader Behaviour and Back-Compat")
-    bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (source_views.dat present, see §"Alternate Source Views" below)
+    bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (srcviews.dat present, see §"Alternate Source Views" below)
     bits 6..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
@@ -649,7 +649,7 @@ The replay-server's existing sourcemap V3 translation path then
 discovers the formatted view through these CTFS internal files —
 **no replay-time subprocess invocation**.
 
-### `source_views.dat` / `source_views.off`
+### `srcviews.dat` / `srcviews.off`
 
 Variable-size record table interning **alternate views** of source
 paths registered in `paths.dat`. Each record carries one formatted
@@ -667,17 +667,17 @@ view of one source.
 | `map` | bytes | A sourcemap V3 (JSON, UTF-8) mapping positions in `content` BACK to positions in the original source at `path_id`. The inverse map direction matters: replay-server's existing P3 translation expects `(generated, line, col) → (original_source, line, col, name?)` segments, where "generated" is the formatted view and "original" is the recorded minified source. |
 
 Records are referenced by 0-based index. The reader loads
-`source_views.dat` lazily — most traces won't carry any alternate
+`srcviews.dat` lazily — most traces won't carry any alternate
 views.
 
 ### Discovery rules
 
 A replay-server consuming a CTFS trace SHOULD:
 
-1. Load `source_views.dat` / `source_views.off` if present.
+1. Load `srcviews.dat` / `srcviews.off` if present.
 2. For each recorded step whose `(path_id, line, column)` lookup
    targets `paths.dat[path_id]`, check whether any
-   `source_views.dat` entry has matching `path_id`. If so, prefer
+   `srcviews.dat` entry has matching `path_id`. If so, prefer
    the alternate view for UI display:
    - Surface `view_name` as the file path in DAP `stackTrace`
      responses.
@@ -717,7 +717,7 @@ Recorders that emit alternate views MUST:
 
 ### Back-compat
 
-Pre-extension traces (no `source_views.dat`) are byte-for-byte
+Pre-extension traces (no `srcviews.dat`) are byte-for-byte
 compatible with column-aware readers (P6.5 contract): the
 `paths.dat` per-line offset table (Layout A) is independent of the
 alternate-views machinery. Readers that detect the bit-5 flag but
@@ -730,15 +730,15 @@ contract.
 - **codetracer-js-recorder** (commit `d493ab9`) ships an
   out-of-CTFS variant: formatted views land under
   `<trace_dir>/files/<name>.fmt.js` + `<name>.fmt.js.map` rather
-  than `source_views.dat`. This is a transitional convention
+  than `srcviews.dat`. This is a transitional convention
   predating this spec section; future js-recorder releases will
-  migrate to `source_views.dat`.
+  migrate to `srcviews.dat`.
 - **codetracer-python-recorder** (commit `06129daf`) ships the
   module + CLI flag + tests but defers the recording-flow
   integration pending the writer-side wire-format change this
   section describes.
 - **codetracer-trace-format-nim** writer support for
-  `source_views.dat` is the prerequisite for closing the Python
+  `srcviews.dat` is the prerequisite for closing the Python
   recorder integration.
 
 The campaign that drove this section is documented in
