@@ -374,7 +374,9 @@ Header (8 bytes):
     bit 1       -- FLAG_HAS_REPLAY_LAUNCH_FIELDS (M-RLP-1, see below)
     bit 2       -- FLAG_HAS_LAYOUT_SNAPSHOT (M-RLP-2, see below)
     bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
-    bits 4..15  -- reserved; readers reject when set
+    bit 4       -- FLAG_HAS_COLUMN_AWARE_STEPS (column-aware step encoding, see trace-events.md §"Reader Behaviour and Back-Compat")
+    bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (source_views.dat present, see §"Alternate Source Views" below)
+    bits 6..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
   recording_id: varint length + UTF-8 bytes (required, M-REC-1)
@@ -631,3 +633,114 @@ Memory mapping table.
 | +16 | 8 | `binary_ref` (u64 LE, Base40) |
 | +24 | 8 | `file_offset` (u64 LE) |
 | +32 | 1 | `permissions` (u8: bit 0=read, 1=write, 2=execute, 3=private) |
+
+---
+
+## Alternate Source Views (Deminification Support)
+
+When a recorder encounters a **minified source** (heuristic: average line
+length exceeds a configurable threshold, default 500 characters) AND no
+companion sourcemap V3 exists upstream, it MAY pre-format the source at
+record time using a language-appropriate formatter (`prettier` for
+JS/TS, `black` for Python, etc.) and bake the formatted view +
+position map into the trace.
+
+The replay-server's existing sourcemap V3 translation path then
+discovers the formatted view through these CTFS internal files —
+**no replay-time subprocess invocation**.
+
+### `source_views.dat` / `source_views.off`
+
+Variable-size record table interning **alternate views** of source
+paths registered in `paths.dat`. Each record carries one formatted
+view of one source.
+
+| Field | Encoding | Notes |
+|-------|----------|-------|
+| `path_id` | varint | Index into `paths.dat` — the original source this view applies to |
+| `view_kind` | u8 | 0 = `raw` (no transformation, rarely emitted), 1 = `prettier_format`, 2 = `black_format`, 3-127 reserved, 128+ = vendor-specific |
+| `view_name_len` | varint | Length of `view_name` |
+| `view_name` | bytes | Human-readable name shown in the UI (e.g., `"lodash.fmt.js"`); typically the original name with a `.fmt.<ext>` suffix |
+| `content_len` | varint | Length of `content` |
+| `content` | bytes | The formatted source as UTF-8 bytes |
+| `map_len` | varint | Length of `map` (0 = no sourcemap) |
+| `map` | bytes | A sourcemap V3 (JSON, UTF-8) mapping positions in `content` BACK to positions in the original source at `path_id`. The inverse map direction matters: replay-server's existing P3 translation expects `(generated, line, col) → (original_source, line, col, name?)` segments, where "generated" is the formatted view and "original" is the recorded minified source. |
+
+Records are referenced by 0-based index. The reader loads
+`source_views.dat` lazily — most traces won't carry any alternate
+views.
+
+### Discovery rules
+
+A replay-server consuming a CTFS trace SHOULD:
+
+1. Load `source_views.dat` / `source_views.off` if present.
+2. For each recorded step whose `(path_id, line, column)` lookup
+   targets `paths.dat[path_id]`, check whether any
+   `source_views.dat` entry has matching `path_id`. If so, prefer
+   the alternate view for UI display:
+   - Surface `view_name` as the file path in DAP `stackTrace`
+     responses.
+   - Surface `content` via the DAP `source` request (or the UI's
+     filesystem-based reader through a materialized sidecar — both
+     resolutions are acceptable).
+   - Translate the recorded `(line, column)` through `map` to
+     positions in `content` before reporting.
+3. When multiple alternate views exist for one path (e.g., a
+   `prettier_format` AND a `black_format` — unusual but legal),
+   pick the one whose `view_kind` matches the source's language.
+   Fall back to the lowest-numbered `view_kind` if no clean match.
+
+### Recorder responsibility
+
+Recorders that emit alternate views MUST:
+
+1. Set the `meta.dat` flag bit 5 = `FLAG_HAS_ALTERNATE_SOURCE_VIEWS`
+   (bits 0-4 are allocated by prior milestones — see
+   trace-events.md §"Reader Behaviour and Back-Compat" for the
+   strict-rejection contract on unknown bits).
+2. Run the formatter as a one-shot at record start, NOT per-step.
+3. Skip the format pass when:
+   - The source has a sibling `<source>.map` upstream (the
+     upstream sourcemap is authoritative; recorder-side
+     re-formatting would override the user's choice of map).
+   - The source's average line length is below the threshold
+     (heuristic for "this is minified code").
+   - The formatter's output line count does not exceed the
+     input's (no point materializing an identical view).
+   - The configured kill switch is active (the
+     `CT_AUTOFORMAT={0|off|false|no}` environment variable is the
+     spec-canonical mechanism).
+4. Treat formatter failures as soft: log a one-shot warning, omit
+   the alternate view, continue recording. The trace remains
+   usable without the view.
+
+### Back-compat
+
+Pre-extension traces (no `source_views.dat`) are byte-for-byte
+compatible with column-aware readers (P6.5 contract): the
+`paths.dat` per-line offset table (Layout A) is independent of the
+alternate-views machinery. Readers that detect the bit-5 flag but
+don't understand alternate views MUST reject the trace cleanly per
+the existing "bits 4-15 reserved; unknown bits cause rejection"
+contract.
+
+### Implementation status
+
+- **codetracer-js-recorder** (commit `d493ab9`) ships an
+  out-of-CTFS variant: formatted views land under
+  `<trace_dir>/files/<name>.fmt.js` + `<name>.fmt.js.map` rather
+  than `source_views.dat`. This is a transitional convention
+  predating this spec section; future js-recorder releases will
+  migrate to `source_views.dat`.
+- **codetracer-python-recorder** (commit `06129daf`) ships the
+  module + CLI flag + tests but defers the recording-flow
+  integration pending the writer-side wire-format change this
+  section describes.
+- **codetracer-trace-format-nim** writer support for
+  `source_views.dat` is the prerequisite for closing the Python
+  recorder integration.
+
+The campaign that drove this section is documented in
+`codetracer-specs/Planned-Features/Column-Aware-Tracing-And-Deminification.milestones.org`
+§P6.2.
