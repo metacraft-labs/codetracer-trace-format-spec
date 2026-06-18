@@ -787,15 +787,15 @@ The column extension is signalled by a new flag bit in `meta.dat`. See `internal
 
 **Allocation:** bit 4 — `FLAG_HAS_COLUMN_AWARE_STEPS`. When set:
 
-* Per-line offset tables are present (Layout A: inline in `paths.dat`; Layout B: companion `paths.lineoffsets.dat`).
+* Per-line offset tables are present in `paths.dat` (Layout A — see §"paths.dat per-line offset table" and `internal-files.md` §"paths.dat Layout A").
 * Step records' `global_position_index` addresses `(line, column)` pairs, not lines.
-* Whichever column-encoding candidate (A or B) is selected in P6.3 applies to the entire trace; the choice is **not** mixable within a single trace.
+* The execution stream MAY contain `DeltaColumn` (tag 0x07) records that advance the cursor's column within the current line.
 
 When `FLAG_HAS_COLUMN_AWARE_STEPS` is clear (legacy default):
 
 * `global_position_index ≡ global_line_index` — single-axis line addressing.
 * No per-line offset tables.
-* Step records use the existing line-only `AbsoluteStep` / `DeltaStep` layout.
+* Step records use the existing line-only `AbsoluteStep` / `DeltaStep` layout; `DeltaColumn` (tag 0x07) MUST NOT appear.
 
 Reader rules:
 
@@ -803,7 +803,20 @@ Reader rules:
 2. A reader that **does not understand** the flag MUST detect the unknown bit (per the existing "bits 4-15 reserved; readers reject when set" rule in `internal-files.md`) and refuse to open the trace rather than silently misdecoding the step stream.
 3. Writers MUST NOT mix column-aware and line-only step records within a single trace. The flag is trace-global.
 
-The Candidate B wire-format break is contained behind the flag: a pre-extension reader sees bit 4 set, rejects, and never enters the `DeltaStep` parse path. A pre-extension reader on a non-column trace works exactly as before.
+`FLAG_HAS_COLUMN_AWARE_STEPS` is a *wire-format* flag — it says columns
+are present, not that they are sharp enough for breakpoint placement or
+per-column motion. Two separate **capability** flags tell the GUI
+whether per-column affordances should be enabled:
+
+* bit 6 — `FLAG_SUPPORTS_COLUMN_BREAKPOINTS`: recorder's columns are
+  sharp enough to place a breakpoint at a specific `(line, column)`.
+* bit 7 — `FLAG_SUPPORTS_COLUMN_MOTIONS`: recorder supports per-column
+  step over / in / out (step predicate fires per statement-start, not
+  per line).
+
+When either capability bit is clear, the GUI MUST disable the
+corresponding affordance. See `internal-files.md` §"Column-Aware
+Capability Flags" for the full contract.
 
 ### Compression Impact
 
@@ -839,3 +852,211 @@ steps.idx:  [chunk_size: u32][offset_0: u64][offset_1: u64]...
 The companion index `steps.idx` starts with the records-per-chunk count (u32 LE), followed by one u64 byte offset per chunk. To seek to a specific record, compute `chunk = record_id / chunk_size`, read the byte offset from the index, and decompress only that chunk. See [seekable-zstd.md](seekable-zstd.md) for the full companion index format.
 
 Default Zstd compression level: 3.
+
+## Recorder Integration — Column-Aware Steps
+
+This section is the integration contract for recorders that want to emit
+column-aware traces. The wire-format pieces (tag 0x07 `DeltaColumn`,
+`paths.dat` Layout A, `meta.dat` bit 4) are documented above; this
+section pins down the *recorder-side* API surface and the per-language
+coverage matrix.
+
+### Canonical Recorder Integration Pattern
+
+The canonical sequence — driven by the Rust safe wrapper in
+`codetracer-trace-format` (`NimTraceWriter`) — is:
+
+```rust
+// Once, before start(): opt in to column-aware encoding. Sets
+// meta.dat bit 4 and switches the writer's step encoder to emit
+// DeltaColumn (tag 0x07) records.
+writer.enable_column_aware_steps();
+
+// Once per source path, before start(): register the path together
+// with the per-line byte-length table that the reader needs to
+// decode (line, column) from global_position_index. `lengths[i]`
+// is the byte length of line i (1-based source index) plus 1 for
+// the "one past EOL" position.
+writer.register_path_with_line_lengths(path, &lengths);
+
+// Start recording at the entry point.
+writer.start(path, line);
+
+// Per step: emit a column-aware step. When `column` is Some(c),
+// the writer threads the column through register_step + a
+// follow-up register_delta_column so the step lands at (line, c).
+// When `column` is None, the writer falls back to a line-only
+// step and the reader surfaces column=None for that step.
+for (path, line, column) in steps {
+    writer.register_step_with_column(path, line, column);
+}
+```
+
+**Why the split (`register_step` + `register_delta_column`).** Prior to
+the column-aware navigation campaign (C1), `NimTraceWriter::register_step_with_column`
+dropped the `column` argument on the floor — it emitted a line-only
+step. The C1 fix threads the column through as two separate writer
+calls: `register_step` (which emits `AbsoluteStep` or `DeltaStep`
+addressing `(line, column=1)`), followed by `register_delta_column`
+(which emits `DeltaColumn` with `column - 1` as the delta). The result
+on the wire is a `(step, column-delta)` pair that decodes to the exact
+`(line, column)` the recorder asked for. Recorders MUST call the safe
+wrapper rather than driving the two FFI symbols directly unless they
+own the bookkeeping for tracking the previous column themselves.
+
+### FFI Symbols (column-aware extensions)
+
+The column-aware extension adds four C FFI symbols to the writer ABI.
+All are no-ops on column-unaware traces (they fail-closed without
+corrupting the trace if called on a writer that has not had
+`trace_writer_enable_column_aware_steps` invoked).
+
+```c
+// Opt in to column-aware encoding. Must be called before start().
+// Sets meta.dat bit 4 (FLAG_HAS_COLUMN_AWARE_STEPS) and switches
+// the writer's step encoder. Idempotent.
+void trace_writer_enable_column_aware_steps(trace_writer_t handle);
+
+// Register a source path together with its per-line byte-length
+// table. Must be called before start() for every path the trace
+// will reference. `lengths` is an array of `line_count` u32 values;
+// `lengths[i]` is the byte length of line i+1 (1-based) plus 1.
+// The writer copies the table into paths.dat Layout A.
+void trace_writer_register_path_with_line_lengths(
+    trace_writer_t handle,
+    const char* path,
+    const uint32_t* lengths,
+    uint32_t line_count);
+
+// Emit a column-aware step in one FFI call. Equivalent to a step at
+// (path, line) followed by a register_delta_column for `column - 1`
+// when `has_column != 0`. When `has_column == 0`, behaves like the
+// legacy line-only ct_assignment.
+void ct_assignment_with_column(
+    trace_writer_t handle,
+    const char* path,
+    uint32_t line,
+    uint32_t column,
+    int has_column);
+
+// Emit a DeltaColumn (tag 0x07) record after a Step. `column_delta`
+// is the signed delta from the previous step's column. The writer
+// MUST have been put into column-aware mode via
+// trace_writer_enable_column_aware_steps; calling this on a
+// column-unaware writer is a no-op (the writer records a one-shot
+// diagnostic).
+void trace_writer_register_delta_column(
+    trace_writer_t handle,
+    int32_t column_delta);
+```
+
+The Rust safe wrapper (`NimTraceWriter` in the `codetracer-trace-writer`
+crate) re-exports these as `enable_column_aware_steps`,
+`register_path_with_line_lengths`, `register_step_with_column` (which
+internally chains `register_step` and `register_delta_column`), and
+`register_delta_column`. The Nim canonical writer
+(`codetracer-trace-format-nim`) exposes the same surface under the
+`writeColumnAware*` family.
+
+### WASM DWARF Subtlety
+
+The WASM recorder consumes DWARF emitted by the target language's
+compiler. For Rust → WASM, `rustc` emits column-refinement DWARF rows
+**without `is_stmt`** for positions inside a sub-expression — i.e. the
+column changes between rows but the row is not flagged as a statement
+boundary. A naive PC → `(file, line, column)` indexer that filters on
+`is_stmt == true` (the usual heuristic for "this row is a steppable
+statement") will silently drop these refinements and end up emitting
+only line-granularity columns.
+
+The column-aware WASM recorder MUST index *all* DWARF line-program rows
+(including `is_stmt == false`) so that column data is available to the
+step predicate. The step predicate itself can still gate on `is_stmt`
+when deciding whether to *emit* a step, but the underlying PC → source
+map must carry every row's column.
+
+This subtlety affects only the WASM recorder today; native DWARF
+recorders that consume the same compiler output (when those land) will
+inherit the same requirement.
+
+### Per-Recorder Integration Matrix
+
+Column-aware status of each in-tree recorder as of this spec revision.
+"PASS" recorders set `FLAG_HAS_COLUMN_AWARE_STEPS` (bit 4) and SHOULD
+also set the two capability bits (`FLAG_SUPPORTS_COLUMN_BREAKPOINTS`,
+`FLAG_SUPPORTS_COLUMN_MOTIONS` — bits 6 and 7) whenever their step
+predicate is genuinely per-statement. "Not supported" recorders leave
+bit 4 clear and the capability bits clear. See `internal-files.md`
+§"Column-Aware Capability Flags" for the contract.
+
+| Recorder | Status | Notes |
+|----------|--------|-------|
+| JavaScript (V8) | PASS | Multi-statement-per-line distinguishable via V8 source positions; in production |
+| EVM / Solidity (M-evm) | PASS | Solidity sourcemap entries carry column; in production |
+| Solana SBF (M-sol) | PASS | SBF DWARF; in production |
+| Cairo (M-cairo) | PASS | Cairo compiler emits column for each instruction; in production |
+| Flow / Cadence (M-flow) | PASS | Cadence parser exposes column on each statement node; in production |
+| PolkaVM (M-polkavm) | PASS | PolkaVM DWARF; in production |
+| Move (M-move) | PASS | Move compiler emits column for each bytecode; in production |
+| WASM (M-wasm) | PASS | DWARF column rows; see §"WASM DWARF Subtlety" above |
+| Noir (M-noir-v2) | PASS | Unblocked via the codetracer Noir compiler fork; in production |
+| Nim compile-time (M-nim) | PASS | Nim macro AST has column on every node; in production |
+| Cardano / Aiken | NOT SUPPORTED | Aiken parser is line-oriented; column data is not produced upstream |
+| Leo (Aleo) | NOT SUPPORTED | Aleo parser drops the second statement on a multi-stmt line, so per-column distinction is unrecoverable |
+| TON Tolk | NOT SUPPORTED | Same root cause as Leo — parser drops the second statement on a multi-stmt line |
+| Ruby | NOT SUPPORTED | `TracePoint` fires once per line; no sub-line callback hook exists |
+| Circom | NOT SUPPORTED | Compiler emits no column information anywhere in its source-position pipeline |
+| Fuel / Sway | NOT SUPPORTED | Sway compiler does not currently emit columns; revisit when upstream lands columns |
+| Miden MASM | NOT SUPPORTED | Step predicate is line-only by construction (one MASM instruction per line) |
+| Shell recorders | WONTFIX | Shell traces have no statement positions to attach columns to |
+| Native MCR | OUT OF SCOPE | MCR uses a different replay model; columns flow through `debug.dat` DWARF at replay time, not through CTFS step records |
+
+**Upstream-blocked recorders.** None currently. The Noir recorder was
+previously blocked on upstream column support; it was unblocked via the
+codetracer Noir compiler fork during this campaign and is now in the
+PASS column.
+
+A "NOT SUPPORTED by language constraint" recorder MUST leave bit 4
+clear in `meta.dat` rather than emit synthetic column=1 values — the
+contract is that a column-aware trace's columns mean something, and a
+recorder that cannot produce meaningful columns must opt out of the
+extension entirely.
+
+## Known Issues — Column-Aware
+
+Open issues from the column-aware navigation campaign as of this spec
+revision. These are recorder/writer bugs, not wire-format bugs — the
+on-wire format is stable; fixes will land in the writer crates without
+requiring trace re-recording.
+
+### `ct_print` drops `call_entry` past `stepCount`
+
+The writer-side close-time flush is asymmetric between the step stream
+and the call stream. When `ct_print` is invoked at trace shutdown, any
+`call_entry` event whose step index is greater than the writer's
+recorded `stepCount` is dropped instead of being flushed to `calls.dat`.
+Symptom: the very last function call in a short trace is missing from
+the call tree even though its steps appear in `steps.dat`.
+
+Workaround: emit a final no-op step before tearing down the writer so
+the last `call_entry` lands within `stepCount`. Fix tracked in the
+writer crate's close-path.
+
+### Writer's pending-value-after-`DeltaColumn`: trailing variable lost
+
+The writer's pending-value pipeline assumes that a `register_variable`
+call lands in the same flush window as the step it annotates. When
+column-aware mode is on, a `DeltaColumn` record can flush the pending
+buffer between the `register_step` and a *trailing* `register_variable`
+call, in which case the variable record is silently discarded.
+
+Symptom: the value of a variable assigned in the same statement as the
+column-final sub-expression is missing from the value stream. The step
+record itself is correct.
+
+Workaround: emit `register_variable` *before* the column-final
+sub-expression's `register_step_with_column`, or rely on the next
+step's `StepValues` snapshot to surface the missed value (the snapshot
+walks current bindings rather than the per-step delta).
+
+Fix tracked in the writer crate's pending-value flush ordering.

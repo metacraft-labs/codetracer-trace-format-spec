@@ -40,12 +40,38 @@ Deduplicated records using the variable-size record table pattern. A `.dat` file
 
 | Table | Data File | Offset File | Record Format |
 |-------|-----------|-------------|---------------|
-| Source paths | `paths.dat` | `paths.off` | raw bytes (file path) |
+| Source paths | `paths.dat` | `paths.off` | raw bytes (file path); column-aware traces append a per-line byte-length table — see "paths.dat Layout A" below |
 | Variable names | `varnames.dat` | `varnames.off` | raw bytes (name) |
 | Types | `types.dat` | `types.off` | kind: u8, lang_type_len: varint, lang_type: bytes, specific_info: binary |
 | Functions | `funcs.dat` | `funcs.off` | global_line_index: varint, name_len: varint, name: bytes |
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
+
+#### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
+
+When `meta.dat` bit 4 (`FLAG_HAS_COLUMN_AWARE_STEPS`) is set, each `paths.dat`
+record carries a per-line byte-length table after the path bytes so the
+reader can resolve `global_position_index → (file, line, column)`:
+
+```
+paths.dat record (column-aware traces):
+  path_len:    varint
+  path_bytes:  [u8] × path_len
+  line_count:  varint
+  line_lengths: [varint] × line_count    (zigzag-delta encoded from previous line)
+```
+
+`line_lengths[0]` is an absolute zigzag varint; subsequent entries are
+deltas from `line_lengths[i-1]`. Each line length SHOULD be the source
+line's byte count plus 1 so that the trailing "one past EOL" position
+(used for end-of-line breakpoints and statement-end markers) gets its
+own address. See `trace-events.md` §"paths.dat per-line offset table"
+for the rationale and the on-wire decoding algorithm.
+
+Pre-column traces have no `line_count` field; the record ends at
+`path_bytes`. Readers detect the extension via `meta.dat` bit 4 and parse
+the extra fields only when the flag is set. `paths.off` continues to
+point at record starts regardless of layout.
 
 ---
 
@@ -376,7 +402,9 @@ Header (8 bytes):
     bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
     bit 4       -- FLAG_HAS_COLUMN_AWARE_STEPS (column-aware step encoding, see trace-events.md §"Reader Behaviour and Back-Compat")
     bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (srcviews.dat present, see §"Alternate Source Views" below)
-    bits 6..15  -- reserved; readers reject when set
+    bit 6       -- FLAG_SUPPORTS_COLUMN_BREAKPOINTS (capability bit; see §"Column-Aware Capability Flags" below)
+    bit 7       -- FLAG_SUPPORTS_COLUMN_MOTIONS (capability bit; see §"Column-Aware Capability Flags" below)
+    bits 8..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
   recording_id: varint length + UTF-8 bytes (required, M-REC-1)
@@ -528,6 +556,42 @@ The canonical writer is `writeMetaDatToBuffer` in
 The canonical readers are the same Nim file's `readMetaDat` and the
 Rust `parse_meta_dat` in
 `codetracer/src/db-backend/src/ctfs_trace_reader/meta_dat.rs`.
+
+### Column-Aware Capability Flags
+
+`FLAG_HAS_COLUMN_AWARE_STEPS` (bit 4) signals only that *column data is
+present on the wire*. It says nothing about whether the columns are
+sharp enough for the GUI to place a breakpoint at, or motion-step
+through, a specific column. Two additional capability bits encode the
+recorder's contract with the GUI:
+
+| Bit | Name | Set when | GUI affordance gated on it |
+|-----|------|----------|-----------------------------|
+| 6 | `FLAG_SUPPORTS_COLUMN_BREAKPOINTS` | The recorder emits column positions sharp enough for breakpoint placement at a specific `(line, column)` pair | Per-column breakpoints; column gutter marks in the source view (M6 Alt+click affordance) |
+| 7 | `FLAG_SUPPORTS_COLUMN_MOTIONS` | The recorder supports per-column step-over / step-in / step-out (the step predicate fires per statement-start, not per line) | Column-aware step buttons; "step to next sub-expression" affordances |
+
+**Contract.** When either capability flag is clear, the GUI MUST disable
+the corresponding affordance — no per-column breakpoint UI, no
+per-column motion buttons — and fall back to line-only behaviour. A
+trace MAY set `FLAG_HAS_COLUMN_AWARE_STEPS` (so column data is
+available for *display*) while leaving both capability bits clear: the
+columns are good enough to highlight which sub-expression is current,
+but not sharp enough to place a breakpoint at or to step to.
+
+Setting either capability bit while `FLAG_HAS_COLUMN_AWARE_STEPS` is
+clear is undefined behaviour: capability flags presuppose column data
+on the wire. Writers SHOULD enforce this by gating the capability bits
+behind `columnAwareSteps` in their writer state.
+
+Recorders SHOULD set both capability bits when their step predicate is
+genuinely per-statement (e.g. JavaScript, Cairo, Solidity); recorders
+whose step predicate is per-line (e.g. Ruby's TracePoint, Aiken's
+line-oriented parser) MUST leave both bits clear even if they happen to
+emit a column for display purposes.
+
+Readers expose these bits through the existing `metadata.flags` JSON
+surface as `supports_column_breakpoints` / `supports_column_motions`,
+parallel to the established `has_column_aware_steps` field.
 
 ---
 
