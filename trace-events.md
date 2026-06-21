@@ -62,6 +62,21 @@ One record per step, containing all variable values visible at that step. This i
 
 The value stream is indexed in parallel with the execution stream — record N in `steps.dat` corresponds to step N in `steps.dat`. For steps with no variables (possible), the record is empty (just a zero count).
 
+> **Implementation note (M23b — CTFS file naming).** The summary table above
+> labels both the Execution stream and this Value stream `steps.dat`. That label
+> is a simplification: the two streams have fundamentally different record sizes
+> (execution records are 2-4 B; value records are 50-500 B) and therefore
+> different Zstd chunk sizing (see §"Benefits" #5: "value-heavy `steps.dat` gets
+> different Zstd settings"). A CTFS internal file is a single seekable byte range
+> with one companion `.idx`, so two streams cannot share one file. The
+> materialized container therefore stores the value stream as its **own seekable
+> CTFS file pair `values.dat` + `values.idx`** (mirroring `calls.dat`/`calls.idx`
+> and `steps.dat`/`steps.idx`), **parallel-indexed to `steps.dat`** (value record
+> N ↔ step N, an empty record for value-less steps). It is gated additively
+> behind the `meta.dat` capability flag `has_value_stream` (bit 10); readers that
+> do not know the bit ignore `values.dat`/`values.idx` and read the unified
+> `events.log` unchanged.
+
 #### 3. Call Stream (`calls.dat`) — call tree records, one per function call
 
 Each record represents a complete function call with entry/exit information.
