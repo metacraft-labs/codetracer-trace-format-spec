@@ -43,7 +43,7 @@ Step records do not carry `call_key`. To find a step's enclosing call, use propo
 
 Raise is emitted when an exception is raised (before unwinding). Catch is emitted when a `try/except` handler catches the exception.
 
-#### 2. Value Stream (`steps.dat`) — variable values, parallel-indexed by step
+#### 2. Value Stream (`values.dat`) — variable values, parallel-indexed by step
 
 One record per step, containing all variable values visible at that step. This is the largest stream (values are variable-length and numerous).
 
@@ -60,22 +60,9 @@ One record per step, containing all variable values visible at that step. This i
 | 8 | VariableCell | variable_id: varint, place: varint |
 | 9 | Assignment | to: varint, pass_by: u8, from: varint |
 
-The value stream is indexed in parallel with the execution stream — record N in `steps.dat` corresponds to step N in `steps.dat`. For steps with no variables (possible), the record is empty (just a zero count).
+The value stream is indexed in parallel with the execution stream — record N in `values.dat` corresponds to step N in `steps.dat`. For steps with no variables (possible), the record is empty (just a zero count).
 
-> **Implementation note (M23b — CTFS file naming).** The summary table above
-> labels both the Execution stream and this Value stream `steps.dat`. That label
-> is a simplification: the two streams have fundamentally different record sizes
-> (execution records are 2-4 B; value records are 50-500 B) and therefore
-> different Zstd chunk sizing (see §"Benefits" #5: "value-heavy `steps.dat` gets
-> different Zstd settings"). A CTFS internal file is a single seekable byte range
-> with one companion `.idx`, so two streams cannot share one file. The
-> materialized container therefore stores the value stream as its **own seekable
-> CTFS file pair `values.dat` + `values.idx`** (mirroring `calls.dat`/`calls.idx`
-> and `steps.dat`/`steps.idx`), **parallel-indexed to `steps.dat`** (value record
-> N ↔ step N, an empty record for value-less steps). It is gated additively
-> behind the `meta.dat` capability flag `has_value_stream` (bit 10); readers that
-> do not know the bit ignore `values.dat`/`values.idx` and read the unified
-> `events.log` unchanged.
+The materialized container stores the value stream as its own seekable CTFS file pair, `values.dat` + `values.idx`, because execution records and value records have fundamentally different sizes and chunking needs. It is gated additively behind the `meta.dat` capability flag `has_value_stream` (bit 10); readers that do not know the bit ignore `values.dat`/`values.idx`.
 
 #### 3. Call Stream (`calls.dat`) — call tree records, one per function call
 
@@ -113,7 +100,7 @@ Call records are written when the function returns (not at call entry), so they 
 | Stream | CTFS File | Purpose | Access Pattern | Typical Record Size |
 |--------|-----------|---------|----------------|-------------------|
 | Execution | `steps.dat` | Step-by-step timeline | Sequential scan, point lookup | 2-4 bytes |
-| Values | `steps.dat` | Variable values per step | Point lookup (parallel to exec) | 50-500 bytes |
+| Values | `values.dat` | Variable values per step | Point lookup (parallel to exec) | 50-500 bytes |
 | Calls | `calls.dat` | Call tree | Random access by call_key | 20-200 bytes |
 | IO Events | `events.dat` | I/O event log | Paginated scan | 20-1000 bytes |
 | Interning | `*.dat` + `*.off` | Paths, functions, types, names | Loaded at startup | Total 1-5MB |
@@ -123,8 +110,8 @@ Call records are written when the function returns (not at call entry), so they 
 1. **Event log loads instantly**: `events.dat` is independent, small, directly paginated
 2. **Call tree loads independently**: `calls.dat` is indexed by call_key, no step scanning needed
 3. **Step navigation is fast**: `steps.dat` records are tiny (2-4 bytes), so chunks hold thousands of steps
-4. **Value loading is on-demand**: `steps.dat` only loaded for the current step's variables
-5. **Streams compress independently**: DeltaStep-heavy `steps.dat` compresses extremely well; value-heavy `steps.dat` gets different Zstd settings
+4. **Value loading is on-demand**: `values.dat` is loaded only for the current step's variables
+5. **Streams compress independently**: DeltaStep-heavy `steps.dat` compresses extremely well; value-heavy `values.dat` gets different Zstd settings
 
 ### Varint IDs
 
@@ -149,7 +136,7 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
 | 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
 
-### Value Stream Events (`steps.dat`)
+### Value Stream Events (`values.dat`)
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|

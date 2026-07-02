@@ -56,8 +56,10 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 | File | Abstraction | Purpose |
 |------|-------------|---------|
 | `meta.dat` | Binary metadata | Program, paths, recorder info (see Metadata section) |
-| `steps.dat` | Chunked compressed | Combined execution + values stream (steps with embedded variable values) |
+| `steps.dat` | Chunked compressed | Execution stream: one compact record per debugger step |
 | `steps.idx` | Companion index | Chunk index for `steps.dat` |
+| `values.dat` | Chunked compressed | Value stream: one record per step with visible variable values |
+| `values.idx` | Companion index | Chunk index for `values.dat` |
 | `calls.dat` | Var-size record | Call stream (complete call records with args/return) |
 | `events.dat` | Chunked compressed | IO event stream (stdout, stderr, file ops, errors) |
 | `events.idx` | Companion index | Chunk index for `events.dat` |
@@ -77,11 +79,11 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 | Stream | CTFS File | Abstraction | Access Pattern |
 |--------|-----------|-------------|----------------|
 | Execution | `steps.dat` | Chunked compressed | Sequential scan, point lookup |
-| Values | `steps.dat` | Chunked compressed | Point lookup by step index |
+| Values | `values.dat` | Chunked compressed | Point lookup by step index |
 | Calls | `calls.dat` | Var-size record | Random access by call_key |
 | IO Events | `events.dat` | Chunked compressed | Paginated scan |
 
-`steps.dat` records are tiny (2-4 bytes each), so chunks hold thousands of steps. The values stream is parallel-indexed with the execution stream -- record N in `steps.dat` corresponds to step N.
+`steps.dat` records are tiny (2-4 bytes each), so chunks hold thousands of steps. The values stream is parallel-indexed with the execution stream -- record N in `values.dat` corresponds to step N in `steps.dat`.
 
 `calls.dat` is indexed by `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` -- each call record stores `[first_step_id, last_step_id]` ranges.
 
