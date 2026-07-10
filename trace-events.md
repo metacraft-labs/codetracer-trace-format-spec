@@ -82,7 +82,7 @@ Each record represents a complete function call with entry/exit information.
 | return_value | streaming CBOR (or VoidReturn marker) |
 | raised_exception | optional: streaming CBOR (if call ended with unhandled raise) |
 
-Call records are written when the function returns (not at call entry), so they contain complete information. The `call_key` is a sequential index assigned at call entry.
+Each call record's *contents* are finalized when the function returns (not at call entry), so they contain complete information. The `call_key` is a sequential index assigned at call entry, and records are stored in `call_key` order — i.e. **call-entry order**, not completion order. A caller therefore precedes its callees in `calls.dat` (a parent's `call_key` is smaller than every child's), even though the parent finalizes last.
 
 #### 4. IO Event Stream (`events.dat`) — I/O events for the event log pane
 
