@@ -210,7 +210,17 @@ Given byte offset `pos`:
 
 A refusal must be all-or-nothing: a writer that claims its data block before walking the mapping has to roll that claim back, so a refused append leaves the container byte-identical and the damage it refused over is still visible to a repair tool.
 
-This binds *writers*. A **reader** meeting the same null has no index question to ask -- it simply cannot resolve the block, and must refuse that stream by name. See `CTFS-Binary-Format.md` section 4, "Null pointers during allocation", for the full statement and the measurements behind it.
+This binds *writers*. A **reader** meeting the same null has no index question to ask -- it simply cannot resolve the block -- and its own rule follows.
+
+**Null block pointers on the read path (normative).** A reader resolving a stream **MUST** refuse that stream, by name, when any block number it resolves is `0`: the entry's mapping root, a chain pointer, a level-`k` child pointer, or a data-block pointer. Block 0 is the container's header and root directory, and `0` is the "unallocated" sentinel, so no stream may name it. This is **independent of, and additional to**, the whole-block bound a reader applies to a container whose length is not a block multiple: a null passes that bound trivially, since `0` is below every non-empty container's block count. A reader that omits it does not merely fail to detect damage -- it walks *into* block 0 and reads the container's own header and root directory as the stream's mapping table, so entry fields decode as block pointers and unrelated blocks are returned as the stream's content.
+
+Three consequences bind with it:
+
+- **A null is not an absence.** A reader **MUST NOT** report a stream whose entry exists but whose mapping is null as missing, nor as empty. "Not in this container", "in this container and empty", and "in this container but its mapping is not" are three different answers. An entry lookup that signals "no such name" by returning `(Size, MapBlock) = (0, 0)` **MUST** report presence separately, because `(0, 0)` is also a legitimately empty member.
+- **A null is not a truncation.** The refusal **MUST NOT** blame a truncated or interrupted tail write. A container carrying a null pointer is typically a whole number of blocks and otherwise intact, and a message naming truncation sends an operator or a repair tool after damage that is not there.
+- **A caller-visible failure, not a crash.** The block number comes out of the container, so on a damaged one it is corruption-controlled. It **MUST** be refused before it is multiplied by `BlockSize`; computing the offset first can overflow and abort the process instead of returning an error.
+
+See `CTFS-Binary-Format.md` section 4, "Null pointers during allocation", and section 5d, "Null block pointers on the read path", for the full statement and the measurements behind both halves.
 
 ### Diagram
 
