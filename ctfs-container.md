@@ -206,6 +206,12 @@ Given byte offset `pos`:
 - **Extend mapping:** When a block index exceeds current level capacity, allocate and chain a new mapping block via `[N-1]`.
 - **O(1) amortized** for sequential appends. Mapping blocks allocated only when a level fills up.
 
+**Null pointers during allocation (normative).** "Allocate a new mapping block" applies only when the slot has genuinely never been used. A mapping is filled in strictly increasing block index order, so a writer **MUST** treat a null pointer as "not yet allocated" only when the block index being placed is the **first index that pointer covers** -- the chain pointer at `[N-1]` only when the rebased index is `0` at the level it leads to, a level-`k` child pointer only when the remainder `idx mod usable^(k-1)` is `0` -- and **MUST** refuse the write otherwise. A null anywhere else means an earlier index already resolved through that pointer, so the container is damaged, and allocating a replacement overwrites the only reference to the existing subtree: every data block beneath it becomes unreachable and unrecoverable while the append reports success.
+
+A refusal must be all-or-nothing: a writer that claims its data block before walking the mapping has to roll that claim back, so a refused append leaves the container byte-identical and the damage it refused over is still visible to a repair tool.
+
+This binds *writers*. A **reader** meeting the same null has no index question to ask -- it simply cannot resolve the block, and must refuse that stream by name. See `CTFS-Binary-Format.md` section 4, "Null pointers during allocation", for the full statement and the measurements behind it.
+
 ### Diagram
 
 ```
