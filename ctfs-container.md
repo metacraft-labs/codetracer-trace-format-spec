@@ -313,6 +313,31 @@ No locks, mutexes, or CAS loops -- only atomic fetch-and-add and atomic stores.
 - **Writers:** Block allocation is atomic. Data fully written before mapping updated. Size updated only after data committed.
 - **Readers:** See previous or new Size (never partial). All data up to observed Size is valid. No locks required.
 
+### Live progress: per-stream following, no sidecar
+
+A concurrent (out-of-process) reader answers "how much is readable right now" from
+the **container itself**, per-stream, with no external artifact:
+
+- **Readable byte extent** of each stream is `FileEntry.Size`, updated atomically
+  after each commit (re-read periodically — Reader Protocol step 2).
+- **Readable record count** is derived from the companion `.idx`, which is written
+  incrementally as chunks seal (§7; a stream that seals partial chunks carries a
+  cumulative record count in its index). No finalization step is required.
+
+This is the **only** progress mechanism. The format is self-contained (Property 6:
+"no external files or JSON"), so there is **no `.head.json` (or any) sidecar** and
+**no in-process RPC** on the recorder to answer progress queries — a recorder must
+not run an event loop to serve reads. When a live coordinator needs aggregate,
+cross-stream progress state (e.g. a recording/replayable *frontier* expressed in
+global event ids or checkpoints), that state is published through the recorder's
+existing **shared-memory channel** consumable by an out-of-process observer — not
+baked into the container and not served by an RPC on the writer.
+
+Per YAGNI, no aggregate frontier field is defined in the container: per-stream
+following covers every reader that exists today. A future consumer that genuinely
+needs a single cross-stream frontier value from the `.ct` would motivate a
+deliberate, versioned in-container addition — not a sidecar.
+
 ### Background Compression Writer
 
 An alternative pattern: multiple producer threads write to per-thread buffers, a single background thread compresses and writes to CTFS. Since only one thread does block allocation, `NextFreeBlock` can be a plain local counter (no atomic overhead).
