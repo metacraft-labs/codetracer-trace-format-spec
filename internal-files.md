@@ -172,6 +172,30 @@ works.
 
 Thread event streams are stored in `threads.ns`, a namespace keyed by `thread_id` (u64). This replaces the previous model of one CTFS file per thread (`t00000000001`, etc.), which was limited by MaxRootEntries. With namespaces, the thread count is unlimited -- the B-tree scales to millions of keys.
 
+#### Per-file thread streams (MCR recorder) are seekable-zstd
+
+The MCR recorder currently writes the per-file model — one `tNNN` file per thread
+(`t` + 11 zero-padded digits). These streams are **chunked, per-chunk Zstd-compressed,
+and seekable**, exactly like `steps.dat` / `calls.dat`:
+
+- `tNNN` (`.dat`): `[zstd(chunk_0)][zstd(chunk_1)]...` — each chunk is the bare
+  concatenation of raw event records (each record is self-describing: it begins with
+  an `EventHeader` whose `size` gives the full record length, so the reader walks a
+  decompressed chunk by `header.size` with no per-record length prefix).
+- Companion index **`iNNN`** (`i` + 11 digits), NOT `tNNN.idx`: CTFS keys every file
+  by the base40 encoding of its first 12 characters, and `tNNN` is already 12
+  characters, so `tNNN.idx` would collide with the data file. `iNNN` is a distinct
+  12-char key. Layout is the standard seekable-zstd companion index —
+  `[chunk_size: u32 LE][offset_0: u64 LE][offset_1: u64 LE]...` where `chunk_size` is
+  events per chunk and `offset_i` is the byte offset of chunk `i` in `tNNN`.
+
+To read event `N` of a thread: `chunk = N div chunk_size`, decompress
+`tNNN[offset[chunk] .. offset[chunk+1])`, walk `N mod chunk_size` records — O(chunk),
+never the whole stream. The `threads.ns` namespace variant (above) carries the same
+per-chunk-compressed, seekable payload keyed by `thread_id` instead of one file per
+thread; both are the seekable-zstd model, differing only in how the per-thread
+streams are addressed within the container.
+
 ### Checkpoint Packing (cp.dat + cp.off)
 
 MCR checkpoints are packed as a variable-size record table. Each checkpoint record contains register state, thread ticks, and page data (full pages or byte-level deltas against the parent checkpoint).
