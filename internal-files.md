@@ -40,12 +40,38 @@ Deduplicated records using the variable-size record table pattern. A `.dat` file
 
 | Table | Data File | Offset File | Record Format |
 |-------|-----------|-------------|---------------|
-| Source paths | `paths.dat` | `paths.off` | raw bytes (file path) |
+| Source paths | `paths.dat` | `paths.off` | raw bytes (file path); column-aware traces append a per-line byte-length table — see "paths.dat Layout A" below |
 | Variable names | `varnames.dat` | `varnames.off` | raw bytes (name) |
 | Types | `types.dat` | `types.off` | kind: u8, lang_type_len: varint, lang_type: bytes, specific_info: binary |
 | Functions | `funcs.dat` | `funcs.off` | global_line_index: varint, name_len: varint, name: bytes |
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
+
+#### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
+
+When `meta.dat` bit 4 (`FLAG_HAS_COLUMN_AWARE_STEPS`) is set, each `paths.dat`
+record carries a per-line byte-length table after the path bytes so the
+reader can resolve `global_position_index → (file, line, column)`:
+
+```
+paths.dat record (column-aware traces):
+  path_len:    varint
+  path_bytes:  [u8] × path_len
+  line_count:  varint
+  line_lengths: [varint] × line_count    (zigzag-delta encoded from previous line)
+```
+
+`line_lengths[0]` is an absolute zigzag varint; subsequent entries are
+deltas from `line_lengths[i-1]`. Each line length SHOULD be the source
+line's byte count plus 1 so that the trailing "one past EOL" position
+(used for end-of-line breakpoints and statement-end markers) gets its
+own address. See `trace-events.md` §"paths.dat per-line offset table"
+for the rationale and the on-wire decoding algorithm.
+
+Pre-column traces have no `line_count` field; the record ends at
+`path_bytes`. Readers detect the extension via `meta.dat` bit 4 and parse
+the extra fields only when the flag is set. `paths.off` continues to
+point at record starts regardless of layout.
 
 ---
 
@@ -441,7 +467,11 @@ Header (8 bytes):
     bit 1       -- FLAG_HAS_REPLAY_LAUNCH_FIELDS (M-RLP-1, see below)
     bit 2       -- FLAG_HAS_LAYOUT_SNAPSHOT (M-RLP-2, see below)
     bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
-    bits 4..15  -- reserved; readers reject when set
+    bit 4       -- FLAG_HAS_COLUMN_AWARE_STEPS (column-aware step encoding, see trace-events.md §"Reader Behaviour and Back-Compat")
+    bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (srcviews.dat present, see §"Alternate Source Views" below)
+    bit 6       -- FLAG_SUPPORTS_COLUMN_BREAKPOINTS (capability bit; see §"Column-Aware Capability Flags" below)
+    bit 7       -- FLAG_SUPPORTS_COLUMN_MOTIONS (capability bit; see §"Column-Aware Capability Flags" below)
+    bits 8..15  -- reserved; readers reject when set
 
 Fields (varint-prefixed):
   recording_id: varint length + UTF-8 bytes (required, M-REC-1)
@@ -594,6 +624,42 @@ The canonical readers are the same Nim file's `readMetaDat` and the
 Rust `parse_meta_dat` in
 `codetracer/src/db-backend/src/ctfs_trace_reader/meta_dat.rs`.
 
+### Column-Aware Capability Flags
+
+`FLAG_HAS_COLUMN_AWARE_STEPS` (bit 4) signals only that *column data is
+present on the wire*. It says nothing about whether the columns are
+sharp enough for the GUI to place a breakpoint at, or motion-step
+through, a specific column. Two additional capability bits encode the
+recorder's contract with the GUI:
+
+| Bit | Name | Set when | GUI affordance gated on it |
+|-----|------|----------|-----------------------------|
+| 6 | `FLAG_SUPPORTS_COLUMN_BREAKPOINTS` | The recorder emits column positions sharp enough for breakpoint placement at a specific `(line, column)` pair | Per-column breakpoints; column gutter marks in the source view (M6 Alt+click affordance) |
+| 7 | `FLAG_SUPPORTS_COLUMN_MOTIONS` | The recorder supports per-column step-over / step-in / step-out (the step predicate fires per statement-start, not per line) | Column-aware step buttons; "step to next sub-expression" affordances |
+
+**Contract.** When either capability flag is clear, the GUI MUST disable
+the corresponding affordance — no per-column breakpoint UI, no
+per-column motion buttons — and fall back to line-only behaviour. A
+trace MAY set `FLAG_HAS_COLUMN_AWARE_STEPS` (so column data is
+available for *display*) while leaving both capability bits clear: the
+columns are good enough to highlight which sub-expression is current,
+but not sharp enough to place a breakpoint at or to step to.
+
+Setting either capability bit while `FLAG_HAS_COLUMN_AWARE_STEPS` is
+clear is undefined behaviour: capability flags presuppose column data
+on the wire. Writers SHOULD enforce this by gating the capability bits
+behind `columnAwareSteps` in their writer state.
+
+Recorders SHOULD set both capability bits when their step predicate is
+genuinely per-statement (e.g. JavaScript, Cairo, Solidity); recorders
+whose step predicate is per-line (e.g. Ruby's TracePoint, Aiken's
+line-oriented parser) MUST leave both bits clear even if they happen to
+emit a column for display purposes.
+
+Readers expose these bits through the existing `metadata.flags` JSON
+surface as `supports_column_breakpoints` / `supports_column_motions`,
+parallel to the established `has_column_aware_steps` field.
+
 ---
 
 ## Global Line Index
@@ -698,3 +764,114 @@ Memory mapping table.
 | +16 | 8 | `binary_ref` (u64 LE, Base40) |
 | +24 | 8 | `file_offset` (u64 LE) |
 | +32 | 1 | `permissions` (u8: bit 0=read, 1=write, 2=execute, 3=private) |
+
+---
+
+## Alternate Source Views (Deminification Support)
+
+When a recorder encounters a **minified source** (heuristic: average line
+length exceeds a configurable threshold, default 500 characters) AND no
+companion sourcemap V3 exists upstream, it MAY pre-format the source at
+record time using a language-appropriate formatter (`prettier` for
+JS/TS, `black` for Python, etc.) and bake the formatted view +
+position map into the trace.
+
+The replay-server's existing sourcemap V3 translation path then
+discovers the formatted view through these CTFS internal files —
+**no replay-time subprocess invocation**.
+
+### `srcviews.dat` / `srcviews.off`
+
+Variable-size record table interning **alternate views** of source
+paths registered in `paths.dat`. Each record carries one formatted
+view of one source.
+
+| Field | Encoding | Notes |
+|-------|----------|-------|
+| `path_id` | varint | Index into `paths.dat` — the original source this view applies to |
+| `view_kind` | u8 | 0 = `raw` (no transformation, rarely emitted), 1 = `prettier_format`, 2 = `black_format`, 3-127 reserved, 128+ = vendor-specific |
+| `view_name_len` | varint | Length of `view_name` |
+| `view_name` | bytes | Human-readable name shown in the UI (e.g., `"lodash.fmt.js"`); typically the original name with a `.fmt.<ext>` suffix |
+| `content_len` | varint | Length of `content` |
+| `content` | bytes | The formatted source as UTF-8 bytes |
+| `map_len` | varint | Length of `map` (0 = no sourcemap) |
+| `map` | bytes | A sourcemap V3 (JSON, UTF-8) mapping positions in `content` BACK to positions in the original source at `path_id`. The inverse map direction matters: replay-server's existing P3 translation expects `(generated, line, col) → (original_source, line, col, name?)` segments, where "generated" is the formatted view and "original" is the recorded minified source. |
+
+Records are referenced by 0-based index. The reader loads
+`srcviews.dat` lazily — most traces won't carry any alternate
+views.
+
+### Discovery rules
+
+A replay-server consuming a CTFS trace SHOULD:
+
+1. Load `srcviews.dat` / `srcviews.off` if present.
+2. For each recorded step whose `(path_id, line, column)` lookup
+   targets `paths.dat[path_id]`, check whether any
+   `srcviews.dat` entry has matching `path_id`. If so, prefer
+   the alternate view for UI display:
+   - Surface `view_name` as the file path in DAP `stackTrace`
+     responses.
+   - Surface `content` via the DAP `source` request (or the UI's
+     filesystem-based reader through a materialized sidecar — both
+     resolutions are acceptable).
+   - Translate the recorded `(line, column)` through `map` to
+     positions in `content` before reporting.
+3. When multiple alternate views exist for one path (e.g., a
+   `prettier_format` AND a `black_format` — unusual but legal),
+   pick the one whose `view_kind` matches the source's language.
+   Fall back to the lowest-numbered `view_kind` if no clean match.
+
+### Recorder responsibility
+
+Recorders that emit alternate views MUST:
+
+1. Set the `meta.dat` flag bit 5 = `FLAG_HAS_ALTERNATE_SOURCE_VIEWS`
+   (bits 0-4 are allocated by prior milestones — see
+   trace-events.md §"Reader Behaviour and Back-Compat" for the
+   strict-rejection contract on unknown bits).
+2. Run the formatter as a one-shot at record start, NOT per-step.
+3. Skip the format pass when:
+   - The source has a sibling `<source>.map` upstream (the
+     upstream sourcemap is authoritative; recorder-side
+     re-formatting would override the user's choice of map).
+   - The source's average line length is below the threshold
+     (heuristic for "this is minified code").
+   - The formatter's output line count does not exceed the
+     input's (no point materializing an identical view).
+   - The configured kill switch is active (the
+     `CT_AUTOFORMAT={0|off|false|no}` environment variable is the
+     spec-canonical mechanism).
+4. Treat formatter failures as soft: log a one-shot warning, omit
+   the alternate view, continue recording. The trace remains
+   usable without the view.
+
+### Back-compat
+
+Pre-extension traces (no `srcviews.dat`) are byte-for-byte
+compatible with column-aware readers (P6.5 contract): the
+`paths.dat` per-line offset table (Layout A) is independent of the
+alternate-views machinery. Readers that detect the bit-5 flag but
+don't understand alternate views MUST reject the trace cleanly per
+the existing "bits 4-15 reserved; unknown bits cause rejection"
+contract.
+
+### Implementation status
+
+- **codetracer-js-recorder** (commit `d493ab9`) ships an
+  out-of-CTFS variant: formatted views land under
+  `<trace_dir>/files/<name>.fmt.js` + `<name>.fmt.js.map` rather
+  than `srcviews.dat`. This is a transitional convention
+  predating this spec section; future js-recorder releases will
+  migrate to `srcviews.dat`.
+- **codetracer-python-recorder** (commit `06129daf`) ships the
+  module + CLI flag + tests but defers the recording-flow
+  integration pending the writer-side wire-format change this
+  section describes.
+- **codetracer-trace-format-nim** writer support for
+  `srcviews.dat` is the prerequisite for closing the Python
+  recorder integration.
+
+The campaign that drove this section is documented in
+`codetracer-specs/Planned-Features/Column-Aware-Tracing-And-Deminification.milestones.org`
+§P6.2.

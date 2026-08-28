@@ -33,11 +33,14 @@ This is what the debugger steps through. Each record is compact and fixed-size w
 
 | Tag | Event | Fields | Size |
 |-----|-------|--------|------|
-| 0 | AbsoluteStep | global_line_index: varint | ~3 bytes |
+| 0 | AbsoluteStep | global_position_index: varint | ~3 bytes |
 | 1 | DeltaStep | delta: signed varint | 2 bytes |
 | 2 | Raise | exception_type_id: varint, message_len: varint, message: bytes | varies |
 | 3 | Catch | exception_type_id: varint | ~2 bytes |
 | 4 | ThreadSwitch | thread_id: varint | 2 bytes |
+| 5 | ThreadStart | thread_id: varint | 2 bytes (legacy — present in the current canonical Nim writer; the spec intent is to infer this from the first ThreadSwitch to a new thread_id) |
+| 6 | ThreadExit | thread_id: varint | 2 bytes (legacy — present in the current canonical Nim writer; the spec intent is to infer this from the last step in a thread) |
+| 7 | DeltaColumn | delta: signed varint | 2 bytes (column-aware traces only) |
 
 Step records do not carry `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` — each call record stores `[first_step_id, last_step_id]` ranges. This is O(log log C), typically 2-3 iterations, and avoids doubling the step record size.
 
@@ -130,11 +133,14 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
-| 0 | `AbsoluteStep` | `global_line_index: varint` | Execution stepped to a source line (full state at chunk/function boundaries) |
-| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's global line index |
+| 0 | `AbsoluteStep` | `global_position_index: varint` | Execution stepped to a source position (full state at chunk/function boundaries) |
+| 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's `global_position_index` |
 | 2 | `Raise` | `exception_type_id: varint`, `message_len: varint`, `message: bytes` | Exception raised (before unwinding) |
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
 | 4 | `ThreadSwitch` | `thread_id: varint` | Execution switched to a different thread |
+| 5 | `ThreadStart` | `thread_id: varint` | Legacy — current canonical Nim writer emits this; spec intent is to infer from first ThreadSwitch |
+| 6 | `ThreadExit` | `thread_id: varint` | Legacy — current canonical Nim writer emits this; spec intent is to infer from last step |
+| 7 | `DeltaColumn` | `delta: signed varint` | Column-only step within the current line; emitted only when the trace's `meta.dat` `FLAG_HAS_COLUMN_AWARE_STEPS` bit is set (see §"Source Location Addressing") |
 
 ### Value Stream Events (`values.dat`)
 
@@ -563,22 +569,72 @@ Each event is encoded as a concatenation of:
 
 Where `str` means: `length(u32 LE) + utf8_bytes`, and `cbor(T)` means: `cbor_length(u32 LE) + cbor_bytes`.
 
+## Source Location Addressing
+
+Step events address source locations through a single varint, `global_position_index`. The index is a linear address into a *per-trace global position space* that subsumes the older line-only `global_line_index` scheme.
+
+### Per-File Contiguous Integer Ranges
+
+Each source file registered in the trace's path interning table (`paths.dat`) is assigned a contiguous half-open integer range `[file_base, file_base + file_size)` in the global position space. The ranges are laid out in file-id order with no gaps:
+
+```
+file 0:  [0,                              file_size_0)
+file 1:  [file_size_0,                    file_size_0 + file_size_1)
+file 2:  [file_size_0 + file_size_1,      ...)
+...
+```
+
+`file_size` depends on the addressing mode:
+
+| Addressing mode | `file_size` | Address semantics |
+|-----------------|-------------|-------------------|
+| Line-only (legacy / column extension off) | `line_count` | Each integer addresses one line. The decoder maps `global_position_index → (file, line)`. |
+| Line + column (column extension on) | `sum(line_lengths)` | Each integer addresses one (line, column) pair with 1-based columns. The decoder maps `global_position_index → (file, line, column)`. |
+
+`line_lengths[i]` is the number of addressable column positions on line `i`. Implementations are free to clamp `line_lengths[i]` to `actual_column_count_of_line_i + 1` so the trailing "one past EOL" position (used for end-of-line breakpoints, statement end markers, and the implicit newline) gets its own address.
+
+### Decoding `global_position_index`
+
+Given a varint `p` and the per-file cumulative-size table, the decoder resolves `(file, line, column)` as follows:
+
+1. **Binary-search the file table** on cumulative `file_base` to find the file `f` such that `file_base[f] ≤ p < file_base[f] + file_size[f]`. Cost: `O(log F)` where `F` is the number of registered files.
+2. **Compute the in-file offset** `q = p - file_base[f]`.
+3. **Line-only mode:** `line = q + 1` (lines are 1-based). Done.
+4. **Line + column mode:** Binary-search the file's per-line cumulative-length table to find the line `l` such that `line_base[l] ≤ q < line_base[l] + line_lengths[l]`. Then `column = q - line_base[l] + 1`. Cost per resolution: `O(log L)` where `L` is the number of lines in file `f`.
+
+Total decode cost is `O(log F + log L)` per step. Cumulative-sum tables are computed once at trace open (typically a few hundred kilobytes for a large multi-file trace) and cached in memory; per-step lookups are then two binary searches and add no I/O.
+
+### Encoding Rules for Step Records
+
+Step records reference source locations through `global_position_index` (absolute) or signed deltas of `global_position_index` (delta). The compact variants are documented in §"Compact Step Encoding".
+
+A delta within the same line moves through column positions only (small magnitude, typically ±1 to ±N where N is the line length). A delta that crosses a line boundary jumps by at least `current_column + 1`. A delta that crosses a file boundary jumps by potentially millions and is normally promoted to an AbsoluteStep.
+
+### Back-Compatibility
+
+The position-index scheme is a strict superset of the legacy line-index scheme:
+
+* Pre-extension traces have no per-line offset table. Their step records' `global_position_index` values are interpreted as `global_line_index` (each integer addresses one line). Readers surface the column slot as `None` (Rust `Option<u32>`, Nim `Option[uint32]`).
+* The presence of the per-line offset table — and therefore the column-aware decoding — is signalled by a `meta.dat` flag bit. See §"Reader Behaviour and Back-Compat".
+
+The on-wire encoding of `global_position_index` (varint) is identical to the legacy `global_line_index` (varint). The interpretation changes; the bytes do not.
+
 ## Compact Step Encoding
 
-Step events use two variants for efficient encoding:
+Step events use two variants for efficient encoding. Both variants address source locations through `global_position_index` (see §"Source Location Addressing"). When the column extension is disabled, `global_position_index ≡ global_line_index` and the legacy line-only decoding applies.
 
 ### AbsoluteStep (Tag 0)
 
 Used at function entry, after large jumps, or when the delta would exceed DeltaStep's range.
 
 ```
-[Tag: 0x00] [global_line_index: varint]
+[Tag: 0x00] [global_position_index: varint]
 Total: 3-4 bytes typical (1 tag + 2-3 varint bytes)
 ```
 
 ### DeltaStep (Tag 1)
 
-Used for consecutive steps within the same function or nearby code. Stores the signed delta from the previous step's global line index.
+Used for consecutive steps within the same function or nearby code. Stores the signed delta from the previous step's `global_position_index`.
 
 ```
 [Tag: 0x01] [delta: signed varint]
@@ -601,6 +657,169 @@ The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then uns
 3. After a Return event, the next step is AbsoluteStep (returning to caller)
 4. All other steps use DeltaStep if the delta fits in 3 varint bytes (±1048575), otherwise AbsoluteStep
 
+### Column Encoding — `DeltaColumn` (chosen)
+
+The column extension introduces a second axis (column) into step records. Two on-wire encodings were considered; the empirical benchmark in `tracing-formats-benchmarks` (`results/ctfs_column_extension/REPORT.md`, P6.2, 2026-06-10) **selected the separate `DeltaColumn` variant (Candidate A)** as the on-wire encoding. The losing candidate is documented below for archival reasons.
+
+#### Chosen — separate `DeltaColumn` variant (Tag 0x07)
+
+Adds a third step-event tag dedicated to column-only motion.
+
+```
+[Tag: 0x07] [delta: signed varint]
+Total: 2 bytes typical (1 tag + 1 varint for column delta ±63)
+```
+
+Semantics:
+
+* `DeltaColumn` advances the cursor's column within the current line. Line is unchanged.
+* When a `DeltaStep` (Tag 0x01) is decoded and it crosses a line boundary, the cursor's column is reset to column 1 of the new line. A subsequent `DeltaColumn` then advances within that new line.
+* A `DeltaStep` that does **not** cross a line boundary leaves the column at its previous value. (Encoders are free to emit either a `DeltaColumn` or a `DeltaStep` with a small column-only delta in that case; the result is identical because `global_position_index` is one-dimensional.)
+* An `AbsoluteStep` carries the full `(line, column)` through its varint and resets both axes.
+
+Wire-format properties:
+
+* **Tag allocation.** Tags 0x00-0x06 are already taken (AbsoluteStep, DeltaStep, Raise, Catch, ThreadSwitch, ThreadStart, ThreadExit — the last two are present in the current canonical Nim writer even though they are marked for future removal in §"Sketched Removals"). `DeltaColumn` is allocated to tag **0x07**. This avoids any conflict with existing event types and keeps the column extension entirely additive on the wire.
+* **Column-only step cost:** 2 bytes (1 tag + 1 zigzag varint).
+* **No size change on existing events.** `DeltaStep` and `AbsoluteStep` byte layouts are unchanged. Existing column-unaware readers see the new tag, fail the `bits 4-15 reserved` check in `meta.dat`, and refuse to open the trace cleanly rather than misdecoding.
+
+#### Rejected — extended `DeltaStep` with column-delta flag bit (after P6.2 benchmark)
+
+**Status:** rejected after benchmark in `tracing-formats-benchmarks` P6.2. Empirically ~2× more expensive than the chosen `DeltaColumn` variant on every measured corpus (raw bytes/step +84% to +102% vs the line-only baseline, vs +1.9% to +20.3% for `DeltaColumn`). Retained here for archival / spec-history reasons only — writers MUST NOT emit this format; readers MUST NOT recognise it.
+
+Folds the column delta into the existing `DeltaStep` event by prefixing the body with a single-byte flag header.
+
+```
+[Tag: 0x01] [flag_byte: u8] [delta_line: signed varint] [delta_column: signed varint?]
+```
+
+Semantics:
+
+* `flag_byte` low bit (`0x01`) — when set, `delta_column` follows after `delta_line`.
+* `flag_byte` bits 1-7 — reserved; must be zero in writers, must be tolerated as zero by readers.
+* `delta_line` is the signed line delta (same zigzag varint as the line-only baseline).
+* `delta_column`, when present, is the signed column delta from the previous step's column.
+* `AbsoluteStep` (Tag 0x00) carries a full `global_position_index` varint; the (line, column) decomposition happens at decode time as in §"Source Location Addressing".
+
+Wire-format properties:
+
+* **Single event per step regardless of axis.** No separate column-only event; a same-line step emits `delta_line = 0` and `delta_column ≠ 0`.
+* **Cost of a column-aware step:** `1 (tag) + 1 (flag) + varint(delta_line) + varint(delta_column)`. For a typical `delta_line = 0, delta_column = ±1` step this is **4 bytes** (vs 2 bytes for the line-only `DeltaStep` baseline) — a 2-byte regression for same-line steps.
+* **Cost of a line-only step (column extension on, no column change):** `1 (tag) + 1 (flag = 0) + varint(delta_line)` = **3 bytes** (vs 2 bytes baseline) — a 1-byte regression.
+* **Breaking change.** Pre-extension readers expect `tag(0x01) + signed_varint` directly; this format inserts a `flag_byte` before the varint. An old reader will misdecode the flag byte as the start of a varint (zigzag value 0 for `flag_byte = 0`, or some other small value) and then misalign permanently. The `meta.dat` column-extension flag (see §"Reader Behaviour and Back-Compat") MUST be checked before parsing the execution stream; readers that don't know the flag MUST refuse to open the trace.
+
+#### Comparison (archival)
+
+| Property | `DeltaColumn` (chosen) | Extended `DeltaStep` (rejected) |
+|----------|------------------------|--------------------------------|
+| Wire compatibility with line-only readers | Additive — new tag 0x07; old readers reject cleanly via `meta.dat` bit 4 | Breaking — flag-byte prefix shifts every `DeltaStep` body |
+| Column-only step cost | 2 bytes (separate event) | 4 bytes (flag + line delta = 0 + column delta) |
+| Line-only step cost | 2 bytes (unchanged) | 3 bytes (flag overhead) |
+| Mixed line+column step cost | 4 bytes (two events) | 4 bytes (one event) |
+| Encoder complexity | Low — pick one of two tags per step | Medium — flag-byte assembly per event |
+| Decoder complexity | Low — tag dispatch | Medium — flag-byte parsing per event |
+
+**Empirical result (P6.2, synthetic 100k-step corpora, raw bytes/step vs line-only baseline):**
+
+| Corpus | `DeltaColumn` | Extended `DeltaStep` |
+|--------|--------------:|---------------------:|
+| `python_co_positions`   | +4.6%  | +98.3%  |
+| `js_sourcemap_minified` | +1.9%  | +101.9% |
+| `cpp_dwarf`             | +18.3% | +86.0%  |
+| `rust_dwarf`            | +20.3% | +84.4%  |
+| `cairo`                 | +12.2% | +92.0%  |
+
+`DeltaColumn` wins on every corpus shape, including the within-line-heavy `js_sourcemap_minified` end and the line-transition-heavy `rust_dwarf` / `cpp_dwarf` end. See `tracing-formats-benchmarks/results/ctfs_column_extension/REPORT.md` for the full table and methodology.
+
+### paths.dat per-line offset table
+
+The column extension adds a per-line length table so the decoder can resolve `(line, column)` from an in-file offset. Two layouts are under consideration.
+
+#### Layout A — inline per-file table in `paths.dat`
+
+Each path record in `paths.dat` is extended to carry its per-line length table after the existing path bytes:
+
+```
+paths.dat record (column-extension on):
+  path_len: varint
+  path_bytes: [u8] × path_len
+  line_count: varint
+  line_lengths: [varint] × line_count       (zigzag-encoded delta from previous line length)
+```
+
+Notes:
+
+* `line_lengths[0]` is encoded as an absolute zigzag varint; subsequent entries are deltas from `line_lengths[i-1]`. The empirical distribution of line lengths in source code is heavily centred around 20-80 chars with low variance line-to-line, so delta-encoding is expected to halve the bytes per line vs raw absolute lengths.
+* Pre-extension `paths.dat` records have no `line_count` field. Readers detect the extension via the `meta.dat` flag (see §"Reader Behaviour and Back-Compat") and parse the extra fields only when the flag is set.
+* `paths.off` (offset companion) keeps pointing to record starts; no schema change.
+
+#### Layout B — companion stream `paths.lineoffsets.dat`
+
+The line-length tables are pulled out of `paths.dat` into a parallel CTFS internal file:
+
+```
+paths.lineoffsets.dat:
+  For file_id 0..F-1, in file-id order:
+    line_count: varint
+    line_lengths: [varint] × line_count    (zigzag-delta encoded)
+
+paths.lineoffsets.off (optional):
+  offset of file_id i's record in paths.lineoffsets.dat
+```
+
+Notes:
+
+* `paths.dat` itself is unchanged; readers that ignore the column extension don't see any extra bytes in their I/O path.
+* Reading source-file paths (a frequent operation in the UI, e.g. populating a file picker) doesn't pull line-length data into cache.
+* Costs one extra CTFS internal file per trace.
+
+#### Choice — Layout A
+
+**Layout A is the chosen layout.** Reasons:
+
+1. `paths.dat` is already loaded at trace open as part of the interning-table warm-up; appending per-line data adds I/O exactly when the reader is already paying it.
+2. The total per-line data is small (a few hundred KB for a 10K-line trace), estimated <1% of total trace size — cache pressure is negligible.
+3. Fewer CTFS internal files = simpler container layout, simpler sharded-trace logic (see `ctfs-container.md`).
+
+Layout B remains documented as a fallback. If a real column-aware recorder (P6.4-P6.6 in the campaign that landed this extension) surfaces measurable cache-thrash on path-only lookups (e.g. UI file picker), revisit.
+
+### Reader Behaviour and Back-Compat
+
+The column extension is signalled by a new flag bit in `meta.dat`. See `internal-files.md` §"Metadata (meta.dat)" for the current flag-byte layout (bits 0-3 currently allocated; bits 4-15 reserved with strict rejection).
+
+**Allocation:** bit 4 — `FLAG_HAS_COLUMN_AWARE_STEPS`. When set:
+
+* Per-line offset tables are present in `paths.dat` (Layout A — see §"paths.dat per-line offset table" and `internal-files.md` §"paths.dat Layout A").
+* Step records' `global_position_index` addresses `(line, column)` pairs, not lines.
+* The execution stream MAY contain `DeltaColumn` (tag 0x07) records that advance the cursor's column within the current line.
+
+When `FLAG_HAS_COLUMN_AWARE_STEPS` is clear (legacy default):
+
+* `global_position_index ≡ global_line_index` — single-axis line addressing.
+* No per-line offset tables.
+* Step records use the existing line-only `AbsoluteStep` / `DeltaStep` layout; `DeltaColumn` (tag 0x07) MUST NOT appear.
+
+Reader rules:
+
+1. A reader that **understands** the column-extension flag MUST honour both modes (load per-line tables when the flag is set; surface `column` as `None` when clear).
+2. A reader that **does not understand** the flag MUST detect the unknown bit (per the existing "bits 4-15 reserved; readers reject when set" rule in `internal-files.md`) and refuse to open the trace rather than silently misdecoding the step stream.
+3. Writers MUST NOT mix column-aware and line-only step records within a single trace. The flag is trace-global.
+
+`FLAG_HAS_COLUMN_AWARE_STEPS` is a *wire-format* flag — it says columns
+are present, not that they are sharp enough for breakpoint placement or
+per-column motion. Two separate **capability** flags tell the GUI
+whether per-column affordances should be enabled:
+
+* bit 6 — `FLAG_SUPPORTS_COLUMN_BREAKPOINTS`: recorder's columns are
+  sharp enough to place a breakpoint at a specific `(line, column)`.
+* bit 7 — `FLAG_SUPPORTS_COLUMN_MOTIONS`: recorder supports per-column
+  step over / in / out (step predicate fires per statement-start, not
+  per line).
+
+When either capability bit is clear, the GUI MUST disable the
+corresponding affordance. See `internal-files.md` §"Column-Aware
+Capability Flags" for the full contract.
+
 ### Compression Impact
 
 In a typical trace, ~80-90% of steps are sequential lines within a function (delta +1 or small positive). With DeltaStep:
@@ -610,6 +829,18 @@ In a typical trace, ~80-90% of steps are sequential lines within a function (del
 - Weighted average: ~2-3 bytes per step
 
 Combined with Zstd compression on the already-compact delta stream, effective per-step storage drops below 1 byte.
+
+#### Column Extension Cost (empirical, P6.2)
+
+Measured on five synthetic 100k-step per-language step corpora (`python_co_positions`, `js_sourcemap_minified`, `cpp_dwarf`, `rust_dwarf`, `cairo`) with the chosen `DeltaColumn` encoding:
+
+* **Step stream raw growth:** +1.9% to +20.3% over the line-only baseline (depending on within-line column-motion density). Best case JS-minified (almost all within-line, +1.9%); worst case Rust DWARF (mostly line transitions, +20.3%).
+* **Step stream after Zstd:** absolute cost stays under **1.0 byte/step** on every corpus (worst case 0.897 B/step on `js_sourcemap_minified`).
+* **`paths.dat` growth (Layout A):** per-line offset table adds roughly `line_count × 1-2 bytes` per file. For a 10K-line trace, ~10-20 KB total — typically <1% of total trace size.
+
+**Budget framing.** The earlier "≤10% total trace size increase" target was relative to a line-only baseline that compresses extraordinarily well (0.095-0.40 B/step after Zstd, dominated by `+1` line deltas that Zstd run-length-collapses). No column-aware encoding can stay within +10% of that figure, by construction. The correct budget formulation is in **absolute bytes-per-step**: column-aware traces under the chosen `DeltaColumn` encoding cost **< 1.0 B/step after Zstd** on every measured corpus, which on a 10M-step trace is on the order of ~10 MB of column data on top of the ~4 MB line-only baseline.
+
+The synthetic-corpus numbers are subject to revision once column-aware recorders ship (Python `co_positions`, DWARF column extraction, Cairo). Re-run the bench against real traces before treating the absolute figures as final.
 
 ### Chunked Compression
 
@@ -623,3 +854,211 @@ steps.idx:  [chunk_size: u32][offset_0: u64][offset_1: u64]...
 The companion index `steps.idx` starts with the records-per-chunk count (u32 LE), followed by one u64 byte offset per chunk. To seek to a specific record, compute `chunk = record_id / chunk_size`, read the byte offset from the index, and decompress only that chunk. See [seekable-zstd.md](seekable-zstd.md) for the full companion index format.
 
 Default Zstd compression level: 3.
+
+## Recorder Integration — Column-Aware Steps
+
+This section is the integration contract for recorders that want to emit
+column-aware traces. The wire-format pieces (tag 0x07 `DeltaColumn`,
+`paths.dat` Layout A, `meta.dat` bit 4) are documented above; this
+section pins down the *recorder-side* API surface and the per-language
+coverage matrix.
+
+### Canonical Recorder Integration Pattern
+
+The canonical sequence — driven by the Rust safe wrapper in
+`codetracer-trace-format` (`NimTraceWriter`) — is:
+
+```rust
+// Once, before start(): opt in to column-aware encoding. Sets
+// meta.dat bit 4 and switches the writer's step encoder to emit
+// DeltaColumn (tag 0x07) records.
+writer.enable_column_aware_steps();
+
+// Once per source path, before start(): register the path together
+// with the per-line byte-length table that the reader needs to
+// decode (line, column) from global_position_index. `lengths[i]`
+// is the byte length of line i (1-based source index) plus 1 for
+// the "one past EOL" position.
+writer.register_path_with_line_lengths(path, &lengths);
+
+// Start recording at the entry point.
+writer.start(path, line);
+
+// Per step: emit a column-aware step. When `column` is Some(c),
+// the writer threads the column through register_step + a
+// follow-up register_delta_column so the step lands at (line, c).
+// When `column` is None, the writer falls back to a line-only
+// step and the reader surfaces column=None for that step.
+for (path, line, column) in steps {
+    writer.register_step_with_column(path, line, column);
+}
+```
+
+**Why the split (`register_step` + `register_delta_column`).** Prior to
+the column-aware navigation campaign (C1), `NimTraceWriter::register_step_with_column`
+dropped the `column` argument on the floor — it emitted a line-only
+step. The C1 fix threads the column through as two separate writer
+calls: `register_step` (which emits `AbsoluteStep` or `DeltaStep`
+addressing `(line, column=1)`), followed by `register_delta_column`
+(which emits `DeltaColumn` with `column - 1` as the delta). The result
+on the wire is a `(step, column-delta)` pair that decodes to the exact
+`(line, column)` the recorder asked for. Recorders MUST call the safe
+wrapper rather than driving the two FFI symbols directly unless they
+own the bookkeeping for tracking the previous column themselves.
+
+### FFI Symbols (column-aware extensions)
+
+The column-aware extension adds four C FFI symbols to the writer ABI.
+All are no-ops on column-unaware traces (they fail-closed without
+corrupting the trace if called on a writer that has not had
+`trace_writer_enable_column_aware_steps` invoked).
+
+```c
+// Opt in to column-aware encoding. Must be called before start().
+// Sets meta.dat bit 4 (FLAG_HAS_COLUMN_AWARE_STEPS) and switches
+// the writer's step encoder. Idempotent.
+void trace_writer_enable_column_aware_steps(trace_writer_t handle);
+
+// Register a source path together with its per-line byte-length
+// table. Must be called before start() for every path the trace
+// will reference. `lengths` is an array of `line_count` u32 values;
+// `lengths[i]` is the byte length of line i+1 (1-based) plus 1.
+// The writer copies the table into paths.dat Layout A.
+void trace_writer_register_path_with_line_lengths(
+    trace_writer_t handle,
+    const char* path,
+    const uint32_t* lengths,
+    uint32_t line_count);
+
+// Emit a column-aware step in one FFI call. Equivalent to a step at
+// (path, line) followed by a register_delta_column for `column - 1`
+// when `has_column != 0`. When `has_column == 0`, behaves like the
+// legacy line-only ct_assignment.
+void ct_assignment_with_column(
+    trace_writer_t handle,
+    const char* path,
+    uint32_t line,
+    uint32_t column,
+    int has_column);
+
+// Emit a DeltaColumn (tag 0x07) record after a Step. `column_delta`
+// is the signed delta from the previous step's column. The writer
+// MUST have been put into column-aware mode via
+// trace_writer_enable_column_aware_steps; calling this on a
+// column-unaware writer is a no-op (the writer records a one-shot
+// diagnostic).
+void trace_writer_register_delta_column(
+    trace_writer_t handle,
+    int32_t column_delta);
+```
+
+The Rust safe wrapper (`NimTraceWriter` in the `codetracer-trace-writer`
+crate) re-exports these as `enable_column_aware_steps`,
+`register_path_with_line_lengths`, `register_step_with_column` (which
+internally chains `register_step` and `register_delta_column`), and
+`register_delta_column`. The Nim canonical writer
+(`codetracer-trace-format-nim`) exposes the same surface under the
+`writeColumnAware*` family.
+
+### WASM DWARF Subtlety
+
+The WASM recorder consumes DWARF emitted by the target language's
+compiler. For Rust → WASM, `rustc` emits column-refinement DWARF rows
+**without `is_stmt`** for positions inside a sub-expression — i.e. the
+column changes between rows but the row is not flagged as a statement
+boundary. A naive PC → `(file, line, column)` indexer that filters on
+`is_stmt == true` (the usual heuristic for "this row is a steppable
+statement") will silently drop these refinements and end up emitting
+only line-granularity columns.
+
+The column-aware WASM recorder MUST index *all* DWARF line-program rows
+(including `is_stmt == false`) so that column data is available to the
+step predicate. The step predicate itself can still gate on `is_stmt`
+when deciding whether to *emit* a step, but the underlying PC → source
+map must carry every row's column.
+
+This subtlety affects only the WASM recorder today; native DWARF
+recorders that consume the same compiler output (when those land) will
+inherit the same requirement.
+
+### Per-Recorder Integration Matrix
+
+Column-aware status of each in-tree recorder as of this spec revision.
+"PASS" recorders set `FLAG_HAS_COLUMN_AWARE_STEPS` (bit 4) and SHOULD
+also set the two capability bits (`FLAG_SUPPORTS_COLUMN_BREAKPOINTS`,
+`FLAG_SUPPORTS_COLUMN_MOTIONS` — bits 6 and 7) whenever their step
+predicate is genuinely per-statement. "Not supported" recorders leave
+bit 4 clear and the capability bits clear. See `internal-files.md`
+§"Column-Aware Capability Flags" for the contract.
+
+| Recorder | Status | Notes |
+|----------|--------|-------|
+| JavaScript (V8) | PASS | Multi-statement-per-line distinguishable via V8 source positions; in production |
+| EVM / Solidity (M-evm) | PASS | Solidity sourcemap entries carry column; in production |
+| Solana SBF (M-sol) | PASS | SBF DWARF; in production |
+| Cairo (M-cairo) | PASS | Cairo compiler emits column for each instruction; in production |
+| Flow / Cadence (M-flow) | PASS | Cadence parser exposes column on each statement node; in production |
+| PolkaVM (M-polkavm) | PASS | PolkaVM DWARF; in production |
+| Move (M-move) | PASS | Move compiler emits column for each bytecode; in production |
+| WASM (M-wasm) | PASS | DWARF column rows; see §"WASM DWARF Subtlety" above |
+| Noir (M-noir-v2) | PASS | Unblocked via the codetracer Noir compiler fork; in production |
+| Nim compile-time (M-nim) | PASS | Nim macro AST has column on every node; in production |
+| Cardano / Aiken | NOT SUPPORTED | Aiken parser is line-oriented; column data is not produced upstream |
+| Leo (Aleo) | NOT SUPPORTED | Aleo parser drops the second statement on a multi-stmt line, so per-column distinction is unrecoverable |
+| TON Tolk | NOT SUPPORTED | Same root cause as Leo — parser drops the second statement on a multi-stmt line |
+| Ruby | NOT SUPPORTED | `TracePoint` fires once per line; no sub-line callback hook exists |
+| Circom | NOT SUPPORTED | Compiler emits no column information anywhere in its source-position pipeline |
+| Fuel / Sway | NOT SUPPORTED | Sway compiler does not currently emit columns; revisit when upstream lands columns |
+| Miden MASM | NOT SUPPORTED | Step predicate is line-only by construction (one MASM instruction per line) |
+| Shell recorders | WONTFIX | Shell traces have no statement positions to attach columns to |
+| Native MCR | OUT OF SCOPE | MCR uses a different replay model; columns flow through `debug.dat` DWARF at replay time, not through CTFS step records |
+
+**Upstream-blocked recorders.** None currently. The Noir recorder was
+previously blocked on upstream column support; it was unblocked via the
+codetracer Noir compiler fork during this campaign and is now in the
+PASS column.
+
+A "NOT SUPPORTED by language constraint" recorder MUST leave bit 4
+clear in `meta.dat` rather than emit synthetic column=1 values — the
+contract is that a column-aware trace's columns mean something, and a
+recorder that cannot produce meaningful columns must opt out of the
+extension entirely.
+
+## Known Issues — Column-Aware
+
+Open issues from the column-aware navigation campaign as of this spec
+revision. These are recorder/writer bugs, not wire-format bugs — the
+on-wire format is stable; fixes will land in the writer crates without
+requiring trace re-recording.
+
+### `ct_print` drops `call_entry` past `stepCount`
+
+The writer-side close-time flush is asymmetric between the step stream
+and the call stream. When `ct_print` is invoked at trace shutdown, any
+`call_entry` event whose step index is greater than the writer's
+recorded `stepCount` is dropped instead of being flushed to `calls.dat`.
+Symptom: the very last function call in a short trace is missing from
+the call tree even though its steps appear in `steps.dat`.
+
+Workaround: emit a final no-op step before tearing down the writer so
+the last `call_entry` lands within `stepCount`. Fix tracked in the
+writer crate's close-path.
+
+### Writer's pending-value-after-`DeltaColumn`: trailing variable lost
+
+The writer's pending-value pipeline assumes that a `register_variable`
+call lands in the same flush window as the step it annotates. When
+column-aware mode is on, a `DeltaColumn` record can flush the pending
+buffer between the `register_step` and a *trailing* `register_variable`
+call, in which case the variable record is silently discarded.
+
+Symptom: the value of a variable assigned in the same statement as the
+column-final sub-expression is missing from the value stream. The step
+record itself is correct.
+
+Workaround: emit `register_variable` *before* the column-final
+sub-expression's `register_step_with_column`, or rely on the next
+step's `StepValues` snapshot to surface the missed value (the snapshot
+walks current bindings rather than the per-step delta).
+
+Fix tracked in the writer crate's pending-value flush ordering.
