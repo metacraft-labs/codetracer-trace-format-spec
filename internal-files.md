@@ -463,15 +463,81 @@ Header (8 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
   version: u16 LE (currently 3)
   flags: u16 LE
-    bit 0       -- FLAG_HAS_MCR_FIELDS (extended block present)
+    The flag word holds two DIFFERENT classes of bit (see "Two classes of
+    flag bit" below). Section-presence bits gate the parse of a
+    variable-length block INSIDE meta.dat and MUST be honoured. Capability
+    and stream-presence bits describe the trace and MUST NOT be treated as
+    a reject-on-unknown gate.
+
+    -- Section-presence (a block is embedded in meta.dat; MUST read to parse):
+    bit 0       -- FLAG_HAS_MCR_FIELDS (MCR extended block present)
     bit 1       -- FLAG_HAS_REPLAY_LAUNCH_FIELDS (M-RLP-1, see below)
     bit 2       -- FLAG_HAS_LAYOUT_SNAPSHOT (M-RLP-2, see below)
     bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
+    -- Capability (format-variant declared at open; not a stream gate):
     bit 4       -- FLAG_HAS_COLUMN_AWARE_STEPS (column-aware step encoding, see trace-events.md §"Reader Behaviour and Back-Compat")
     bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (srcviews.dat present, see §"Alternate Source Views" below)
     bit 6       -- FLAG_SUPPORTS_COLUMN_BREAKPOINTS (capability bit; see §"Column-Aware Capability Flags" below)
     bit 7       -- FLAG_SUPPORTS_COLUMN_MOTIONS (capability bit; see §"Column-Aware Capability Flags" below)
-    bits 8..15  -- reserved; readers reject when set
+    -- Stream-presence (ADDITIVE HINT; tautological with a named stream file;
+    -- see "Stream-presence flags are a hint, not a gate" below):
+    bit 8       -- FLAG_HAS_CALL_STREAM       (calls.dat present)         M17a
+    bit 9       -- FLAG_HAS_STEP_STREAM       (steps.dat present)         M23a
+    bit 10      -- FLAG_HAS_VALUE_STREAM      (values.dat present)        M23b
+    bit 11      -- FLAG_HAS_IO_EVENT_STREAM   (events.dat present)        M23c
+    bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
+    bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
+    bits 14..15 -- reserved; readers reject when set
+
+### Two classes of flag bit
+
+The `flags` word conflates two things a reader must NOT treat alike:
+
+1. **Section-presence bits (0..3)** gate the parse of a *variable-length
+   block inside meta.dat itself*. There is no separate file to inspect, so a
+   reader MUST read these to parse meta.dat correctly. They are decided when
+   meta.dat is written (at open) and never change — so they carry no
+   streaming hazard.
+
+2. **Capability bits (4..7)** declare a *format variant* of the trace (e.g.
+   column-aware steps) chosen at open. They too are set once and describe how
+   to interpret data that is present; they are not a reject-on-unknown gate.
+
+3. **Stream-presence bits (8..13)** claim that a *separately named stream
+   file* exists in the container (`steps.dat`, `spans.dat`, …). This claim is
+   **tautological with the container's own structure**: the stream exists iff
+   the file entry exists. See the next subsection.
+
+### Stream-presence flags are a hint, not a gate
+
+A stream-presence bit (8..13) is an **optional hint**, redundant with a
+`findFile("<stream>.dat")` on the container's file-entry array. The
+authoritative answer to "does this trace carry stream X?" is the
+**structural presence of the named file**, and the authoritative answer to
+"how much of it is readable right now?" is that file's `FileEntry.Size`
+(ctfs-container.md §6, "Live progress: per-stream following"). Therefore:
+
+- A reader **MUST NOT gate** reading a stream on its presence bit, and **MUST
+  NOT reject** a container merely because a stream file is present while its
+  bit is clear. It resolves each optional stream by `findFile` + `Size`.
+- **Streaming correctness (normative).** A stream file and its `FileEntry.Size`
+  become visible the instant the writer creates the stream and commits data —
+  *mid-run*, not at close. A presence bit, by contrast, may be stamped only
+  when the writer learns the stream is non-empty, which can be deferred to
+  close. A reader that gates on the bit would therefore be unable to read a
+  stream that structurally exists in a *still-recording* trace — a violation
+  of the requirement that every consumer can load a trace while the target is
+  still running. Gating on structure (file presence + `Size`) is the only
+  streaming-correct rule; the bit MUST NOT be a precondition.
+- These bits are **additive**: a reader that does not understand a stream
+  ignores its file (and its bit) and reads the rest correctly. They are
+  consequently NOT in the reject-on-unknown reserved range — only bits 14..15
+  are.
+- Writers MAY still set bits 8..13 as a fast-path hint. When they do, the bit
+  MUST be set as soon as the stream is created (so it is visible mid-run),
+  never deferred to close; a writer that cannot guarantee mid-run stamping
+  SHOULD leave the bit clear and rely on structural presence rather than emit
+  a bit that lies to a live reader.
 
 Fields (varint-prefixed):
   recording_id: varint length + UTF-8 bytes (required, M-REC-1)
