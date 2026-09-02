@@ -72,17 +72,49 @@ and reads off the crossings in the bounded window:
 Because the window is bounded by the span rather than the whole recording, both
 directions are **local** computations, and both compose with the black-box
 forward/reverse continue-to-breakpoint primitive
-(`ReplaySession::step(Action::Continue, forward)`).
+(`ReplaySession::step(Action::Continue, forward)`). This span-bounded scan is the
+**format-only fallback**: it needs nothing but the on-disk container, so it is
+what a consumer without recreated memory uses, and it is the contract the fast
+path (§1.2) must agree with.
 
-### 1.2 Non-normative optimization
+### 1.2 The primary resolution mechanism: recreated in-memory bookkeeping (seek → O(1))
 
-"Which span / which VM frame / which step ordinal are we at" can be read directly
-from memory MCR has already recreated at the seek point — the recorder's
-per-thread bookkeeping (the shadow call stack `ct_shadow_sp`; the MCR single
-per-thread TLS state block). This can short-circuit the bounded scan. It is a
-**performance optimization, not a requirement**; a conforming implementation may
-ignore it, and the normative model stays "bounded local scan of chokepoint
-crossings within the span" — independent of MCR's internal memory layout.
+The questions a consumer actually asks at a moment — *which crossing span, which
+VM frame, which step ordinal within it, and (under cooperative scheduling) which
+logical context is live* — are answered **directly, in O(1), by reading the
+recorder's in-memory bookkeeping at the seek point.** This is the canonical
+mechanism for the MCR path, not merely an optimization layered on §1.1's scan.
+
+It is O(1) for the same reason CodeTracer navigation is O(1) in general: **a seek
+restores process memory.** The recorder keeps its bookkeeping in ordinary process
+memory — the shadow call stack (`ct_shadow_sp` / `ct_shadow_stack.c`: a `__thread`
+pointer plus the `.bss` `ct_shadow_stacks[]` registry) and the single per-thread
+TLS state block (the MCR "Set A" single-TLS-slot architecture,
+`MCR-Recorder-Architecture-Invariants.md` A1/A2). MCR's checkpoint+restore
+snapshots *every writable mapping* (heap, stack,
+`.bss`, `mmap`s) plus the `fs_base`/`gs_base` TLS pointers, and a seek restores the
+nearest checkpoint and re-executes forward to the exact tick
+(Multi-Core-Recorder.md §11–§12). So at any landing moment those structures hold
+**exactly** the values they held at that moment during recording; reading one is a
+field access — no stream decode, no index lookup, no scan whose cost grows with the
+recording.
+
+This is why the query must **not** be modeled as reader-side state accumulated by
+stepping there: on a cold jump the consumer has walked nothing, yet memory
+restoration has reconstructed everything. The altitude/crossing/context state a
+consumer needs is therefore whatever the recorder is *required* to keep in that
+in-memory bookkeeping (§1.5 pins the cooperative-scheduling additions); the
+consumer reads it rather than deriving it.
+
+**The on-disk format stays independent of MCR's memory layout.** Elevating the
+memory read to primary is a statement about the *consumer's* cost model, not the
+*format contract*. The durable artifact is still the span stream (§1 — coarse and
+seekable) plus the chokepoints: backend-neutral, and the only inputs available to
+a consumer *without* recreated memory (a pure-DB reader of a standalone
+materialized trace, §2). For such a consumer §1.1's span-bounded scan is the
+equivalent, conforming fallback that yields the same answer more slowly. **The two
+paths must agree** — the memory read is the fast path the MCR consumer takes, the
+scan is the contract that keeps the format honest.
 
 ### 1.3 Scope: MCR only
 
@@ -91,6 +123,71 @@ without a recorded correlation, re-deriving the association on RR lacks MCR's
 precise-memory / omniscient-DB machinery. The container and spans are
 backend-neutral, so RR is not precluded by the format — it is simply not in
 scope. Mixed-Trace-Debugging.md §7.
+
+### 1.4 Streaming correctness: open crossings and the live edge
+
+All CodeTracer functionality must work while the target is still recording, and a
+crossing is a live interval, so the span-stream projection is written
+**open-at-begin, settled-at-close**: on entering a crossing the recorder appends a
+`SpanRecord` with `flags.open` set and `end_step = 0`; on returning it appends a
+record with the **same `span_id`** carrying the final `end_step` (last-record-wins
+per `span_id`, `CTFS-Request-Span-Streams.md`). Emitting the record only at close
+would leave the *in-flight* frame — exactly the moment a load-while-recording
+session sits in — invisible on the fallback path until it returns.
+
+An open crossing has no `end_step` yet, so a consumer on the fallback path treats
+it as covering `[start_step, recording_head]` — the live edge
+(`ReplaySession::recording_head`), never `0` and never `+∞`. This is not merely a
+streaming nicety: `end_step` is the **bound of the expensive direction** (a
+VM→native seek is MCR replay-from-checkpoint, §6 / Mixed-Trace-Debugging.md §5). An
+unbounded open span would turn that bounded-local search into a scan of the whole
+tail, so clamping an open crossing to the live edge is what keeps the fallback
+O(local) at the live edge. The memory-read path (§1.2) is unaffected: "which
+crossing am I in" is a field in restored memory whether or not the crossing has
+returned yet.
+
+### 1.5 Cooperative scheduling (multiple logical contexts on one OS thread)
+
+A single OS thread may run **multiple logical execution contexts** that yield to
+each other cooperatively — VM coroutines/fibers (e.g. Lua coroutines), or two
+scripting altitudes interleaved on one host thread. Their materialized steps
+**interleave on the one global step timeline**, so a crossing's
+`[start_step, end_step]` for context A *contains* context B's steps. The interval
+test alone no longer decides membership, and "which context is live at step N"
+becomes the load-bearing question.
+
+**On the memory-read path (§1.2) this is a non-problem.** At the landing moment,
+restored memory already reflects which context is running — either the recorder's
+own per-context bookkeeping or the VM's own current-coroutine pointer (also in the
+restored heap). The consumer reads the current context and its current crossing in
+O(1); interleaving never has to be untangled from the step ranges, because the
+answer is not derived from the ranges.
+
+Two requirements make this sound, and both are per-crossing / per-yield — never
+per-step — so neither taxes the hot path:
+
+1. **The recorder's crossing bookkeeping is keyed by logical context, not OS
+   thread.** The shadow stack and the Set-A TLS block are per-OS-thread
+   (`MCR-Recorder-Architecture-Invariants.md` A1), so on one OS thread two
+   coroutines would otherwise share them. The VM identifies the logical context
+   when it opens a crossing (it passes a context id through the crossing API), and
+   the recorder maintains the current-crossing stack **per logical context**.
+
+2. **The on-disk projection carries the owning context**, so the fallback path
+   (§1.1) — which has no recreated memory — can still disambiguate. A VM crossing
+   span's `thread_id` is the **logical context id** the VM assigned (for a
+   non-cooperative VM this coincides with the OS thread), and `structural` bit 0
+   `contiguous_on_one_thread` is set **false** whenever the context's steps
+   interleave with another's on the global timeline — the explicit signal that
+   `[start_step, end_step]` is *not* a contiguous ownership set and membership must
+   be filtered by owning context. The fallback recovers `owner(N)` from the step
+   stream's `ThreadSwitch` markers (coarse — one per yield, so a bounded local scan
+   or a small companion index suffices), then filters covering crossings to that
+   context before taking the innermost.
+
+No per-step context tag is added to the step stream: that would tax the hot path
+for a query the memory-read path answers for free and the fallback answers from the
+coarse (per-yield) switch markers.
 
 ## 2. Absence and standalone traces
 
