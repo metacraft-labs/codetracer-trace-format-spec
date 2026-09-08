@@ -571,6 +571,32 @@ Where `str` means: `length(u32 LE) + utf8_bytes`, and `cbor(T)` means: `cbor_len
 
 Step events address source locations through a single varint, `global_position_index`. The index is a linear address into a *per-trace global position space* that subsumes the older line-only `global_line_index` scheme.
 
+### The address is a prefix sum, and nothing else
+
+There is exactly one scheme. An address is a position in a per-trace space
+built by concatenating files in file-id order; it is **not** a packing of
+`(file_id, line)` into disjoint bit-fields.
+
+A bit-field packing — `(path_id << 32) | line`, or any other fixed stride —
+is not this format. It is excluded on three grounds, and readers must not
+accept it:
+
+* It bounds the trace. A shift of 32 caps both the file count and the lines
+  per file, and neither limit belongs in a container whose whole point is to
+  hold whatever a program did.
+* It defeats the varint. §"Varint IDs" budgets `global_line_index` at 2-3
+  bytes and the average event at ~4. A shifted address costs 5 bytes for
+  every file after the first, because the file id sits above bit 32 — a
+  ~50% inflation of the step stream on any multi-file trace. A prefix-sum
+  address stays proportional to the program's total line count, which is
+  small enough to varint well and to delta-encode between neighbouring
+  steps.
+* It cannot be told apart from a real address. Both schemes produce
+  well-formed integers from the same field, a container records no
+  discriminator, and both inverses always return a plausible `(file, line)`.
+  A reader handed the wrong one does not fail — it answers a location that
+  was never in the trace.
+
 ### Per-File Contiguous Integer Ranges
 
 Each source file registered in the trace's path interning table (`paths.dat`) is assigned a contiguous half-open integer range `[file_base, file_base + file_size)` in the global position space. The ranges are laid out in file-id order with no gaps:
@@ -597,7 +623,7 @@ Given a varint `p` and the per-file cumulative-size table, the decoder resolves 
 
 1. **Binary-search the file table** on cumulative `file_base` to find the file `f` such that `file_base[f] ≤ p < file_base[f] + file_size[f]`. Cost: `O(log F)` where `F` is the number of registered files.
 2. **Compute the in-file offset** `q = p - file_base[f]`.
-3. **Line-only mode:** `line = q + 1` (lines are 1-based). Done.
+3. **Line-only mode:** `line = q + 1` (lines are 1-based). Done. The inverse is `global_index(file_id, line) = prefix_sums[file_id] + (line - 1)` — see [internal-files.md](internal-files.md) §"Global Line Index", which carries the encode side and a note on the off-by-one this pair had until 2026-09.
 4. **Line + column mode:** Binary-search the file's per-line cumulative-length table to find the line `l` such that `line_base[l] ≤ q < line_base[l] + line_lengths[l]`. Then `column = q - line_base[l] + 1`. Cost per resolution: `O(log L)` where `L` is the number of lines in file `f`.
 
 Total decode cost is `O(log F + log L)` per step. Cumulative-sum tables are computed once at trace open (typically a few hundred kilobytes for a large multi-file trace) and cached in memory; per-step lookups are then two binary searches and add no I/O.

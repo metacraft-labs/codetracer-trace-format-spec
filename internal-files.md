@@ -600,13 +600,33 @@ parallel to the established `has_column_aware_steps` field.
 Source files are concatenated into a virtual address space where each line has a unique global index.
 
 ```
-global_index(file_id, line) = prefix_sums[file_id] + line
+global_index(file_id, line) = prefix_sums[file_id] + (line - 1)
 
 prefix_sums[0] = 0
 prefix_sums[k] = prefix_sums[k-1] + line_count[k-1]
 ```
 
 The prefix-sum array is computed once at startup from the interning table.
+
+`line` is 1-based, so the `- 1` puts a file's first line at its own
+`prefix_sums[file_id]` and its last line at `prefix_sums[file_id] +
+line_count - 1`. This is what makes `file_size = line_count` in
+[trace-events.md](trace-events.md) §"Source Location Addressing" correct: a
+file's range is exactly the addresses its lines occupy, with none left over
+and none spilling into the next file.
+
+It is also the same in-file offset the column-aware mode uses. There `q =
+p - file_base[f]` is a 0-based index over every (line, column) pair, so
+`q = 0` is line 1, column 1. Line-only mode is that scheme with one address
+per line instead of one per column position, and `line = q + 1` inverts it.
+
+> **Encoding `prefix_sums[file_id] + line` is wrong and was specified here
+> until 2026-09.** It leaves `prefix_sums[file_id]` unused and pushes a
+> file's last line one address past the end of its own range. With the
+> `file_size = line_count` sizing that error is invisible while every file is
+> allocated a fixed oversized stride, and becomes a wrong answer at every
+> file boundary the moment real line counts are used: with counts `[10, 10]`,
+> `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
 
 ### Uses
 
