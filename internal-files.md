@@ -44,8 +44,49 @@ Deduplicated records using the variable-size record table pattern. A `.dat` file
 | Variable names | `varnames.dat` | `varnames.off` | raw bytes (name) |
 | Types | `types.dat` | `types.off` | kind: u8, lang_type_len: varint, lang_type: bytes, specific_info: binary |
 | Functions | `funcs.dat` | `funcs.off` | global_line_index: varint, name_len: varint, name: bytes |
+| Correlation-marker labels | `markers.dat` | `markers.off` | raw bytes (boundary label) |
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
+
+#### `markers.dat` — correlation-marker labels
+
+The boundary label of a correlation marker (`corrmark.ns`, and the
+`boundary_id` field of a `MarkerPayload`) is interned like any other repeated
+string, so the hot path can pass an integer.
+
+- **Record format:** raw label bytes, exactly as `varnames.dat`.
+- **Id assignment:** 0-based, in first-declaration order, assigned by the
+  writer's `ensure_marker_id`-style operation. Ids are per-container.
+- **Written lazily.** Unlike the four tables above — which every trace
+  creates — `markers.dat` / `markers.off` appear only once a marker label is
+  actually interned. A recording that declares no marker is byte-identical to
+  one written before marker labels existed.
+- **`meta.dat` flag: bit 14**, `FLAG_HAS_CORRELATION_INDEX` — the same bit
+  that covers `corrmark.ns`, **not** bit 12's `FLAG_HAS_INTERNING_TABLES` set.
+
+##### Why bit 14 rather than joining bit 12
+
+Three reasons, and the first is decisive:
+
+1. **Bit 12 is a cross-implementation agreement.** Its own definition requires
+   it to match in three places — the Nim writer's
+   `codetracer_trace_writer/meta_dat.nim`, Rust's
+   `codetracer_trace_writer::meta_dat::FLAG_HAS_INTERNING_TABLES`, and the
+   db-backend's `FLAG_HAS_INTERNING_TABLES`. Redefining what it covers means
+   changing a settled three-way contract to describe a table two of those
+   readers have no use for.
+2. **The marker table is meaningless without `corrmark.ns`.** They are written
+   together and read together, so one bit describing "this recording carries a
+   correlation index, and the label table it refers to" is the honest unit.
+   Bit 12's four tables are, by contrast, always created together and always
+   present.
+3. **Bit 15 is the last reserved bit.** Spending it on a table that is already
+   implied by bit 14 would exhaust the flag word for nothing.
+
+Both bits keep the semantics bits 8–14 already have: **additive hints**. A
+reader that does not know bit 14 ignores `corrmark.ns` and `markers.dat`
+entirely, and the file-entry array — not the flag — remains the authority on
+what a container holds.
 
 #### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
 
@@ -487,7 +528,7 @@ Header (8 bytes):
     bit 11      -- FLAG_HAS_IO_EVENT_STREAM   (events.dat present)        M23c
     bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
     bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
-    bit 14      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns present)        WTCI
+    bit 14      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns + markers.dat/.off) WTCI
     bit 15      -- reserved; readers reject when set
 
 ### Two classes of flag bit
@@ -580,6 +621,13 @@ missing or malformed value. Rationale and migration roadmap:
   `codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md`
   § 3.
 
+- **v3.2** (WTCI, 2026-09-09) -- flag bit 14 additionally covers the
+  correlation-marker label interning table (`markers.dat` + `markers.off`),
+  written lazily beside `corrmark.ns`. No layout change and no new bit: the
+  table is meaningless without the index the same bit already announces, and
+  joining bit 12's `FLAG_HAS_INTERNING_TABLES` set would have redefined a flag
+  whose meaning is agreed across the Nim writer, `codetracer_trace_writer::
+  meta_dat` (Rust) and the db-backend. See § "Interning Tables".
 - **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 14
   `FLAG_HAS_CORRELATION_INDEX` from the reserved range, narrowing it to
   bit 15. No layout change: the bit is a stream-presence hint for
@@ -774,14 +822,23 @@ appended payload region, as `memwrites.tc` is actually built (see
 ctfs-container.md § 8 predates that implementation). Type B is required here
 regardless: a collision bucket is variable-length.
 
+**Key, per kind.** `kind = 0` (distributed-trace span) hashes
+`trace_id_be || span_id_be`. `kind = 1` (boundary crossing) hashes
+`marker_id` (8 bytes big-endian, the interned label id — see § "Interning
+Tables") followed by the raw `key_value` bytes. **No separator is needed**:
+`marker_id` is fixed width, so the split point is always byte 8 and two
+distinct `(marker_id, key_value)` pairs cannot produce the same buffer.
+
 **Value — a bucket, because a 64-bit key over a large corpus collides:**
 
 ```
 bucket:
   entry_count : u32 LE
   entries[entry_count]:
-    trace_id          : 16 bytes  (big-endian, wire order)
-    span_id           :  8 bytes  (big-endian, wire order)
+    identity          : 24 bytes  interpreted by `kind`:
+                          kind 0: trace_id[16] || span_id[8], wire order
+                          kind 1: marker_id u64 BE || key_fingerprint u64 BE
+                                  || reserved[8] (zero)
     wall_time_unix_ns : u64 LE
     monotonic_time_ns : u64 LE
     geid              : u64 LE    coordinate into the event stream
@@ -794,10 +851,21 @@ bucket:
 
 60 bytes per entry. Entries are sorted by `(trace_id, span_id, geid)`.
 
-**Every entry carries its full key, and a reader MUST compare it.** A B-tree
-hit is a hash hit, not a match: a lookup that does not confirm the full
-24 bytes will eventually return the wrong recording. A bucket whose entries all
-mismatch is a *miss*, indistinguishable in its answer from an empty result.
+**A B-tree hit is a hash hit, not a match, and a reader MUST confirm it.**
+
+- **kind 0** carries its full 24-byte `(trace_id, span_id)`, so confirmation is
+  exact.
+- **kind 1** confirms in two parts: `marker_id` is compared **exactly** — it is
+  a fixed-width interned id — while `key_value` rests on a 64-bit fingerprint
+  under a different seed from the index key. `key_value` is the per-event match
+  value and is therefore different on essentially every marker, so interning it
+  would grow one record per marker and save nothing; it stays variable-length,
+  and a fixed-width entry can only carry a digest of it. A false positive
+  consequently needs an exact hit on the interned boundary *and* a 64-bit
+  collision on the key.
+
+A bucket whose entries all fail confirmation is a *miss*, indistinguishable in
+its answer from an empty result.
 
 **Absence is a distinct answer from a miss.** The presence of the `corrmark.ns`
 file entry — which a reader already parses out of block 0, so this costs no
