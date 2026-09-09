@@ -619,6 +619,36 @@ file 2:  [file_size_0 + file_size_1,      ...)
 
 `line_lengths[i]` is the number of addressable column positions on line `i`. Implementations are free to clamp `line_lengths[i]` to `actual_column_count_of_line_i + 1` so the trailing "one past EOL" position (used for end-of-line breakpoints, statement end markers, and the implicit newline) gets its own address.
 
+There is one sizing rule, not two: **`file_size` is the number of
+positions the file has.** The rows above differ only in what a position
+*is* — an addressable column in one mode, a line in the other — so the
+counts are in different units (bytes on one axis, lines on the other)
+while the rule that consumes them is the same. Implementations MUST
+compute both through the same function. A file sized by one rule in the
+writer and another in a reader shifts the base of every file after it,
+and a position then resolves into the wrong file at a line number that is
+in range and therefore unrefusable.
+
+`file_size` MUST NOT be zero: a file with no positions shares its base
+with the next file, and the two are indistinguishable at decode.
+
+**Where the sizes come from.** In line + column mode the per-line table
+in each `paths.dat` record carries them. In line-only mode the file's
+`line_count` is carried by the same record when `meta.dat` bit 14
+(`FLAG_HAS_LINE_COUNT_TABLE`) is set — see
+[internal-files.md](internal-files.md) §"`paths.dat` line-count table".
+A line-only trace *without* that bit records no sizes at all, and a
+reader can only apply a convention its writer also applied; the
+conventional value is `100000` addresses per file. Writers SHOULD set bit
+14. The convention is not merely unrecorded but unsound above its own
+ceiling: a file with more than `100000` lines addresses positions inside
+the *next* file's range, which is a well-formed address of a location
+that was never recorded.
+
+Because such an address is in-space, **no reader can detect it.** A
+writer that records `line_count` therefore MUST refuse a step whose line
+exceeds it, at the point of registration, where the file's size is known.
+
 ### Decoding `global_position_index`
 
 Given a varint `p` and the per-file cumulative-size table, the decoder resolves `(file, line, column)` as follows:
@@ -642,6 +672,7 @@ The position-index scheme is a strict superset of the legacy line-index scheme:
 
 * Pre-extension traces have no per-line offset table. Their step records' `global_position_index` values are interpreted as `global_line_index` (each integer addresses one line). Readers surface the column slot as `None` (Rust `Option<u32>`, Nim `Option[uint32]`).
 * The presence of the per-line offset table — and therefore the column-aware decoding — is signalled by a `meta.dat` flag bit. See §"Reader Behaviour and Back-Compat".
+* A line-only trace's per-file `line_count` table is signalled by its own bit (14, `FLAG_HAS_LINE_COUNT_TABLE`) and is independent of the column extension. It changes no step record and no address arithmetic — only where the `file_size` values in §"Per-File Contiguous Integer Ranges" come from. A trace without it is sized by the `100000`-per-file convention, as every line-only trace was before the bit existed.
 
 The on-wire encoding of `global_position_index` (varint) is identical to the legacy `global_line_index` (varint). The interpretation changes; the bytes do not.
 
@@ -707,7 +738,7 @@ Wire-format properties:
 
 * **Tag allocation.** Tags 0x00-0x06 are already taken (AbsoluteStep, DeltaStep, Raise, Catch, ThreadSwitch, ThreadStart, ThreadExit — the last two are present in the current canonical Nim writer even though they are marked for future removal in §"Sketched Removals"). `DeltaColumn` is allocated to tag **0x07**. This avoids any conflict with existing event types and keeps the column extension entirely additive on the wire.
 * **Column-only step cost:** 2 bytes (1 tag + 1 zigzag varint).
-* **No size change on existing events.** `DeltaStep` and `AbsoluteStep` byte layouts are unchanged. Existing column-unaware readers see the new tag, fail the `bits 4-15 reserved` check in `meta.dat`, and refuse to open the trace cleanly rather than misdecoding.
+* **No size change on existing events.** `DeltaStep` and `AbsoluteStep` byte layouts are unchanged. Existing column-unaware readers see the new tag, fail the unknown-flag-bit check in `meta.dat`, and refuse to open the trace cleanly rather than misdecoding.
 
 #### Rejected — extended `DeltaStep` with column-delta flag bit (after P6.2 benchmark)
 
@@ -811,7 +842,7 @@ Layout B remains documented as a fallback. If a real column-aware recorder (P6.4
 
 ### Reader Behaviour and Back-Compat
 
-The column extension is signalled by a new flag bit in `meta.dat`. See `internal-files.md` §"Metadata (meta.dat)" for the current flag-byte layout (bits 0-3 currently allocated; bits 4-15 reserved with strict rejection).
+The column extension is signalled by a new flag bit in `meta.dat`. See `internal-files.md` §"Metadata (meta.dat)" for the current flag-byte layout and for which bits are allocated; every unallocated bit is reserved with strict rejection.
 
 **Allocation:** bit 4 — `FLAG_HAS_COLUMN_AWARE_STEPS`. When set:
 
@@ -828,7 +859,7 @@ When `FLAG_HAS_COLUMN_AWARE_STEPS` is clear (legacy default):
 Reader rules:
 
 1. A reader that **understands** the column-extension flag MUST honour both modes (load per-line tables when the flag is set; surface `column` as `None` when clear).
-2. A reader that **does not understand** the flag MUST detect the unknown bit (per the existing "bits 4-15 reserved; readers reject when set" rule in `internal-files.md`) and refuse to open the trace rather than silently misdecoding the step stream.
+2. A reader that **does not understand** the flag MUST detect the unknown bit (per the existing "reserved; readers reject when set" rule for unallocated bits in `internal-files.md`) and refuse to open the trace rather than silently misdecoding the step stream.
 3. Writers MUST NOT mix column-aware and line-only step records within a single trace. The flag is trace-global.
 
 `FLAG_HAS_COLUMN_AWARE_STEPS` is a *wire-format* flag — it says columns

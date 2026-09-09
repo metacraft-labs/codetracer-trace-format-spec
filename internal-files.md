@@ -73,6 +73,60 @@ Pre-column traces have no `line_count` field; the record ends at
 the extra fields only when the flag is set. `paths.off` continues to
 point at record starts regardless of layout.
 
+#### `paths.dat` line-count table (line-only traces)
+
+When `meta.dat` bit 14 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
+`paths.dat` record carries the file's line count after the path bytes:
+
+```
+paths.dat record (line-count table):
+  path_len:   varint
+  path_bytes: [u8] × path_len
+  line_count: varint
+```
+
+This is Layout A's framing without its trailing per-line table. The two
+layouts state the same field, `line_count`, under the two addressing
+modes: a column-aware file's positions are addressable columns, so its
+size is `sum(line_lengths)` and `line_count` is the length of that table;
+a line-only file's positions are lines, so its size *is* `line_count` and
+there is no per-line table to follow. That single sizing rule —
+`file_size` is the number of positions the file has — is stated in
+`trace-events.md` §"Per-File Contiguous Integer Ranges", and this record
+is what lets a reader apply it to a line-only trace instead of assuming a
+size.
+
+Requirements:
+
+* **Bits 4 and 14 are mutually exclusive.** A record cannot be in both
+  layouts, and a Layout A record already carries `line_count`. Writers
+  MUST NOT set both; readers MUST reject a header that does.
+* **`line_count` is mandatory under bit 14, for every record.** A writer
+  that cannot determine a file's real line count MUST record the ceiling
+  it lays the file out with (the conventional `100000`) rather than omit
+  the field or record a sentinel. An omitted count would return that one
+  file to being sized by assumption, which is the defect this table
+  removes.
+* **`line_count` MUST NOT be zero.** A file sized zero shares its base
+  with the next file and the two become indistinguishable at decode.
+  Readers MUST reject such a record rather than substitute a default.
+* **Writers MUST refuse a step whose line exceeds the file's recorded
+  `line_count`.** Such a step's address falls inside the *next* file's
+  range, so it is a well-formed address of a location that was never
+  recorded, and no reader can detect it — see `trace-events.md`
+  §"Per-File Contiguous Integer Ranges".
+
+Traces without bit 14 have no `line_count` field; the record is the bare
+path bytes and every file is sized by the writer's convention, which the
+container does not record. `paths.off` continues to point at record
+starts regardless of layout.
+
+**A reader MUST decide the layout from the `meta.dat` bits, never by
+inspecting the record bytes.** The three record spaces overlap: a bare
+record whose first byte happens to equal its own remaining length decodes
+cleanly under either extended layout, yielding a truncated path and a
+fabricated count with no error.
+
 ---
 
 ## Runtime Tracing (DB Traces)
@@ -461,7 +515,7 @@ A single binary metadata file using split-binary encoding.
 ```
 Header (8 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (currently 3)
+  version: u16 LE (currently 4)
   flags: u16 LE
     The flag word holds two DIFFERENT classes of bit (see "Two classes of
     flag bit" below). Section-presence bits gate the parse of a
@@ -487,7 +541,10 @@ Header (8 bytes):
     bit 11      -- FLAG_HAS_IO_EVENT_STREAM   (events.dat present)        M23c
     bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
     bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
-    bits 14..15 -- reserved; readers reject when set
+    -- Capability (record-layout variant declared at open):
+    bit 14      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
+                   file's line_count; see §"`paths.dat` line-count table" below)
+    bit 15      -- reserved; readers reject when set
 
 ### Two classes of flag bit
 
@@ -761,6 +818,16 @@ per line instead of one per column position, and `line = q + 1` inverts it.
 > file boundary the moment real line counts are used: with counts `[10, 10]`,
 > `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
 
+`line_count[k]` is the count `paths.dat` records for file `k` when
+`meta.dat` bit 14 is set (§"`paths.dat` line-count table"). A trace
+without that bit states no counts, and the recurrence above is evaluated
+against the writer's convention of `100000` per file — a number the
+reader must assume, and which is wrong for any file that has more lines
+than that. Sizing files at their real counts also shortens every address:
+the space is the program's total line count rather than
+`file_count × 100000`, which is what the varint budget in §"Varint IDs"
+assumes.
+
 ### Uses
 
 1. **Compact Step events**: A step stores one global line index instead of separate (path_id, line).
@@ -913,7 +980,7 @@ A replay-server consuming a CTFS trace SHOULD:
 Recorders that emit alternate views MUST:
 
 1. Set the `meta.dat` flag bit 5 = `FLAG_HAS_ALTERNATE_SOURCE_VIEWS`
-   (bits 0-4 are allocated by prior milestones — see
+   (bits 0-4 were allocated by prior milestones — see
    trace-events.md §"Reader Behaviour and Back-Compat" for the
    strict-rejection contract on unknown bits).
 2. Run the formatter as a one-shot at record start, NOT per-step.
@@ -939,7 +1006,7 @@ compatible with column-aware readers (P6.5 contract): the
 `paths.dat` per-line offset table (Layout A) is independent of the
 alternate-views machinery. Readers that detect the bit-5 flag but
 don't understand alternate views MUST reject the trace cleanly per
-the existing "bits 4-15 reserved; unknown bits cause rejection"
+the existing "unknown flag bits cause rejection"
 contract.
 
 ### Implementation status
