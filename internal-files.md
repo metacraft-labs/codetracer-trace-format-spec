@@ -80,8 +80,9 @@ Three reasons, and the first is decisive:
    correlation index, and the label table it refers to" is the honest unit.
    Bit 12's four tables are, by contrast, always created together and always
    present.
-3. **Bit 15 is the last reserved bit.** Spending it on a table that is already
-   implied by bit 14 would exhaust the flag word for nothing.
+3. **Bit 15 is the last bit.** It is spoken for by
+   `FLAG_HAS_LINE_COUNT_TABLE`, and spending a bit on a table already implied
+   by bit 14 would be spending the format's last one for nothing.
 
 Both bits keep the semantics bits 8–14 already have: **additive hints** — the
 file-entry array, not the flag, is the authority on what a container holds, and
@@ -103,8 +104,18 @@ The order that was actually followed: the constant landed in
 meta_dat` (Rust), the db-backend's `ctfs_trace_reader::meta_dat` and
 backend-manager's `meta_dat` — including in each one's `KNOWN_FLAGS_MASK` —
 before any writer stamped it. The two rejection tests that had been aimed at
-bit 14 moved to bit 15, since a rejection test aimed at a bit that has since
-been allocated is a test of nothing.
+bit 14 moved to bit 15, since a rejection test aimed at a bit the reader now
+knows is a test of nothing.
+
+Bit 15 is a valid target for those tests even though this document allocates
+it to `FLAG_HAS_LINE_COUNT_TABLE`, because what a reader rejects is a bit
+outside **its own** `KNOWN_FLAGS_MASK`, not a bit this document has left
+unassigned. No implementation reads or writes the line-count table yet, so
+bit 15 is unknown to every one of them, and the tests assert exactly the
+behaviour the next allocated bit will meet. Whichever reader implements the
+line-count table first must move these tests again — and at that point the
+flag word is full, so it will have to move them onto a `version` the reader
+does not know instead.
 
 #### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
 
@@ -131,6 +142,60 @@ Pre-column traces have no `line_count` field; the record ends at
 `path_bytes`. Readers detect the extension via `meta.dat` bit 4 and parse
 the extra fields only when the flag is set. `paths.off` continues to
 point at record starts regardless of layout.
+
+#### `paths.dat` line-count table (line-only traces)
+
+When `meta.dat` bit 15 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
+`paths.dat` record carries the file's line count after the path bytes:
+
+```
+paths.dat record (line-count table):
+  path_len:   varint
+  path_bytes: [u8] × path_len
+  line_count: varint
+```
+
+This is Layout A's framing without its trailing per-line table. The two
+layouts state the same field, `line_count`, under the two addressing
+modes: a column-aware file's positions are addressable columns, so its
+size is `sum(line_lengths)` and `line_count` is the length of that table;
+a line-only file's positions are lines, so its size *is* `line_count` and
+there is no per-line table to follow. That single sizing rule —
+`file_size` is the number of positions the file has — is stated in
+`trace-events.md` §"Per-File Contiguous Integer Ranges", and this record
+is what lets a reader apply it to a line-only trace instead of assuming a
+size.
+
+Requirements:
+
+* **Bits 4 and 15 are mutually exclusive.** A record cannot be in both
+  layouts, and a Layout A record already carries `line_count`. Writers
+  MUST NOT set both; readers MUST reject a header that does.
+* **`line_count` is mandatory under bit 15, for every record.** A writer
+  that cannot determine a file's real line count MUST record the ceiling
+  it lays the file out with (the conventional `100000`) rather than omit
+  the field or record a sentinel. An omitted count would return that one
+  file to being sized by assumption, which is the defect this table
+  removes.
+* **`line_count` MUST NOT be zero.** A file sized zero shares its base
+  with the next file and the two become indistinguishable at decode.
+  Readers MUST reject such a record rather than substitute a default.
+* **Writers MUST refuse a step whose line exceeds the file's recorded
+  `line_count`.** Such a step's address falls inside the *next* file's
+  range, so it is a well-formed address of a location that was never
+  recorded, and no reader can detect it — see `trace-events.md`
+  §"Per-File Contiguous Integer Ranges".
+
+Traces without bit 15 have no `line_count` field; the record is the bare
+path bytes and every file is sized by the writer's convention, which the
+container does not record. `paths.off` continues to point at record
+starts regardless of layout.
+
+**A reader MUST decide the layout from the `meta.dat` bits, never by
+inspecting the record bytes.** The three record spaces overlap: a bare
+record whose first byte happens to equal its own remaining length decodes
+cleanly under either extended layout, yielding a truncated path and a
+fabricated count with no error.
 
 ---
 
@@ -520,7 +585,7 @@ A single binary metadata file using split-binary encoding.
 ```
 Header (8 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (currently 3)
+  version: u16 LE (currently 4)
   flags: u16 LE
     The flag word holds two DIFFERENT classes of bit (see "Two classes of
     flag bit" below). Section-presence bits gate the parse of a
@@ -547,7 +612,12 @@ Header (8 bytes):
     bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
     bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
     bit 14      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns + markers.dat/.off) WTCI
-    bit 15      -- reserved; readers reject when set
+    -- Capability (record-layout variant declared at open):
+    bit 15      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
+                   file's line_count; see §"`paths.dat` line-count table" below)
+
+    No bit is reserved: version 4 assigns all sixteen. A further flag needs a
+    meta.dat version bump, not a spare bit.
 
 ### Two classes of flag bit
 
@@ -590,10 +660,10 @@ authoritative answer to "does this trace carry stream X?" is the
   still running. Gating on structure (file presence + `Size`) is the only
   streaming-correct rule; the bit MUST NOT be a precondition.
 - These bits are **additive**: a reader that does not understand a stream
-  ignores its file (and its bit) and reads the rest correctly. They are
-  consequently NOT in the reject-on-unknown reserved range — only bits 14..15
-  are.
-- Writers MAY still set bits 8..13 as a fast-path hint. When they do, the bit
+  ignores its file (and its bit) and reads the rest correctly. Bit 14
+  (`corrmark.ns`) is additive on the same terms. No bit is reserved for
+  reject-on-unknown in version 4.
+- Writers MAY still set bits 8..14 as a fast-path hint. When they do, the bit
   MUST be set as soon as the stream is created (so it is visible mid-run),
   never deferred to close; a writer that cannot guarantee mid-run stamping
   SHOULD leave the bit clear and rely on structural presence rather than emit
@@ -647,8 +717,12 @@ missing or malformed value. Rationale and migration roadmap:
   whose meaning is agreed across the Nim writer, `codetracer_trace_writer::
   meta_dat` (Rust) and the db-backend. See § "Interning Tables".
 - **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 14
-  `FLAG_HAS_CORRELATION_INDEX` from the reserved range, narrowing it to
-  bit 15. No layout change: the bit is a stream-presence hint for
+  `FLAG_HAS_CORRELATION_INDEX`, extending the stream-presence run to
+  8..14, and moved `FLAG_HAS_LINE_COUNT_TABLE` to bit 15, which the
+  line-only sizing work had provisionally taken. The correlation index is
+  a named stream file, so it belongs in the stream-presence run; the
+  line-count table is a record-layout capability and does not. Neither
+  bit had shipped. The flag word is now fully assigned. No layout change: the bit is a stream-presence hint for
   `corrmark.ns` and, like bits 8..13, is redundant with the container's
   file-entry array. A reader that ignores it loses nothing; a reader that
   trusts it over the file entry is wrong for the same reason it would be
@@ -809,13 +883,43 @@ parallel to the established `has_column_aware_steps` field.
 Source files are concatenated into a virtual address space where each line has a unique global index.
 
 ```
-global_index(file_id, line) = prefix_sums[file_id] + line
+global_index(file_id, line) = prefix_sums[file_id] + (line - 1)
 
 prefix_sums[0] = 0
 prefix_sums[k] = prefix_sums[k-1] + line_count[k-1]
 ```
 
 The prefix-sum array is computed once at startup from the interning table.
+
+`line` is 1-based, so the `- 1` puts a file's first line at its own
+`prefix_sums[file_id]` and its last line at `prefix_sums[file_id] +
+line_count - 1`. This is what makes `file_size = line_count` in
+[trace-events.md](trace-events.md) §"Source Location Addressing" correct: a
+file's range is exactly the addresses its lines occupy, with none left over
+and none spilling into the next file.
+
+It is also the same in-file offset the column-aware mode uses. There `q =
+p - file_base[f]` is a 0-based index over every (line, column) pair, so
+`q = 0` is line 1, column 1. Line-only mode is that scheme with one address
+per line instead of one per column position, and `line = q + 1` inverts it.
+
+> **Encoding `prefix_sums[file_id] + line` is wrong and was specified here
+> until 2026-09.** It leaves `prefix_sums[file_id]` unused and pushes a
+> file's last line one address past the end of its own range. With the
+> `file_size = line_count` sizing that error is invisible while every file is
+> allocated a fixed oversized stride, and becomes a wrong answer at every
+> file boundary the moment real line counts are used: with counts `[10, 10]`,
+> `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
+
+`line_count[k]` is the count `paths.dat` records for file `k` when
+`meta.dat` bit 15 is set (§"`paths.dat` line-count table"). A trace
+without that bit states no counts, and the recurrence above is evaluated
+against the writer's convention of `100000` per file — a number the
+reader must assume, and which is wrong for any file that has more lines
+than that. Sizing files at their real counts also shortens every address:
+the space is the program's total line count rather than
+`file_count × 100000`, which is what the varint budget in §"Varint IDs"
+assumes.
 
 ### Uses
 
@@ -1081,7 +1185,7 @@ A replay-server consuming a CTFS trace SHOULD:
 Recorders that emit alternate views MUST:
 
 1. Set the `meta.dat` flag bit 5 = `FLAG_HAS_ALTERNATE_SOURCE_VIEWS`
-   (bits 0-4 are allocated by prior milestones — see
+   (bits 0-4 were allocated by prior milestones — see
    trace-events.md §"Reader Behaviour and Back-Compat" for the
    strict-rejection contract on unknown bits).
 2. Run the formatter as a one-shot at record start, NOT per-step.
@@ -1107,7 +1211,7 @@ compatible with column-aware readers (P6.5 contract): the
 `paths.dat` per-line offset table (Layout A) is independent of the
 alternate-views machinery. Readers that detect the bit-5 flag but
 don't understand alternate views MUST reject the trace cleanly per
-the existing "bits 4-15 reserved; unknown bits cause rejection"
+the existing "unknown flag bits cause rejection"
 contract.
 
 ### Implementation status
