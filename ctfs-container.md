@@ -342,7 +342,7 @@ deliberate, versioned in-container addition — not a sidecar.
 *whether* a stream exists, not only how much of it is readable. Whether a trace
 carries `steps.dat` / `spans.dat` / any optional stream is answered by
 `findFile("<stream>.dat")` on the file-entry array — the authoritative,
-streaming-correct source. The `meta.dat` stream-presence flags (bits 8..13, see
+streaming-correct source. The `meta.dat` stream-presence flags (bits 8..14, see
 internal-files.md → "Stream-presence flags are a hint, not a gate") are an
 optional, tautological hint and MUST NOT be used as a read gate: a writer may
 only learn a stream is non-empty near the end and stamp its bit at close, so a
