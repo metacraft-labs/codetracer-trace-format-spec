@@ -83,10 +83,28 @@ Three reasons, and the first is decisive:
 3. **Bit 15 is the last reserved bit.** Spending it on a table that is already
    implied by bit 14 would exhaust the flag word for nothing.
 
-Both bits keep the semantics bits 8–14 already have: **additive hints**. A
-reader that does not know bit 14 ignores `corrmark.ns` and `markers.dat`
-entirely, and the file-entry array — not the flag — remains the authority on
-what a container holds.
+Both bits keep the semantics bits 8–14 already have: **additive hints** — the
+file-entry array, not the flag, is the authority on what a container holds, and
+a reader that has no use for the index loses nothing by ignoring it.
+
+**"Additive" is about the FILES, not about the bit.** An earlier revision of
+this section said a reader that does not know bit 14 "ignores `corrmark.ns` and
+`markers.dat` entirely". That is not what any of the three implementations do,
+and the difference is the whole rollout: every reader refuses a container whose
+flag word carries a bit outside its own known mask, so an unrecognised bit
+rejects the *container*, not just the files it announces. This is the same
+property bit 13 records, and it makes the ordering **readers before writers** —
+a writer that sets the bit before the readers know it makes every recording
+with a correlation marker fail to open, for a reason that has nothing to do
+with the index.
+
+The order that was actually followed: the constant landed in
+`codetracer-trace-format-nim`'s `meta_dat.nim`, `codetracer_trace_writer::
+meta_dat` (Rust), the db-backend's `ctfs_trace_reader::meta_dat` and
+backend-manager's `meta_dat` — including in each one's `KNOWN_FLAGS_MASK` —
+before any writer stamped it. The two rejection tests that had been aimed at
+bit 14 moved to bit 15, since a rejection test aimed at a bit that has since
+been allocated is a test of nothing.
 
 #### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
 
@@ -887,6 +905,30 @@ outlive the data blocks it points at. A lookup that resolves an entry MUST
 consult the recording's retention state before reporting a hit, and report
 *expired* rather than a hit when the payload is gone. The index accelerates the
 question; it is never the authority on whether the data still exists.
+
+**Inspecting an index.** `ct print --correlation-index <file.ct>` reports the
+entries and, separately, whether the namespace is present at all. That view
+exists because a `kind = 0` entry is otherwise unobservable: unlike a boundary
+crossing it writes no `MarkerPayload` and no I/O event, so a recorder that
+declared coverage and one that silently dropped the call produce byte-identical
+event streams.
+
+### Implementation
+
+| Piece | Where |
+|---|---|
+| Encoder, reader, bulk load | `codetracer-trace-format-nim/src/codetracer_trace_writer/corrmark_builder.nim` |
+| Writer API (`registerSpanCoverage`, `registerCorrelationMarker*`, `ensureMarkerId`) | `.../codetracer_trace_writer/multi_stream_writer.nim` |
+| C ABI (`trace_writer_mark_span_coverage[_hex]`, `trace_writer_mark_correlation[_by_id]`, `trace_writer_ensure_marker_id`) | `.../codetracer_trace_writer_ffi.nim`, declared in `include/codetracer_trace_writer.h` |
+| Rust binding | `codetracer-trace-format/codetracer_trace_writer_nim` (`TraceWriter` trait + `NimTraceWriter`) |
+| MCR writer | `codetracer-native-recorder/ct_recorder/src/ct_recorder/trace_writer.nim` |
+| Consumer | `codetracer-ci/apps/Monolith/Monolith.TraceStorage/CtfsCorrelationIndex.cs` |
+
+The C ABI takes the ids as **wire bytes**, with a `_hex` wrapper that converts.
+The conversion lives in the shared library rather than in each recorder because
+the index keys on the wire bytes: a recorder that hashed the hex rendering
+instead would produce an index that is present, correct-looking, permanently
+unqueryable, and silent.
 
 Full contract, including why this shape was chosen over a scan:
 `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
