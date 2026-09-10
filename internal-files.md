@@ -75,7 +75,7 @@ point at record starts regardless of layout.
 
 #### `paths.dat` line-count table (line-only traces)
 
-When `meta.dat` bit 14 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
+When `meta.dat` bit 15 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
 `paths.dat` record carries the file's line count after the path bytes:
 
 ```
@@ -98,10 +98,10 @@ size.
 
 Requirements:
 
-* **Bits 4 and 14 are mutually exclusive.** A record cannot be in both
+* **Bits 4 and 15 are mutually exclusive.** A record cannot be in both
   layouts, and a Layout A record already carries `line_count`. Writers
   MUST NOT set both; readers MUST reject a header that does.
-* **`line_count` is mandatory under bit 14, for every record.** A writer
+* **`line_count` is mandatory under bit 15, for every record.** A writer
   that cannot determine a file's real line count MUST record the ceiling
   it lays the file out with (the conventional `100000`) rather than omit
   the field or record a sentinel. An omitted count would return that one
@@ -116,7 +116,7 @@ Requirements:
   recorded, and no reader can detect it — see `trace-events.md`
   §"Per-File Contiguous Integer Ranges".
 
-Traces without bit 14 have no `line_count` field; the record is the bare
+Traces without bit 15 have no `line_count` field; the record is the bare
 path bytes and every file is sized by the writer's convention, which the
 container does not record. `paths.off` continues to point at record
 starts regardless of layout.
@@ -541,10 +541,13 @@ Header (8 bytes):
     bit 11      -- FLAG_HAS_IO_EVENT_STREAM   (events.dat present)        M23c
     bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
     bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
+    bit 14      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns present)        WTCI
     -- Capability (record-layout variant declared at open):
-    bit 14      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
+    bit 15      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
                    file's line_count; see §"`paths.dat` line-count table" below)
-    bit 15      -- reserved; readers reject when set
+
+    No bit is reserved: version 4 assigns all sixteen. A further flag needs a
+    meta.dat version bump, not a spare bit.
 
 ### Two classes of flag bit
 
@@ -560,14 +563,14 @@ The `flags` word conflates two things a reader must NOT treat alike:
    column-aware steps) chosen at open. They too are set once and describe how
    to interpret data that is present; they are not a reject-on-unknown gate.
 
-3. **Stream-presence bits (8..13)** claim that a *separately named stream
-   file* exists in the container (`steps.dat`, `spans.dat`, …). This claim is
-   **tautological with the container's own structure**: the stream exists iff
-   the file entry exists. See the next subsection.
+3. **Stream-presence bits (8..14)** claim that a *separately named stream
+   file* exists in the container (`steps.dat`, `spans.dat`, `corrmark.ns`, …).
+   This claim is **tautological with the container's own structure**: the
+   stream exists iff the file entry exists. See the next subsection.
 
 ### Stream-presence flags are a hint, not a gate
 
-A stream-presence bit (8..13) is an **optional hint**, redundant with a
+A stream-presence bit (8..14) is an **optional hint**, redundant with a
 `findFile("<stream>.dat")` on the container's file-entry array. The
 authoritative answer to "does this trace carry stream X?" is the
 **structural presence of the named file**, and the authoritative answer to
@@ -587,10 +590,10 @@ authoritative answer to "does this trace carry stream X?" is the
   still running. Gating on structure (file presence + `Size`) is the only
   streaming-correct rule; the bit MUST NOT be a precondition.
 - These bits are **additive**: a reader that does not understand a stream
-  ignores its file (and its bit) and reads the rest correctly. They are
-  consequently NOT in the reject-on-unknown reserved range — only bits 14..15
-  are.
-- Writers MAY still set bits 8..13 as a fast-path hint. When they do, the bit
+  ignores its file (and its bit) and reads the rest correctly. Bit 14
+  (`corrmark.ns`) is additive on the same terms. No bit is reserved for
+  reject-on-unknown in version 4.
+- Writers MAY still set bits 8..14 as a fast-path hint. When they do, the bit
   MUST be set as soon as the stream is created (so it is visible mid-run),
   never deferred to close; a writer that cannot guarantee mid-run stamping
   SHOULD leave the bit clear and rely on structural presence rather than emit
@@ -635,6 +638,19 @@ missing or malformed value. Rationale and migration roadmap:
   regenerated. Spec:
   `codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md`
   § 3.
+
+- **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 14
+  `FLAG_HAS_CORRELATION_INDEX`, extending the stream-presence run to
+  8..14, and moved `FLAG_HAS_LINE_COUNT_TABLE` to bit 15, which the
+  line-only sizing work had provisionally taken. The correlation index is
+  a named stream file, so it belongs in the stream-presence run; the
+  line-count table is a record-layout capability and does not. Neither
+  bit had shipped. The flag word is now fully assigned. No layout change: the bit is a stream-presence hint for
+  `corrmark.ns` and, like bits 8..13, is redundant with the container's
+  file-entry array. A reader that ignores it loses nothing; a reader that
+  trusts it over the file entry is wrong for the same reason it would be
+  for `spans.dat`. Contract:
+  `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
 
 ### Extended Fields (flags bitmask)
 
@@ -819,7 +835,7 @@ per line instead of one per column position, and `line = q + 1` inverts it.
 > `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
 
 `line_count[k]` is the count `paths.dat` records for file `k` when
-`meta.dat` bit 14 is set (§"`paths.dat` line-count table"). A trace
+`meta.dat` bit 15 is set (§"`paths.dat` line-count table"). A trace
 without that bit states no counts, and the recurrence above is evaluated
 against the writer's convention of `100000` per file — a number the
 reader must assume, and which is wrong for any file that has more lines
@@ -833,6 +849,73 @@ assumes.
 1. **Compact Step events**: A step stores one global line index instead of separate (path_id, line).
 2. **Namespace key for `linehits.tc`**: Maps global line index to hit time coordinates.
 
+### Correlation Index (`corrmark.ns`)
+
+A namespace mapping a correlation key to the markers a recording carries for
+it, so a consumer can answer "does this recording cover this span?" with a
+B-tree lookup instead of a scan of the event stream. Built **during recording**
+by every writer that observes a marker.
+
+**Key.** `XXH64(seed = 0, key_bytes)`. For distributed-trace correlation
+(`kind = 0`) `key_bytes` is the 24-byte buffer `trace_id_be || span_id_be` —
+the 16 big-endian bytes of the trace id followed by the 8 big-endian bytes of
+the span id, i.e. wire order, **not** a hex rendering.
+
+**Leaf type B**, `[payload_offset: u64][payload_len: u64]` descriptors into an
+appended payload region, as `memwrites.tc` is actually built (see
+`memwrites_builder.nim`; note the Leaf-Type-A attribution in
+ctfs-container.md § 8 predates that implementation). Type B is required here
+regardless: a collision bucket is variable-length.
+
+**Value — a bucket, because a 64-bit key over a large corpus collides:**
+
+```
+bucket:
+  entry_count : u32 LE
+  entries[entry_count]:
+    trace_id          : 16 bytes  (big-endian, wire order)
+    span_id           :  8 bytes  (big-endian, wire order)
+    wall_time_unix_ns : u64 LE
+    monotonic_time_ns : u64 LE
+    geid              : u64 LE    coordinate into the event stream
+    thread_id         : u64 LE
+    kind              : u16 LE    0 = distributed-trace span
+                                  1 = MarkerPayload boundary crossing
+    flags             : u16 LE    bit 0: direction (enter = 0, exit = 1)
+                                  bits 1..15 reserved
+```
+
+60 bytes per entry. Entries are sorted by `(trace_id, span_id, geid)`.
+
+**Every entry carries its full key, and a reader MUST compare it.** A B-tree
+hit is a hash hit, not a match: a lookup that does not confirm the full
+24 bytes will eventually return the wrong recording. A bucket whose entries all
+mismatch is a *miss*, indistinguishable in its answer from an empty result.
+
+**Absence is a distinct answer from a miss.** The presence of the `corrmark.ns`
+file entry — which a reader already parses out of block 0, so this costs no
+extra read — says whether the recording was indexed at all:
+
+| `corrmark.ns` | key found | meaning |
+|---|---|---|
+| present | yes, full key confirms | the recording covers this span |
+| present | no (or bucket mismatch) | the recording definitively does not |
+| absent | — | **not indexed** — says nothing about the span |
+
+A consumer MUST NOT collapse the third row into the second. Reporting an
+unindexed recording as "no match" is what made the original failure mode hard
+to diagnose.
+
+**Retention.** B-tree blocks stay in the main `.ct` and are never sharded
+(ctfs-container.md § "Separation of structure and data"), so an index entry can
+outlive the data blocks it points at. A lookup that resolves an entry MUST
+consult the recording's retention state before reporting a hit, and report
+*expired* rather than a hit when the payload is gone. The index accelerates the
+question; it is never the authority on whether the data still exists.
+
+Full contract, including why this shape was chosen over a scan:
+`codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
+
 ### Namespace Key Summary
 
 | Namespace | Key | Meaning |
@@ -843,6 +926,7 @@ assumes.
 | `slc-mwr.ns` | slice_id | Per-thread-slice write address sets |
 | `slc-mrd.ns` | slice_id | Per-thread-slice read address sets |
 | `threads.ns` | thread_id | Per-thread event streams |
+| `corrmark.ns` | XXH64 of the correlation key | Correlation markers — which distributed-trace spans (and cross-process boundaries) this recording touches |
 
 ---
 
