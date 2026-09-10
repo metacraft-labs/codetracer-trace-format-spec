@@ -44,8 +44,91 @@ Deduplicated records using the variable-size record table pattern. A `.dat` file
 | Variable names | `varnames.dat` | `varnames.off` | raw bytes (name) |
 | Types | `types.dat` | `types.off` | kind: u8, lang_type_len: varint, lang_type: bytes, specific_info: binary |
 | Functions | `funcs.dat` | `funcs.off` | global_line_index: varint, name_len: varint, name: bytes |
+| Correlation-marker labels | `markers.dat` | `markers.off` | raw bytes (boundary label) |
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
+
+#### `markers.dat` — correlation-marker labels
+
+The boundary label of a correlation marker (`corrmark.ns`, and the
+`boundary_id` field of a `MarkerPayload`) is interned like any other repeated
+string, so the hot path can pass an integer.
+
+- **Record format:** raw label bytes, exactly as `varnames.dat`.
+- **Id assignment:** 0-based, in first-declaration order, assigned by the
+  writer's `ensure_marker_id`-style operation. Ids are per-container.
+- **Written lazily.** Unlike the four tables above — which every trace
+  creates — `markers.dat` / `markers.off` appear only once a marker label is
+  actually interned. A recording that declares no marker is byte-identical to
+  one written before marker labels existed.
+- **`meta.dat` flag: bit 15**, `FLAG_HAS_CORRELATION_INDEX` — the same bit
+  that covers `corrmark.ns`, **not** bit 12's `FLAG_HAS_INTERNING_TABLES` set.
+
+##### Why bit 15 rather than joining bit 12
+
+Three reasons, and the first is decisive:
+
+1. **Bit 12 is a cross-implementation agreement.** Its own definition requires
+   it to match in three places — the Nim writer's
+   `codetracer_trace_writer/meta_dat.nim`, Rust's
+   `codetracer_trace_writer::meta_dat::FLAG_HAS_INTERNING_TABLES`, and the
+   db-backend's `FLAG_HAS_INTERNING_TABLES`. Redefining what it covers means
+   changing a settled three-way contract to describe a table two of those
+   readers have no use for.
+2. **The marker table is meaningless without `corrmark.ns`.** They are written
+   together and read together, so one bit describing "this recording carries a
+   correlation index, and the label table it refers to" is the honest unit.
+   Bit 12's four tables are, by contrast, always created together and always
+   present.
+3. **Bit 15 is the last bit, and one bit is all this needs.** Giving the index
+   and its label table a bit each would spend the format's last two on a pair
+   that is always written and read together.
+
+Both files keep the semantics bits 8–13 already have: **additive hints** — the
+file-entry array, not the flag, is the authority on what a container holds, and
+a reader that has no use for the index loses nothing by ignoring it.
+
+##### Why the stream-presence bits are no longer contiguous
+
+Bit 14 went to `FLAG_HAS_LINE_COUNT_TABLE` while this index was being drafted
+against the same bit. Both describe the container, so they could not share one:
+a container setting either would have announced the other to every reader. The
+line-count table shipped first and kept 14; the index took 15. Nothing on disk
+carried either bit at the time, so the choice cost no compatibility.
+
+That leaves stream-presence as bits 8..13 and 15, with a record-layout
+capability at 14 between them. The grouping is worth stating precisely because
+the bit number is the only thing that identifies a flag, and a reader that
+infers a bit's class from its neighbours will be wrong about 14.
+
+**"Additive" is about the FILES, not about the bit.** An earlier revision of
+this section said a reader that does not know bit 15 "ignores `corrmark.ns` and
+`markers.dat` entirely". That is not what any of the three implementations do,
+and the difference is the whole rollout: every reader refuses a container whose
+flag word carries a bit outside its own known mask, so an unrecognised bit
+rejects the *container*, not just the files it announces. This is the same
+property bit 13 records, and it makes the ordering **readers before writers** —
+a writer that sets the bit before the readers know it makes every recording
+with a correlation marker fail to open, for a reason that has nothing to do
+with the index.
+
+The order that was actually followed: the constant landed in
+`codetracer-trace-format-nim`'s `meta_dat.nim`, `codetracer_trace_writer::
+meta_dat` (Rust), the db-backend's `ctfs_trace_reader::meta_dat` and
+backend-manager's `meta_dat` — including in each one's `KNOWN_FLAGS_MASK` —
+before any writer stamped it.
+
+The two rejection tests that had been aimed at bit 15 moved to bit 14, since a
+rejection test aimed at a bit the reader now knows is a test of nothing. Bit 14
+is a valid target even though this document allocates it, because **what a
+reader rejects is a bit outside its own `KNOWN_FLAGS_MASK`, not a bit this
+document has left unassigned.** The db-backend does not implement the
+line-count table, so bit 14 is unknown to it, and the test asserts exactly the
+behaviour the next flag it does not know will meet.
+
+With the flag word fully assigned, a reader that later implements every flag
+has no bit left to probe, and the test has to move onto a `version` it does not
+recognise instead. `rejects_unsupported_version` already covers that shape.
 
 #### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
 
@@ -75,7 +158,7 @@ point at record starts regardless of layout.
 
 #### `paths.dat` line-count table (line-only traces)
 
-When `meta.dat` bit 15 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
+When `meta.dat` bit 14 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
 `paths.dat` record carries the file's line count after the path bytes:
 
 ```
@@ -98,10 +181,10 @@ size.
 
 Requirements:
 
-* **Bits 4 and 15 are mutually exclusive.** A record cannot be in both
+* **Bits 4 and 14 are mutually exclusive.** A record cannot be in both
   layouts, and a Layout A record already carries `line_count`. Writers
   MUST NOT set both; readers MUST reject a header that does.
-* **`line_count` is mandatory under bit 15, for every record.** A writer
+* **`line_count` is mandatory under bit 14, for every record.** A writer
   that cannot determine a file's real line count MUST record the ceiling
   it lays the file out with (the conventional `100000`) rather than omit
   the field or record a sentinel. An omitted count would return that one
@@ -116,7 +199,7 @@ Requirements:
   recorded, and no reader can detect it — see `trace-events.md`
   §"Per-File Contiguous Integer Ranges".
 
-Traces without bit 15 have no `line_count` field; the record is the bare
+Traces without bit 14 have no `line_count` field; the record is the bare
 path bytes and every file is sized by the writer's convention, which the
 container does not record. `paths.off` continues to point at record
 starts regardless of layout.
@@ -541,10 +624,11 @@ Header (8 bytes):
     bit 11      -- FLAG_HAS_IO_EVENT_STREAM   (events.dat present)        M23c
     bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
     bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
-    bit 14      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns present)        WTCI
     -- Capability (record-layout variant declared at open):
-    bit 15      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
+    bit 14      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
                    file's line_count; see §"`paths.dat` line-count table" below)
+    -- Stream-presence, continued (see the note below on why it is not adjacent):
+    bit 15      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns + markers.dat/.off) WTCI
 
     No bit is reserved: version 4 assigns all sixteen. A further flag needs a
     meta.dat version bump, not a spare bit.
@@ -563,14 +647,17 @@ The `flags` word conflates two things a reader must NOT treat alike:
    column-aware steps) chosen at open. They too are set once and describe how
    to interpret data that is present; they are not a reject-on-unknown gate.
 
-3. **Stream-presence bits (8..14)** claim that a *separately named stream
-   file* exists in the container (`steps.dat`, `spans.dat`, `corrmark.ns`, …).
-   This claim is **tautological with the container's own structure**: the
-   stream exists iff the file entry exists. See the next subsection.
+3. **Stream-presence bits (8..13 and 15)** claim that a *separately named
+   stream file* exists in the container (`steps.dat`, `spans.dat`,
+   `corrmark.ns`, …). This claim is **tautological with the container's own
+   structure**: the stream exists iff the file entry exists. Bit 14 sits
+   inside that numeric range but is a capability bit, not a stream-presence
+   one — see § "Why the stream-presence bits are no longer contiguous". See
+   the next subsection.
 
 ### Stream-presence flags are a hint, not a gate
 
-A stream-presence bit (8..14) is an **optional hint**, redundant with a
+A stream-presence bit (8..13, 15) is an **optional hint**, redundant with a
 `findFile("<stream>.dat")` on the container's file-entry array. The
 authoritative answer to "does this trace carry stream X?" is the
 **structural presence of the named file**, and the authoritative answer to
@@ -593,7 +680,7 @@ authoritative answer to "does this trace carry stream X?" is the
   ignores its file (and its bit) and reads the rest correctly. Bit 14
   (`corrmark.ns`) is additive on the same terms. No bit is reserved for
   reject-on-unknown in version 4.
-- Writers MAY still set bits 8..14 as a fast-path hint. When they do, the bit
+- Writers MAY still set bits 8..13 and bit 15 as a fast-path hint. When they do, the bit
   MUST be set as soon as the stream is created (so it is visible mid-run),
   never deferred to close; a writer that cannot guarantee mid-run stamping
   SHOULD leave the bit clear and rely on structural presence rather than emit
@@ -639,17 +726,25 @@ missing or malformed value. Rationale and migration roadmap:
   `codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md`
   § 3.
 
-- **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 14
-  `FLAG_HAS_CORRELATION_INDEX`, extending the stream-presence run to
-  8..14, and moved `FLAG_HAS_LINE_COUNT_TABLE` to bit 15, which the
-  line-only sizing work had provisionally taken. The correlation index is
-  a named stream file, so it belongs in the stream-presence run; the
-  line-count table is a record-layout capability and does not. Neither
-  bit had shipped. The flag word is now fully assigned. No layout change: the bit is a stream-presence hint for
-  `corrmark.ns` and, like bits 8..13, is redundant with the container's
-  file-entry array. A reader that ignores it loses nothing; a reader that
-  trusts it over the file entry is wrong for the same reason it would be
-  for `spans.dat`. Contract:
+- **v3.2** (WTCI, 2026-09-09) -- flag bit 15 additionally covers the
+  correlation-marker label interning table (`markers.dat` + `markers.off`),
+  written lazily beside `corrmark.ns`. No layout change and no new bit: the
+  table is meaningless without the index the same bit already announces, and
+  joining bit 12's `FLAG_HAS_INTERNING_TABLES` set would have redefined a flag
+  whose meaning is agreed across the Nim writer, `codetracer_trace_writer::
+  meta_dat` (Rust) and the db-backend. See § "Interning Tables".
+- **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 15
+  `FLAG_HAS_CORRELATION_INDEX`, spending the last bit of the flag word.
+  The index was drafted against bit 14, which `FLAG_HAS_LINE_COUNT_TABLE`
+  took first; both describe the container, so they could not share one.
+  Neither bit had shipped, so the choice cost no compatibility, and it
+  leaves stream-presence as bits 8..13 and 15 with a record-layout
+  capability at 14 between them. No layout change: the bit is a
+  stream-presence hint for `corrmark.ns` and, like bits 8..13, is
+  redundant with the container's file-entry array. A reader that ignores
+  it loses nothing; a reader that trusts it over the file entry is wrong
+  for the same reason it would be for `spans.dat`. A further flag now
+  needs a version bump rather than a spare bit. Contract:
   `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
 
 ### Extended Fields (flags bitmask)
@@ -835,7 +930,7 @@ per line instead of one per column position, and `line = q + 1` inverts it.
 > `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
 
 `line_count[k]` is the count `paths.dat` records for file `k` when
-`meta.dat` bit 15 is set (§"`paths.dat` line-count table"). A trace
+`meta.dat` bit 14 is set (§"`paths.dat` line-count table"). A trace
 without that bit states no counts, and the recurrence above is evaluated
 against the writer's convention of `100000` per file — a number the
 reader must assume, and which is wrong for any file that has more lines
@@ -867,14 +962,23 @@ appended payload region, as `memwrites.tc` is actually built (see
 ctfs-container.md § 8 predates that implementation). Type B is required here
 regardless: a collision bucket is variable-length.
 
+**Key, per kind.** `kind = 0` (distributed-trace span) hashes
+`trace_id_be || span_id_be`. `kind = 1` (boundary crossing) hashes
+`marker_id` (8 bytes big-endian, the interned label id — see § "Interning
+Tables") followed by the raw `key_value` bytes. **No separator is needed**:
+`marker_id` is fixed width, so the split point is always byte 8 and two
+distinct `(marker_id, key_value)` pairs cannot produce the same buffer.
+
 **Value — a bucket, because a 64-bit key over a large corpus collides:**
 
 ```
 bucket:
   entry_count : u32 LE
   entries[entry_count]:
-    trace_id          : 16 bytes  (big-endian, wire order)
-    span_id           :  8 bytes  (big-endian, wire order)
+    identity          : 24 bytes  interpreted by `kind`:
+                          kind 0: trace_id[16] || span_id[8], wire order
+                          kind 1: marker_id u64 BE || key_fingerprint u64 BE
+                                  || reserved[8] (zero)
     wall_time_unix_ns : u64 LE
     monotonic_time_ns : u64 LE
     geid              : u64 LE    coordinate into the event stream
@@ -887,10 +991,21 @@ bucket:
 
 60 bytes per entry. Entries are sorted by `(trace_id, span_id, geid)`.
 
-**Every entry carries its full key, and a reader MUST compare it.** A B-tree
-hit is a hash hit, not a match: a lookup that does not confirm the full
-24 bytes will eventually return the wrong recording. A bucket whose entries all
-mismatch is a *miss*, indistinguishable in its answer from an empty result.
+**A B-tree hit is a hash hit, not a match, and a reader MUST confirm it.**
+
+- **kind 0** carries its full 24-byte `(trace_id, span_id)`, so confirmation is
+  exact.
+- **kind 1** confirms in two parts: `marker_id` is compared **exactly** — it is
+  a fixed-width interned id — while `key_value` rests on a 64-bit fingerprint
+  under a different seed from the index key. `key_value` is the per-event match
+  value and is therefore different on essentially every marker, so interning it
+  would grow one record per marker and save nothing; it stays variable-length,
+  and a fixed-width entry can only carry a digest of it. A false positive
+  consequently needs an exact hit on the interned boundary *and* a 64-bit
+  collision on the key.
+
+A bucket whose entries all fail confirmation is a *miss*, indistinguishable in
+its answer from an empty result.
 
 **Absence is a distinct answer from a miss.** The presence of the `corrmark.ns`
 file entry — which a reader already parses out of block 0, so this costs no
@@ -912,6 +1027,30 @@ outlive the data blocks it points at. A lookup that resolves an entry MUST
 consult the recording's retention state before reporting a hit, and report
 *expired* rather than a hit when the payload is gone. The index accelerates the
 question; it is never the authority on whether the data still exists.
+
+**Inspecting an index.** `ct print --correlation-index <file.ct>` reports the
+entries and, separately, whether the namespace is present at all. That view
+exists because a `kind = 0` entry is otherwise unobservable: unlike a boundary
+crossing it writes no `MarkerPayload` and no I/O event, so a recorder that
+declared coverage and one that silently dropped the call produce byte-identical
+event streams.
+
+### Implementation
+
+| Piece | Where |
+|---|---|
+| Encoder, reader, bulk load | `codetracer-trace-format-nim/src/codetracer_trace_writer/corrmark_builder.nim` |
+| Writer API (`registerSpanCoverage`, `registerCorrelationMarker*`, `ensureMarkerId`) | `.../codetracer_trace_writer/multi_stream_writer.nim` |
+| C ABI (`trace_writer_mark_span_coverage[_hex]`, `trace_writer_mark_correlation[_by_id]`, `trace_writer_ensure_marker_id`) | `.../codetracer_trace_writer_ffi.nim`, declared in `include/codetracer_trace_writer.h` |
+| Rust binding | `codetracer-trace-format/codetracer_trace_writer_nim` (`TraceWriter` trait + `NimTraceWriter`) |
+| MCR writer | `codetracer-native-recorder/ct_recorder/src/ct_recorder/trace_writer.nim` |
+| Consumer | `codetracer-ci/apps/Monolith/Monolith.TraceStorage/CtfsCorrelationIndex.cs` |
+
+The C ABI takes the ids as **wire bytes**, with a `_hex` wrapper that converts.
+The conversion lives in the shared library rather than in each recorder because
+the index keys on the wire bytes: a recorder that hashed the hex rendering
+instead would produce an index that is present, correct-looking, permanently
+unqueryable, and silent.
 
 Full contract, including why this shape was chosen over a scan:
 `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.

@@ -634,7 +634,7 @@ with the next file, and the two are indistinguishable at decode.
 
 **Where the sizes come from.** In line + column mode the per-line table
 in each `paths.dat` record carries them. In line-only mode the file's
-`line_count` is carried by the same record when `meta.dat` bit 15
+`line_count` is carried by the same record when `meta.dat` bit 14
 (`FLAG_HAS_LINE_COUNT_TABLE`) is set — see
 [internal-files.md](internal-files.md) §"`paths.dat` line-count table".
 A line-only trace *without* that bit records no sizes at all, and a
@@ -672,7 +672,7 @@ The position-index scheme is a strict superset of the legacy line-index scheme:
 
 * Pre-extension traces have no per-line offset table. Their step records' `global_position_index` values are interpreted as `global_line_index` (each integer addresses one line). Readers surface the column slot as `None` (Rust `Option<u32>`, Nim `Option[uint32]`).
 * The presence of the per-line offset table — and therefore the column-aware decoding — is signalled by a `meta.dat` flag bit. See §"Reader Behaviour and Back-Compat".
-* A line-only trace's per-file `line_count` table is signalled by its own bit (15, `FLAG_HAS_LINE_COUNT_TABLE`) and is independent of the column extension. It changes no step record and no address arithmetic — only where the `file_size` values in §"Per-File Contiguous Integer Ranges" come from. A trace without it is sized by the `100000`-per-file convention, as every line-only trace was before the bit existed.
+* A line-only trace's per-file `line_count` table is signalled by its own bit (14, `FLAG_HAS_LINE_COUNT_TABLE`) and is independent of the column extension. It changes no step record and no address arithmetic — only where the `file_size` values in §"Per-File Contiguous Integer Ranges" come from. A trace without it is sized by the `100000`-per-file convention, as every line-only trace was before the bit existed.
 
 The on-wire encoding of `global_position_index` (varint) is identical to the legacy `global_line_index` (varint). The interpretation changes; the bytes do not.
 
