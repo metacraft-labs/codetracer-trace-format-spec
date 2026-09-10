@@ -61,10 +61,10 @@ string, so the hot path can pass an integer.
   creates — `markers.dat` / `markers.off` appear only once a marker label is
   actually interned. A recording that declares no marker is byte-identical to
   one written before marker labels existed.
-- **`meta.dat` flag: bit 14**, `FLAG_HAS_CORRELATION_INDEX` — the same bit
+- **`meta.dat` flag: bit 15**, `FLAG_HAS_CORRELATION_INDEX` — the same bit
   that covers `corrmark.ns`, **not** bit 12's `FLAG_HAS_INTERNING_TABLES` set.
 
-##### Why bit 14 rather than joining bit 12
+##### Why bit 15 rather than joining bit 12
 
 Three reasons, and the first is decisive:
 
@@ -80,16 +80,29 @@ Three reasons, and the first is decisive:
    correlation index, and the label table it refers to" is the honest unit.
    Bit 12's four tables are, by contrast, always created together and always
    present.
-3. **Bit 15 is the last bit.** It is spoken for by
-   `FLAG_HAS_LINE_COUNT_TABLE`, and spending a bit on a table already implied
-   by bit 14 would be spending the format's last one for nothing.
+3. **Bit 15 is the last bit, and one bit is all this needs.** Giving the index
+   and its label table a bit each would spend the format's last two on a pair
+   that is always written and read together.
 
-Both bits keep the semantics bits 8–14 already have: **additive hints** — the
+Both files keep the semantics bits 8–13 already have: **additive hints** — the
 file-entry array, not the flag, is the authority on what a container holds, and
 a reader that has no use for the index loses nothing by ignoring it.
 
+##### Why the stream-presence bits are no longer contiguous
+
+Bit 14 went to `FLAG_HAS_LINE_COUNT_TABLE` while this index was being drafted
+against the same bit. Both describe the container, so they could not share one:
+a container setting either would have announced the other to every reader. The
+line-count table shipped first and kept 14; the index took 15. Nothing on disk
+carried either bit at the time, so the choice cost no compatibility.
+
+That leaves stream-presence as bits 8..13 and 15, with a record-layout
+capability at 14 between them. The grouping is worth stating precisely because
+the bit number is the only thing that identifies a flag, and a reader that
+infers a bit's class from its neighbours will be wrong about 14.
+
 **"Additive" is about the FILES, not about the bit.** An earlier revision of
-this section said a reader that does not know bit 14 "ignores `corrmark.ns` and
+this section said a reader that does not know bit 15 "ignores `corrmark.ns` and
 `markers.dat` entirely". That is not what any of the three implementations do,
 and the difference is the whole rollout: every reader refuses a container whose
 flag word carries a bit outside its own known mask, so an unrecognised bit
@@ -103,19 +116,19 @@ The order that was actually followed: the constant landed in
 `codetracer-trace-format-nim`'s `meta_dat.nim`, `codetracer_trace_writer::
 meta_dat` (Rust), the db-backend's `ctfs_trace_reader::meta_dat` and
 backend-manager's `meta_dat` — including in each one's `KNOWN_FLAGS_MASK` —
-before any writer stamped it. The two rejection tests that had been aimed at
-bit 14 moved to bit 15, since a rejection test aimed at a bit the reader now
-knows is a test of nothing.
+before any writer stamped it.
 
-Bit 15 is a valid target for those tests even though this document allocates
-it to `FLAG_HAS_LINE_COUNT_TABLE`, because what a reader rejects is a bit
-outside **its own** `KNOWN_FLAGS_MASK`, not a bit this document has left
-unassigned. No implementation reads or writes the line-count table yet, so
-bit 15 is unknown to every one of them, and the tests assert exactly the
-behaviour the next allocated bit will meet. Whichever reader implements the
-line-count table first must move these tests again — and at that point the
-flag word is full, so it will have to move them onto a `version` the reader
-does not know instead.
+The two rejection tests that had been aimed at bit 15 moved to bit 14, since a
+rejection test aimed at a bit the reader now knows is a test of nothing. Bit 14
+is a valid target even though this document allocates it, because **what a
+reader rejects is a bit outside its own `KNOWN_FLAGS_MASK`, not a bit this
+document has left unassigned.** The db-backend does not implement the
+line-count table, so bit 14 is unknown to it, and the test asserts exactly the
+behaviour the next flag it does not know will meet.
+
+With the flag word fully assigned, a reader that later implements every flag
+has no bit left to probe, and the test has to move onto a `version` it does not
+recognise instead. `rejects_unsupported_version` already covers that shape.
 
 #### `paths.dat` Layout A — per-line byte-length table (column-aware traces)
 
@@ -145,7 +158,7 @@ point at record starts regardless of layout.
 
 #### `paths.dat` line-count table (line-only traces)
 
-When `meta.dat` bit 15 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
+When `meta.dat` bit 14 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
 `paths.dat` record carries the file's line count after the path bytes:
 
 ```
@@ -168,10 +181,10 @@ size.
 
 Requirements:
 
-* **Bits 4 and 15 are mutually exclusive.** A record cannot be in both
+* **Bits 4 and 14 are mutually exclusive.** A record cannot be in both
   layouts, and a Layout A record already carries `line_count`. Writers
   MUST NOT set both; readers MUST reject a header that does.
-* **`line_count` is mandatory under bit 15, for every record.** A writer
+* **`line_count` is mandatory under bit 14, for every record.** A writer
   that cannot determine a file's real line count MUST record the ceiling
   it lays the file out with (the conventional `100000`) rather than omit
   the field or record a sentinel. An omitted count would return that one
@@ -186,7 +199,7 @@ Requirements:
   recorded, and no reader can detect it — see `trace-events.md`
   §"Per-File Contiguous Integer Ranges".
 
-Traces without bit 15 have no `line_count` field; the record is the bare
+Traces without bit 14 have no `line_count` field; the record is the bare
 path bytes and every file is sized by the writer's convention, which the
 container does not record. `paths.off` continues to point at record
 starts regardless of layout.
@@ -611,10 +624,11 @@ Header (8 bytes):
     bit 11      -- FLAG_HAS_IO_EVENT_STREAM   (events.dat present)        M23c
     bit 12      -- FLAG_HAS_INTERNING_TABLES  (paths/funcs/types/varnames.dat present) M23d
     bit 13      -- FLAG_HAS_SPAN_STREAM       (spans.dat / spans.idx present) RS-M1
-    bit 14      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns + markers.dat/.off) WTCI
     -- Capability (record-layout variant declared at open):
-    bit 15      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
+    bit 14      -- FLAG_HAS_LINE_COUNT_TABLE (every paths.dat record carries the
                    file's line_count; see §"`paths.dat` line-count table" below)
+    -- Stream-presence, continued (see the note below on why it is not adjacent):
+    bit 15      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns + markers.dat/.off) WTCI
 
     No bit is reserved: version 4 assigns all sixteen. A further flag needs a
     meta.dat version bump, not a spare bit.
@@ -633,14 +647,17 @@ The `flags` word conflates two things a reader must NOT treat alike:
    column-aware steps) chosen at open. They too are set once and describe how
    to interpret data that is present; they are not a reject-on-unknown gate.
 
-3. **Stream-presence bits (8..14)** claim that a *separately named stream
-   file* exists in the container (`steps.dat`, `spans.dat`, `corrmark.ns`, …).
-   This claim is **tautological with the container's own structure**: the
-   stream exists iff the file entry exists. See the next subsection.
+3. **Stream-presence bits (8..13 and 15)** claim that a *separately named
+   stream file* exists in the container (`steps.dat`, `spans.dat`,
+   `corrmark.ns`, …). This claim is **tautological with the container's own
+   structure**: the stream exists iff the file entry exists. Bit 14 sits
+   inside that numeric range but is a capability bit, not a stream-presence
+   one — see § "Why the stream-presence bits are no longer contiguous". See
+   the next subsection.
 
 ### Stream-presence flags are a hint, not a gate
 
-A stream-presence bit (8..14) is an **optional hint**, redundant with a
+A stream-presence bit (8..13, 15) is an **optional hint**, redundant with a
 `findFile("<stream>.dat")` on the container's file-entry array. The
 authoritative answer to "does this trace carry stream X?" is the
 **structural presence of the named file**, and the authoritative answer to
@@ -663,7 +680,7 @@ authoritative answer to "does this trace carry stream X?" is the
   ignores its file (and its bit) and reads the rest correctly. Bit 14
   (`corrmark.ns`) is additive on the same terms. No bit is reserved for
   reject-on-unknown in version 4.
-- Writers MAY still set bits 8..14 as a fast-path hint. When they do, the bit
+- Writers MAY still set bits 8..13 and bit 15 as a fast-path hint. When they do, the bit
   MUST be set as soon as the stream is created (so it is visible mid-run),
   never deferred to close; a writer that cannot guarantee mid-run stamping
   SHOULD leave the bit clear and rely on structural presence rather than emit
@@ -709,24 +726,25 @@ missing or malformed value. Rationale and migration roadmap:
   `codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md`
   § 3.
 
-- **v3.2** (WTCI, 2026-09-09) -- flag bit 14 additionally covers the
+- **v3.2** (WTCI, 2026-09-09) -- flag bit 15 additionally covers the
   correlation-marker label interning table (`markers.dat` + `markers.off`),
   written lazily beside `corrmark.ns`. No layout change and no new bit: the
   table is meaningless without the index the same bit already announces, and
   joining bit 12's `FLAG_HAS_INTERNING_TABLES` set would have redefined a flag
   whose meaning is agreed across the Nim writer, `codetracer_trace_writer::
   meta_dat` (Rust) and the db-backend. See § "Interning Tables".
-- **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 14
-  `FLAG_HAS_CORRELATION_INDEX`, extending the stream-presence run to
-  8..14, and moved `FLAG_HAS_LINE_COUNT_TABLE` to bit 15, which the
-  line-only sizing work had provisionally taken. The correlation index is
-  a named stream file, so it belongs in the stream-presence run; the
-  line-count table is a record-layout capability and does not. Neither
-  bit had shipped. The flag word is now fully assigned. No layout change: the bit is a stream-presence hint for
-  `corrmark.ns` and, like bits 8..13, is redundant with the container's
-  file-entry array. A reader that ignores it loses nothing; a reader that
-  trusts it over the file entry is wrong for the same reason it would be
-  for `spans.dat`. Contract:
+- **v3.1** (WTCI, 2026-09-09) -- allocated flag bit 15
+  `FLAG_HAS_CORRELATION_INDEX`, spending the last bit of the flag word.
+  The index was drafted against bit 14, which `FLAG_HAS_LINE_COUNT_TABLE`
+  took first; both describe the container, so they could not share one.
+  Neither bit had shipped, so the choice cost no compatibility, and it
+  leaves stream-presence as bits 8..13 and 15 with a record-layout
+  capability at 14 between them. No layout change: the bit is a
+  stream-presence hint for `corrmark.ns` and, like bits 8..13, is
+  redundant with the container's file-entry array. A reader that ignores
+  it loses nothing; a reader that trusts it over the file entry is wrong
+  for the same reason it would be for `spans.dat`. A further flag now
+  needs a version bump rather than a spare bit. Contract:
   `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
 
 ### Extended Fields (flags bitmask)
@@ -912,7 +930,7 @@ per line instead of one per column position, and `line = q + 1` inverts it.
 > `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
 
 `line_count[k]` is the count `paths.dat` records for file `k` when
-`meta.dat` bit 15 is set (§"`paths.dat` line-count table"). A trace
+`meta.dat` bit 14 is set (§"`paths.dat` line-count table"). A trace
 without that bit states no counts, and the recurrence above is evaluated
 against the writer's convention of `100000` per file — a number the
 reader must assume, and which is wrong for any file that has more lines
