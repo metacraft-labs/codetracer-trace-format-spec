@@ -912,6 +912,70 @@ The companion index `steps.idx` starts with the records-per-chunk count (u32 LE)
 
 Default Zstd compression level: 3.
 
+## Recorder Integration — Starting a Recording
+
+`start(path, line)` is the first writer call a recorder makes after its paths are
+registered, and it is **not** merely a cursor move. It emits three things, in this
+order, and a recorder that drives the FFI directly rather than through a safe
+wrapper MUST emit all three:
+
+1. the **`<toplevel>` function record**, at `(path, line)`;
+2. the **opening `Call`** of that function, with no arguments;
+3. the **entry step** at `(path, line)`.
+
+```
+Function { path_id, line, name: "<toplevel>" }   -> function_id 0
+Call     { function_id: 0, args: [] }            -> call_key 0, depth 0
+Step     { path_id, line }                       -> the entry step
+```
+
+### `<toplevel>` is the call tree's root and its id is fixed
+
+`<toplevel>` MUST be the **first** function a recording interns, so that it receives
+**`function_id` 0**, and its call MUST be the first call, so that it receives
+**`call_key` 0** at **`depth` 0**. Readers rely on this: the call tree is rooted at
+`call_key` 0, and a recording whose first call is a user function has no root to hang
+the tree from. Writers SHOULD assert the identity rather than assume it — the
+reference implementation does exactly that, with
+`assert!(function_id == TOP_LEVEL_FUNCTION_ID)` where `TOP_LEVEL_FUNCTION_ID` is
+`FunctionId(0)`.
+
+The name is literally `<toplevel>`, in angle brackets. It is not a placeholder for the
+entry function's own name: a recording of a program whose entry point is `main` has
+BOTH a `<toplevel>` frame at depth 0 and a `main` frame at depth 1, and a reader
+showing a call tree shows the former as the root.
+
+### The entry step is part of `start`, not the recorder's first `register_step`
+
+A recording contains **one more step than the recorder emitted** — the entry step,
+which `start` emits. A recorder that calls `start(p, 1)` and then `register_step` N
+times produces **N + 1** steps.
+
+This is stated normatively because the two reference writers disagreed about it, in
+opposite directions, and neither was wrong by its own documentation:
+
+- the pure-Rust `AbstractTraceWriter::start` registered `<toplevel>` and its call but
+  emitted **no step**;
+- the Nim C ABI's `trace_writer_start` emitted **the step** — its docstring says
+  *"Record the initial step (entry point)"* — but registered **no `<toplevel>`**.
+
+A container written by one and read by a consumer written against the other is off by
+one step, or has no call-tree root, with nothing in the container to say so. Both
+behaviours are defensible readings of *"start recording at the entry point"*, which is
+why the contract is pinned here rather than left to each writer's own documentation.
+
+### Consequences a recorder author should expect
+
+- **Step counts.** Any assertion of the form *"the container has as many steps as the
+  host emitted"* is off by one. Compare against `emitted + 1`, or against the
+  positions the recorder asked for, which does not depend on the count at all.
+- **Function and call counts.** A recording with no user function calls still has
+  **one** function and **one** call.
+- **The first step's position** is the entry point's, not the first event the
+  recorder produced.
+
+---
+
 ## Recorder Integration — Column-Aware Steps
 
 This section is the integration contract for recorders that want to emit
