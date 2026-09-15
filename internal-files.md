@@ -44,6 +44,16 @@ Deduplicated records using the variable-size record table pattern. A `.dat` file
 | Variable names | `varnames.dat` | `varnames.off` | raw bytes (name) |
 | Types | `types.dat` | `types.off` | kind: u8, lang_type_len: varint, lang_type: bytes, specific_info: binary |
 | Functions | `funcs.dat` | `funcs.off` | global_line_index: varint, name_len: varint, name: bytes |
+
+**A function's `global_line_index` is a LINE address, in every trace, including a column-aware one.**
+The column extension re-interprets the address carried by *step* records -- `trace-events.md`
+§"Source Location Addressing" scopes it to step events throughout, and §"Pre-extension traces" talks
+only about "their step records". It says nothing about `funcs.dat`, and two conforming writers duly
+read that silence differently: one addressed a declaration site in the line space and the other in
+the column-aware byte-offset space that its step records use, so the same function in the same trace
+got `100000` from one writer and `8` from the other. A declaration site is a line, not a cursor
+position -- there is no column at which a function is declared -- so it is the line space, and a
+writer must not substitute the position space merely because the trace is column-aware.
 | Correlation-marker labels | `markers.dat` | `markers.off` | raw bytes (boundary label) |
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
