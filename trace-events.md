@@ -67,6 +67,31 @@ The value stream is indexed in parallel with the execution stream — record N i
 
 The materialized container stores the value stream as its own seekable CTFS file pair, `values.dat` + `values.idx`, because execution records and value records have fundamentally different sizes and chunking needs. It is gated additively behind the `meta.dat` capability flag `has_value_stream` (bit 10); readers that do not know the bit ignore `values.dat`/`values.idx`.
 
+##### Forward Compatibility and Self-Delimiting Events
+
+Historically, value-stream events in `values.dat` (tags 0–9) were not self-delimiting. Each event kind had an ad-hoc field layout with no universal length header. Consequently, when a reader encountered a tag it did not know (such as tag 9 `Assignment` encountered by a pre-tag-9 binary), it could not determine the byte boundary of that event. Because a guess would mis-frame all subsequent events in the record, the reader had to refuse the entire record. In practice, this caused readers to drop all visible variable values (`StepValues`) for every step containing the new event (measured as 338 value lines silently lost on the 486-step HCR trace, Known-Test-Failures.md:984-993).
+
+To resolve this forward-compatibility hazard (HX-OQ-8):
+1. **Wire layout for forward-compatible events (tags ≥ 10):**
+   Every value-stream event with tag ≥ 10 is self-delimiting and carries a varint length prefix immediately following the tag byte:
+   ```
+   [tag: u8 (≥ 10)][payload_len: varint][payload: payload_len bytes]
+   ```
+2. **Reader specification:**
+   - When a reader encounters a known tag ≥ 10, it reads `payload_len` and decodes the event payload.
+   - When a reader encounters an **unknown tag ≥ 10**:
+     1. It reads `payload_len: varint`.
+     2. If `pos + payload_len > record_end`, it reports a truncation error.
+     3. Otherwise, it skips `payload_len` bytes (`pos += payload_len`).
+     4. It MUST emit a diagnostic warning naming the skipped tag and context (e.g. one-shot warning to stderr naming the tag and count skipped so as to remain loud without flooding logs).
+     5. It MUST continue decoding the remaining events in that step's record, thereby **preserving** the visible variable values (`StepValues` tag 0) and any other known events for that step.
+   - When a reader encounters an **unknown tag < 10**, it continues to refuse the record with an error, as tags < 10 do not carry the self-delimiting length prefix and cannot be skipped safely.
+3. **Rationale and cost trade-off:**
+   - **Skip vs. Refuse:** A container capability flag would force an old reader to REFUSE the entire trace, losing all inspection utility. A per-event length prefix allows old readers to SKIP unknown events while preserving known variable values at that step.
+   - **Cost:** Exactly 1 varint per event (typically 1 byte for payloads < 128 bytes) on tags ≥ 10.
+   - **Backward compatibility:** Existing tags 0–9 in existing containers remain completely valid and unchanged. No existing container needs to be rewritten.
+
+
 #### 3. Call Stream (`calls.dat`) — call tree records, one per function call
 
 Each record represents a complete function call with entry/exit information.
