@@ -47,6 +47,14 @@ struct ContainerHeader {
 };
 ```
 
+**A container that is not sharded writes `max_shards = 0`, and `1` is not a synonym for it.** The
+parenthetical above says `0 = no sharding`, but it left "one shard" and "no sharding" describing the
+same container without saying which byte to write, and two conforming writers duly picked
+differently -- one wrote `0` and the other `1` for containers that are otherwise identical. A field
+that admits two spellings of one state is not a specification of that state, so: a writer that does
+not shard MUST write `0`. `1` means a sharded container whose maximum is one shard, which is a
+different claim even where it is not yet a different layout.
+
 **Compression is not in the header.** Different internal files may use different compression settings; the compression mode is specified per-stream in `meta.dat`.
 
 **Encryption IS in the header** because an encrypted container is opaque -- even `meta.dat` is unreadable without the key.
