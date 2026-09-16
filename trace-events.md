@@ -98,17 +98,36 @@ Each record represents a complete function call with entry/exit information.
 
 | Field | Type |
 |-------|------|
-| call_key | varint |
 | function_id | varint |
-| parent_key | varint (-1 for root) |
+| parent_key | signed varint (-1 for root) |
 | first_step_id | varint |
 | last_step_id | varint |
 | depth | varint |
+| args_count | varint |
+| args | args_count × (`varname_id: varint`, `value_len: varint`, `value: streaming CBOR`) |
+| return_value_len | varint |
+| return_value | streaming CBOR (or the VoidReturn marker) |
+| raised_exception_len | varint |
+| raised_exception | streaming CBOR, zero-length when the call returned normally |
 | children_count | varint |
 | children_keys | [varint] × children_count |
-| args | streaming CBOR (or empty if no args) |
-| return_value | streaming CBOR (or VoidReturn marker) |
-| raised_exception | optional: streaming CBOR (if call ended with unhandled raise) |
+
+**`call_key` is not stored in the record.** It is the record's position in
+`calls.dat`, which is what makes the stream addressable by it.
+
+**Each argument is its own entry, and carries its own `varname_id`.** The
+framing is the one `values.dat` tag 0 `StepValues` uses for the same job — a
+count, then that many `(name, value)` pairs — and for the same reason: an
+argument's NAME is part of what the record is for, and a reader assembling a
+`(variable, value)` pair has nowhere else to get it.
+
+A writer MUST NOT collapse the arguments into one entry holding a serialized
+vector. That form fits the framing and loses the names, so a reader cannot
+tell it from a single-argument call and cannot report the names of the
+arguments it did receive. It is spelled out because one reference writer did
+exactly that, under a synthetic `varname_id` of 0, and the resulting container
+was unreadable to the other implementation's reader — which had never been
+pointed at one, so nothing said so.
 
 Each call record's *contents* are finalized when the function returns (not at call entry), so they contain complete information. The `call_key` is a sequential index assigned at call entry, and records are stored in `call_key` order — i.e. **call-entry order**, not completion order. A caller therefore precedes its callees in `calls.dat` (a parent's `call_key` is smaller than every child's), even though the parent finalizes last.
 
@@ -188,17 +207,21 @@ Call records are not tagged events — each record is a complete function call w
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `call_key` | varint | Sequential index assigned at call entry |
-| `function_id` | varint | Reference to interning table |
-| `parent_key` | varint (-1 for root) | Parent call's call_key |
+| `function_id` | varint | Reference to the `funcs.dat` interning table |
+| `parent_key` | signed varint (-1 for root) | Parent call's `call_key` |
 | `first_step_id` | varint | First step in this call |
 | `last_step_id` | varint | Last step in this call |
 | `depth` | varint | Call stack depth |
+| `args_count` | varint | Number of arguments |
+| `args` | args_count × (`varname_id: varint`, `value_len: varint`, `value: streaming CBOR`) | One entry per argument — see §"Call Stream (`calls.dat`)" |
+| `return_value_len` | varint | Byte length of `return_value` |
+| `return_value` | streaming CBOR (or VoidReturn marker) | Return value |
+| `raised_exception_len` | varint | Byte length of `raised_exception`; 0 when none |
+| `raised_exception` | streaming CBOR | Present if call ended with unhandled raise |
 | `children_count` | varint | Number of child calls |
 | `children_keys` | [varint] × children_count | Child call keys |
-| `args` | streaming CBOR (or empty) | Function arguments |
-| `return_value` | streaming CBOR (or VoidReturn marker) | Return value |
-| `raised_exception` | optional: streaming CBOR | Present if call ended with unhandled raise |
+
+`call_key` is the record's position in `calls.dat`, not a stored field.
 
 ### IO Event Stream Records (`events.dat`)
 
