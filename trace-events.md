@@ -990,8 +990,11 @@ Default Zstd compression level: 3.
 
 `start(path, line)` is the first writer call a recorder makes after its paths are
 registered, and it is **not** merely a cursor move. It emits three things, in this
-order, and a recorder that drives the FFI directly rather than through a safe
-wrapper MUST emit all three:
+order, and **every** implementation of it does so — the C ABI's
+`trace_writer_start` as much as a safe wrapper, because a recorder should not
+have to know which writer it was handed in order to produce a well-formed call
+tree. A recorder therefore MUST NOT register `<toplevel>` itself: doing so opens
+the frame twice.
 
 1. the **`<toplevel>` function record**, at `(path, line)`;
 2. the **opening `Call`** of that function, with no arguments;
