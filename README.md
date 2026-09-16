@@ -11,6 +11,7 @@ This repository is the source-of-truth specification for the CodeTracer trace fo
 | [seekable-zstd.md](seekable-zstd.md) | Zstd seekable compression format as used by CodeTracer |
 | [internal-files.md](internal-files.md) | Conventions for files stored inside a CTFS container |
 | [Trace-Filters.md](Trace-Filters.md) | Cross-language trace filter contract: schema, hot-path requirement, provenance |
+| [conformance-testing.md](conformance-testing.md) | How to test an implementation, and how such tests fail to fail — written from the defects that got through |
 
 ## Implementations
 
