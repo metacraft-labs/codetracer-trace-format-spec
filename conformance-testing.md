@@ -153,6 +153,16 @@ into a container beside the recording, and a test suite that read them back from
 there, agreed with each other perfectly while the real recording was missing
 every one of those records. Read back the artifact the product consumes.
 
+The same shape appears wherever one job has two implementations. A dump tool
+grew a second copy of its renderer so tests could call it in-process without
+shelling out to the binary — and the tests then asserted against the copy, which
+no user runs. Over the following months the shipped binary gained an ordering
+fix, a column-aware position decoder, and a diagnostic channel; the copy the
+tests exercised gained none of them, and separately grew a field the binary has
+never printed. Every one of those was a passing test suite describing a program
+nobody executes. Two producers of one output need something that compares them,
+or they are not two implementations of a rule — they are two rules.
+
 ## What this asks of a conformance suite
 
 1. **Cross-read.** An implementation's own round-trip proves self-consistency

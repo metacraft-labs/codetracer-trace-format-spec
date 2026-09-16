@@ -131,6 +131,53 @@ pointed at one, so nothing said so.
 
 Each call record's *contents* are finalized when the function returns (not at call entry), so they contain complete information. The `call_key` is a sequential index assigned at call entry, and records are stored in `call_key` order — i.e. **call-entry order**, not completion order. A caller therefore precedes its callees in `calls.dat` (a parent's `call_key` is smaller than every child's), even though the parent finalizes last.
 
+##### Assembling an event stream: storage order is not event order
+
+`calls.dat` is stored in call-entry order because that is what makes it
+addressable by `call_key`. A tool that **assembles an event stream** from a
+container — `ct-print --events` / `--full`, a DAP trace processor, any UI that
+interleaves calls with steps — does not present it in that order. It walks the
+steps and emits a `call_entry` at each record's `first_step_id` and a
+`call_exit` at its `last_step_id`. Those are two different orders, and the
+storage sentence above decides neither of them.
+
+Records routinely share a `last_step_id`. Every frame still open when a
+recording ends is finalized with `last_step_id = step_count - 1`, so all of them
+report the same one; so does a callee whose caller emits no step between the
+callee's return and its own. At that point the completion order is simply not in
+the data, and the assembler is choosing it.
+
+**An assembler MUST NOT emit a call's `call_exit` before the `call_exit` of any
+call in that call's subtree.** A child's `[first_step_id, last_step_id]` range
+lies inside its parent's, so a parent's exit is the last event of its subtree.
+An ordering that breaks this renders a frame as outliving its own callee — not a
+state the program was ever in, and not one a call tree can represent.
+
+**Where the container does not otherwise distinguish them, an assembler MUST
+order `call_exit` events by `last_step_id` ascending, then `call_key`
+descending.** A parent's `call_key` is always smaller than every descendant's,
+so descending `call_key` places the innermost frame first among any set of
+records sharing an exit step, which satisfies the requirement above and is
+total. It is pinned as a single ordering, rather than left to each assembler,
+so that two implementations reading one container produce one event stream.
+
+Two frames that share an exit step and are *not* related by nesting are
+indistinguishable in the records; the rule orders them by descending `call_key`
+because it must order them somehow, and that order carries no claim about which
+finished first.
+
+`call_entry` is the mirror and needs no tie-break beyond the natural one: emit
+at `first_step_id`, ascending `call_key`, which is outermost first.
+
+This is spelled out because it is invisible to the checks a conformance suite
+reaches for first. Under either order the count of `call_exit` events is right,
+every record decodes, and the return value attached to each one is right. Only a
+question about *which* call closed first can see it — and a per-fixture list of
+expected function names asks that question only of the fixtures someone wrote it
+out for. Derive it from `children_keys` instead and it holds for every fixture:
+walk the assembled events and refuse any `call_exit` whose call still has an
+unclosed child. See `conformance-testing.md` §"Assert names, not counts".
+
 #### 4. IO Event Stream (`events.dat`) — I/O events for the event log pane
 
 | Field | Type |
@@ -1053,6 +1100,84 @@ why the contract is pinned here rather than left to each writer's own documentat
 
 ---
 
+## Recorder Integration — Staging Values
+
+A writer that buffers one step at a time — `register_step` opens a step, and the
+next step, call, or return flushes it together with everything staged in between
+— will be handed variables at moments when no step is open. This is not a
+recorder behaving badly. It is the normal shape for two very common cases:
+
+* **A binding whose value is only known after a call returns.** `let x = f()`
+  reaches the writer as `call` / `step` / `return` / `variable x`, because the
+  value does not exist until `f` has returned, and the return has already
+  flushed the step.
+* **A call's arguments.** Recorders stage each argument as a step variable as
+  well as a call argument, and they do it *before* `register_call`, at a moment
+  when the caller's own step is typically already flushed.
+
+Those values are said to be staged **in the gap**, and what a writer does with
+them is a correctness question, not a housekeeping one.
+
+### The rule
+
+**Values staged while no step is open MUST attach to the next step the writer
+emits, and the writer MUST NOT emit a step of its own to carry them.**
+
+Carrying them forward is correct on the format's own terms: `StepValues` is "all
+variable values visible at this step", and the next step is the first step at
+which they are visible. It also needs no new policy — it is what a line-only
+writer has always done.
+
+Two tempting alternatives are both wrong, and both have shipped:
+
+**Do not park them on a `DeltaColumn`.** A `DeltaColumn` is a column-only nudge
+on the preceding step, not a logical step — `logicalStepCount` excludes it for
+exactly that reason. A value record written parallel to one sits at an exec
+index that no logical step occupies: it is unreachable from `variables_at` for
+every step in the trace, so the values are written and then never readable. The
+container finalizes, decodes cleanly, holds one value record per exec index, and
+is *short* — see `conformance-testing.md` §"A record that is empty for two
+different reasons". **This is worse than discarding them**, because a discard at
+least leaves the value count matching the step count, whereas this leaves a
+container in which nothing at all indicates something is missing.
+
+**Do not synthesize a step somewhere else to hold them.** Emitting one at the
+callee's declaration site, or at the previous step's position, or at line 1, puts
+a step in the exec stream that the recorder never asked for and the program never
+executed. A reader that seeks to it lands where the program never was; the step
+count stops matching what the recorder emitted, and no recorder author can
+predict it, because whether the extra step appears depends on whether a value
+happened to be staged at that moment. It is the same class of defect as folding a
+column into a line-only address: a plausible position that is not a real one.
+
+### Where the recording ends with values still staged
+
+Carry-forward needs a terminus. When a recording ends with values staged and no
+further step coming, those values **MUST NOT be silently discarded** — a writer
+that drops them finalizes a container that is short in exactly the way described
+above, with the same absence of any signal.
+
+Two shapes are in use, and they are not equivalent; see §"Known Issues —
+Column-Aware" for the open question. A writer that has not yet emitted the last
+step's value record can still amend it, which costs no extra step. A writer that
+has already emitted it cannot, and has to add one final step at the last recorded
+position instead.
+
+Where there is no last position either — values staged by a recorder that never
+recorded a single step — there is nothing truthful to attach them to, and the
+writer MUST fail the close by name rather than finalize a container that silently
+omits them.
+
+### What this asks of a recorder
+
+A recorder does not have to rely on the writer getting this right, and the
+recorders that read best do not. Holding a value until the next step is known and
+registering it there makes the recorder's own intent explicit, keeps it correct
+against writers that have not been fixed, and is the only form in which the
+recorder — rather than the writer — decides which step a value belongs to.
+
+---
+
 ## Recorder Integration — Column-Aware Steps
 
 This section is the integration contract for recorders that want to emit
@@ -1103,6 +1228,51 @@ on the wire is a `(step, column-delta)` pair that decodes to the exact
 `(line, column)` the recorder asked for. Recorders MUST call the safe
 wrapper rather than driving the two FFI symbols directly unless they
 own the bookkeeping for tracking the previous column themselves.
+
+### A column needs a file with a column axis
+
+`register_path_with_line_lengths` is what gives a file a column axis. A file
+registered without one — an empty table, because the source was not readable at
+the path the recorder named — is sized in the position space by the line-only
+fallback, where **one address is one line**. A column delta added to such an
+address does not name a column. It names a later line, and the result decodes as
+`line + column - 1` with nothing in the container to say the position was ever
+about a column.
+
+This is neither hypothetical nor rare. A recorder that resolves source paths out
+of debug information gets unreadable paths whenever it records somewhere other
+than the build machine, and a recorder fed generated or fetched sources may have
+no local file at all. Measured in the Solana recorder: every file went untabled,
+and every step after the first reported a line that was wrong by its own column
+— decoding cleanly, with plausible line numbers.
+
+**A writer MUST NOT fold a column into the address of a file that has no
+per-line table.** Readers already decline to decode a column for such a file and
+fall back to line-only, so a writer that accepts one is producing positions its
+own reader refuses to read.
+
+What happens to the rest of the call depends on what else it carries:
+
+* **A column arriving as part of a step** — `register_step_with_column`, or the
+  single combined event a writer folds it into — **keeps the step**. Emit it at
+  its line, line-only, and report the dropped column on the writer's diagnostic
+  channel. The line is a position the recorder actually observed; refusing the
+  whole step to punish the column throws that away, and a missing step is far
+  harder to notice than a missing column.
+* **A column arriving on its own** — a bare `DeltaColumn` cursor move — has no
+  step to keep, so the call is refused with an error naming the file.
+
+The two entry points are easy to fix by halves. A writer that guards only the
+bare cursor move has not closed anything: the combined step-plus-column call is
+the one the canonical recorder wrapper drives, so it is the one every recorder
+actually reaches, and a guard that misses it leaves the defect live on the only
+path in use. **Both entry points, or neither.**
+
+**A recorder SHOULD NOT offer the column at all** for a file it knows has no
+table — and it does know, being the party that supplied, or failed to supply,
+the lengths. Tracking which paths came back with a non-empty table and passing
+`None` for the rest keeps the diagnostic channel quiet, and is the only form
+that is also correct against a writer that has not been fixed yet.
 
 ### FFI Symbols (column-aware extensions)
 
@@ -1224,10 +1394,11 @@ extension entirely.
 
 ## Known Issues — Column-Aware
 
-Open issues from the column-aware navigation campaign as of this spec
-revision. These are recorder/writer bugs, not wire-format bugs — the
-on-wire format is stable; fixes will land in the writer crates without
-requiring trace re-recording.
+Open issues in the writer and recorder pipeline as of this spec revision, most
+of them surfaced by the column-aware navigation campaign. These are
+recorder/writer bugs, not wire-format bugs — the on-wire format is stable; fixes
+land in the writer crates without requiring trace re-recording. Entries that have
+been closed are kept when the way they were wrong is itself worth knowing.
 
 ### `ct_print` drops `call_entry` past `stepCount`
 
@@ -1244,19 +1415,47 @@ writer crate's close-path.
 
 ### Writer's pending-value-after-`DeltaColumn`: trailing variable lost
 
-The writer's pending-value pipeline assumes that a `register_variable`
-call lands in the same flush window as the step it annotates. When
-column-aware mode is on, a `DeltaColumn` record can flush the pending
-buffer between the `register_step` and a *trailing* `register_variable`
-call, in which case the variable record is silently discarded.
+**Closed.** The mechanism this described — a `DeltaColumn` record flushing the
+pending buffer between a `register_step` and a *trailing* `register_variable` —
+stopped existing when `register_delta_column` was folded into the pending line
+step. The step and its column became one combined event, so a trailing
+`register_variable` now lands in the same flush window as the step it annotates.
 
-Symptom: the value of a variable assigned in the same statement as the
-column-final sub-expression is missing from the value stream. The step
-record itself is correct.
+What outlived it was a different defect in the same pipeline, which is why this
+entry stayed plausible for so long: values staged *in the gap*, where no step is
+open at all, were parked on a synthesized `DeltaColumn` nudge and became
+unreachable from every step in the trace. That is ruled out by §"Recorder
+Integration — Staging Values", which now says where a staged value goes instead
+of leaving each writer to invent a policy.
 
-Workaround: emit `register_variable` *before* the column-final
-sub-expression's `register_step_with_column`, or rely on the next
-step's `StepValues` snapshot to surface the missed value (the snapshot
-walks current bindings rather than the per-step delta).
+The entry is kept rather than deleted because of how it came to be wrong. A
+regression test for exactly this shape had existed for months and had never run
+— it was never added to the test runner's file list. It named the right pipeline
+and the wrong defect, and nothing contradicted it, because nothing executed it.
+See `conformance-testing.md` §"A gate that cannot pass".
 
-Fix tracked in the writer crate's pending-value flush ordering.
+### Trailing values at close: two shapes, one of them adds a step
+
+Open. §"Recorder Integration — Staging Values" requires that values still staged
+when a recording ends are not discarded. Both reference writers honour that —
+differently.
+
+* A writer still buffering the last step's value record amends that record. No
+  extra step; the values surface on the final step.
+* A writer that has already emitted the record cannot amend it, and emits one
+  additional step at the last recorded position to carry them instead. Same
+  values, one more step, and a `last_step_id` naming a duplicate position.
+
+A container written by one is therefore a step longer than one written by the
+other from identical recorder calls — which any byte-for-byte differential
+between the two will see the moment a fixture ends with a staged value. Pick one
+before a recorder starts depending on the count.
+
+### A writer freed without being closed loses staged values silently
+
+Open. The terminus that saves trailing values runs on the close path only. A
+caller that releases the writer handle without closing it first — which is what a
+wrapper's destructor does when `close()` was never called — finalizes the
+container through the release path, where the terminus is not reached. The staged
+values are dropped, and the release path has no return channel to report it, so
+the only evidence is a value stream that is short.
