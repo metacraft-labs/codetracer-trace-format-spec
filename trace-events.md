@@ -1153,20 +1153,30 @@ column into a line-only address: a plausible position that is not a real one.
 ### Where the recording ends with values still staged
 
 Carry-forward needs a terminus. When a recording ends with values staged and no
-further step coming, those values **MUST NOT be silently discarded** — a writer
-that drops them finalizes a container that is short in exactly the way described
-above, with the same absence of any signal.
+further step coming, **those values MUST NOT be lost** — a writer that discards
+them finalizes a container that is short in exactly the way described above, with
+the same absence of any signal.
 
-Two shapes are in use, and they are not equivalent; see §"Known Issues —
-Column-Aware" for the open question. A writer that has not yet emitted the last
-step's value record can still amend it, which costs no extra step. A writer that
-has already emitted it cannot, and has to add one final step at the last recorded
-position instead.
+**They attach to the last step the writer emitted, and the writer MUST NOT add a
+step to carry them.** The last step is the step that was current when they were
+staged, so it is where they are visible; and adding one would break the count
+guarantee this specification states elsewhere without qualification — a recording
+has **exactly N + 1 steps** for a recorder that emitted N (§"The entry step is
+part of `start`, not the recorder's first `register_step`"). A terminus that adds
+a step makes the total depend on whether a value happened to be staged when the
+recording ended, which is not something a recorder author can predict, and turns
+a stated guarantee into an approximation.
 
-Where there is no last position either — values staged by a recorder that never
-recorded a single step — there is nothing truthful to attach them to, and the
-writer MUST fail the close by name rather than finalize a container that silently
-omits them.
+Concretely: a writer still buffering the last step's value record amends it. A
+writer that has already emitted that record has to be able to amend it anyway —
+keeping the most recent record amendable is a writer-side obligation, not an
+excuse to emit a second step.
+
+Where there is no last step either — values staged by a recorder that never
+recorded one — there is nothing to attach them to, and the writer MUST fail the
+close by name rather than finalize a container that silently omits them. Note
+that `start` emits the entry step, so this is only reachable by a writer whose
+recording never started.
 
 ### What this asks of a recorder
 
@@ -1434,22 +1444,21 @@ regression test for exactly this shape had existed for months and had never run
 and the wrong defect, and nothing contradicted it, because nothing executed it.
 See `conformance-testing.md` §"A gate that cannot pass".
 
-### Trailing values at close: two shapes, one of them adds a step
+### Trailing values at close: the terminus used to add a step
 
-Open. §"Recorder Integration — Staging Values" requires that values still staged
-when a recording ends are not discarded. Both reference writers honour that —
-differently.
+**Closed.** §"Recorder Integration — Staging Values" now pins where values still
+staged at the end of a recording go: onto the last step, with no step added. One
+reference writer already did that; the other emitted an extra step at the last
+recorded position, so a container written by one was a step longer than one
+written by the other from identical recorder calls.
 
-* A writer still buffering the last step's value record amends that record. No
-  extra step; the values surface on the final step.
-* A writer that has already emitted the record cannot amend it, and emits one
-  additional step at the last recorded position to carry them instead. Same
-  values, one more step, and a `last_step_id` naming a duplicate position.
-
-A container written by one is therefore a step longer than one written by the
-other from identical recorder calls — which any byte-for-byte differential
-between the two will see the moment a fixture ends with a staged value. Pick one
-before a recorder starts depending on the count.
+The cost of the extra step was not the duplicate position. It was that the step
+count stopped being **N + 1** — it became N + 1 or N + 2 depending on whether a
+value happened to be staged at the moment the recording ended, which is invisible
+to the recorder. Four recorder repositories carried failing step-count
+assertions traceable to this and to its mid-recording counterpart; the
+assertions were right, and computing N + 1 from the recorder's own call count is
+the check that found it.
 
 ### A writer freed without being closed loses staged values silently
 
