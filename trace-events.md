@@ -419,6 +419,32 @@ void trace_value_end(trace_writer_t w);
 void trace_writer_end_value(trace_writer_t w);
 ```
 
+### Scalars are written in CBOR's own types
+
+A leaf value goes into `values.dat` as the CBOR type that denotes it:
+`trace_value_write_int` writes a CBOR integer, `trace_value_write_bool` a CBOR
+boolean, and **`trace_value_write_float` a CBOR float** — half, single or
+double, whichever round-trips the value, since a reader decodes all three to
+the same number.
+
+**A float is NOT written as text.** It is stated because it was: the JSON
+projection of a `Float` carries its value as a decimal string — JSON cannot
+express an infinity or a NaN, and `"inf"`, `"+inf"`, `"-inf"` and `"nan"` are
+the spellings it uses — and one reference implementation shared a single
+serializer definition between the two formats, so the text form reached
+`values.dat` as well. CBOR encodes the non-finites natively and needs no such
+workaround, and a binary format should not inherit a text format's limits.
+
+The symptom was that the other implementation's reader refused every container
+carrying a float, with *"invalid type: floating point `2.5`, expected a
+string"* — but only because the two forms are different CBOR types. Had both
+been text, the divergence would have been invisible.
+
+A reader SHOULD accept any CBOR numeric type where a float is specified.
+Writers choose the narrowest float that round-trips, and an implementation may
+encode a whole-numbered float as an integer; refusing those would make a value
+unreadable on the strength of how its producer chose to pack it.
+
 ### Usage Example (Python recorder pseudocode)
 
 ```python
