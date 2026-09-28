@@ -369,7 +369,91 @@ per-chunk-compressed, seekable payload keyed by `thread_id` instead of one file 
 thread; both are the seekable-zstd model, differing only in how the per-thread
 streams are addressed within the container.
 
+#### Snapshot payloads (MCR recorder) are Chunked Compressed Tables of bytes
+
+*(Added 2026-09-25, `MCR-Memory-Page-CAS.milestones.org` CAS-Z0.)*
+
+The MCR recorder's memory-snapshot payloads are stored through the same Chunked
+Compressed Table as `steps.dat` and the thread streams above — **the container's
+one compression layer; nothing snapshot-specific is layered on top** (owner
+decision, 2026-09-24: snapshots "can likely piggyback on the existing compression
+of the CTFS format (there won't be any win from double compression)").
+
+The payload classes, by LOGICAL name:
+
+| Logical name | What it holds |
+|---|---|
+| `cp.<kind>.mem` | the page bytes of a stage-0 boundary snapshot (`kind` = `prein` / `entry` / `postl`) |
+| `cp.<kind>.cas` | that boundary's page-CAS hash stream (`MCR-Memory-Page-CAS.md` §3.3) |
+| `cppages.ns` | the trace's page-CAS page store (§5.1) |
+| `cp0.mem`, `cpN.mem` | a full memory snapshot, `(addr: u64, size: u64, bytes[size])*` — the initial one, or periodic checkpoint `N` |
+| `t_start.mem` | the macOS recording-start snapshot (same framing as `cp0.mem`) |
+
+Each is stored as a record-size-**1** table: every record is one byte, so
+`chunk_size` is the number of payload BYTES per chunk (the recorder uses
+1 048 576), every chunk but the last inflates to exactly `chunk_size` bytes, and
+the payload's length is `(chunks - 1) * chunk_size` plus the last frame's
+declared content size.  Random access holds: byte `o` is in chunk
+`o div chunk_size`.
+
+**Member names.**  `foo.dat` / `foo.idx` cannot be used: the logical names are
+already up to 12 characters, the most CTFS keys (§ base40 in
+[ctfs-container.md](ctfs-container.md)).  So the data and index members are named
+by replacing the extension `<ext>` with `<ext[0]>zd` and `<ext[0]>zi`:
+
+```
+cp.entry.mem -> cp.entry.mzd (data)  +  cp.entry.mzi (index)
+cp.entry.cas -> cp.entry.czd         +  cp.entry.czi
+cppages.ns   -> cppages.nzd          +  cppages.nzi
+cp3.mem      -> cp3.mzd              +  cp3.mzi
+```
+
+A name whose derived member would exceed 12 characters is refused by the
+writer, never truncated.
+
+**The legacy form, and how a reader tells the two apart.**  Traces written
+before 2026-09-25 carry the same payload RAW under the logical name.  A reader
+MUST decide the form by **which members exist**, never by inspecting bytes (a raw
+memory page can begin with the zstd frame magic):
+
+| `<logical>` | `<data>` + `<index>` | Meaning |
+|---|---|---|
+| absent | both present | compressed form — inflate |
+| present | both absent | legacy raw form — read as is |
+| present | any present | **malformed** — refuse |
+| any | exactly one present | **malformed** (half a pair) — refuse |
+| absent | both absent | the payload is absent |
+
+A writer emits exactly one form, and adds the data and index members together
+or not at all (it checks for two free root entries first; CTFS cannot remove a
+member once added).  Every frame's declared content size MUST match what the
+index implies, so a truncated or re-ordered payload fails rather than decoding
+to plausible bytes.
+
+Layouts (`cp.<kind>.lay`), register files (`cp.<kind>.reg`, `cpN.regs`) and the
+checkpoint index members stay raw: each is well under one block, and a
+compressed pair costs two members and at least four blocks where the raw member
+costs one member and two.
+
+Implementations: `codetracer-native-recorder/ct_recorder/src/ct_recorder/snapshot_payload.nim`
+(writer and reader); `tracing-formats-benchmarks/cas_dedup/ctfs.py`
+(`read_payload`, independent Python reader).
+
 ### Checkpoint Packing (cp.dat + cp.off)
+
+> **Not what the MCR recorder writes (corrected 2026-09-25, CAS-Z0).**  No
+> producer in the workspace writes `cp.dat` / `cp.off`; the design below is
+> unimplemented.  The MCR recorder's periodic checkpoints are FULL snapshots in
+> five member kinds: `cpidx.idx` (`count: u32`, then `id: u32` per checkpoint),
+> `cpidx_full.idx` (`count: u32`, then `(id: u32, geid: u64)` per checkpoint),
+> `cpdata.bin` (concatenated `(id: u32, geid: u64, n: u32, (tid: u32, tick: u64)[n])`
+> records, raw, no page data), `cpN.mem` (the memory, as a compressed snapshot
+> payload — above) and `cpN.regs` (`(tid: u32, len: u32, bytes[len])*`).  There
+> is no incremental chain and no delta encoding.  `Multi-Core-Recorder.md`
+> §12.3-§12.4 states the same.  (`cpidx_full.idx` is 14 characters and `_` is not
+> in the base40 alphabet, so its 12-character key decodes as `cpidx<NUL>full.i`;
+> readers that look members up by encoded key find it, readers that compare
+> decoded names do not.)
 
 MCR checkpoints are packed as a variable-size record table. Each checkpoint record contains register state, thread ticks, and page data (full pages or byte-level deltas against the parent checkpoint).
 

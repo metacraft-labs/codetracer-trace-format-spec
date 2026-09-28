@@ -88,3 +88,9 @@ This avoids fetching the entire data stream.
 Default Zstd compression level: 3.
 
 Chunk sizes are configurable per stream. Smaller chunks give finer seek granularity but lower compression ratio. Larger chunks compress better but require decompressing more data per seek. Default: 4096 records per chunk.
+
+The MCR recorder's memory-snapshot payloads (`cp.<kind>.mem`, `cp.<kind>.cas`,
+`cppages.ns`, `cpN.mem`) use this format with a record size of **one byte** and
+`chunk_size` = 1 048 576, at level 3 — see "Snapshot payloads (MCR recorder)" in
+[internal-files.md](internal-files.md) for their member names and for how a
+reader tells them from the raw form older traces carry.

@@ -55,7 +55,22 @@ that admits two spellings of one state is not a specification of that state, so:
 not shard MUST write `0`. `1` means a sharded container whose maximum is one shard, which is a
 different claim even where it is not yet a different layout.
 
-**Compression is not in the header.** Different internal files may use different compression settings; the compression mode is specified per-stream in `meta.dat`.
+**Compression is not in the header.** Different internal files may use different compression settings.
+
+> **Corrected 2026-09-25 (`MCR-Memory-Page-CAS.milestones.org` CAS-Z0).**  This
+> paragraph used to end "the compression mode is specified per-stream in
+> `meta.dat`".  `meta.dat` has no such field in any version (v4/v5 carry flags,
+> identity, paths and the MCR fields — see `codetracer_trace_writer/meta_dat.nim`),
+> and no reader looks for one.  A member's compression is a property of its
+> **format, fixed by its name**: a Chunked Compressed Table (§7; `steps.dat` +
+> `steps.idx`, the MCR thread streams `tNNN` + `iNNN`, the MCR snapshot payloads
+> `<stem>.<x>zd` + `<stem>.<x>zi` of [internal-files.md](internal-files.md)) keeps
+> independent zstd frames in its data member and their offsets in its index
+> member, and so does a seekable-zstd stream such as the non-MCR writer's `events.log`
+> ([seekable-zstd.md](seekable-zstd.md)); a member whose format is not one of
+> those is stored exactly as written.  No current writer compresses the
+> container as a whole — the MCR recorder's buffered mode, which did, has been
+> removed.
 
 **Encryption IS in the header** because an encrypted container is opaque -- even `meta.dat` is unreadable without the key.
 
@@ -89,6 +104,19 @@ root_blocks = ceil((16 + R + MaxRootEntries * 24) / BlockSize)
 ```
 
 Data block allocation begins at block number `root_blocks`.
+
+> **Implementation status (2026-09-26, `MCR-Memory-Page-CAS.milestones.org`
+> CAS-Z0): the overflow is not implemented anywhere.**  `codetracer_ctfs`'s
+> `createCtfs` allocates block 0 alone and starts data at block 1; the MCR
+> recorder's `ctfs_disk.readCtfsRootBlock` reads block 0 alone and stops at its
+> end; `container_append.nim` refuses a declared count that does not fit block 0.
+> So a container holds at most `(BlockSize - 16 - R) / 24` members in practice —
+> 170 at the defaults — and a writer MUST NOT declare more until readers read
+> `root_blocks` blocks, or the entries past block 0 are silently not found.  The
+> MCR recorder declares exactly 170 and fails a recording that needs more,
+> naming the member it could not add; a periodic checkpoint costs three entries
+> (`cpN.mzd`, `cpN.mzi`, `cpN.regs`), so a `--checkpoint-interval` recording
+> reaches the limit at about 50 checkpoints.
 
 ### Version History
 
