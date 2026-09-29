@@ -93,7 +93,7 @@ Block 0:
 auto_entries = (BlockSize - 16 - R) / 24
 ```
 
-For BlockSize=4096, max_shards=16: `auto_entries = (4096 - 16 - 672) / 24 = 141`.
+For BlockSize=4096, max_shards=16: `auto_entries = (4096 - 16 - 672) / 24 = 142` (this line said 141 until 2026-09-29; 3408 / 24 is exactly 142).
 
 For BlockSize=4096, max_shards=0 (R=0): `auto_entries = (4096 - 16) / 24 = 170`.
 
@@ -105,18 +105,45 @@ root_blocks = ceil((16 + R + MaxRootEntries * 24) / BlockSize)
 
 Data block allocation begins at block number `root_blocks`.
 
-> **Implementation status (2026-09-26, `MCR-Memory-Page-CAS.milestones.org`
-> CAS-Z0): the overflow is not implemented anywhere.**  `codetracer_ctfs`'s
-> `createCtfs` allocates block 0 alone and starts data at block 1; the MCR
-> recorder's `ctfs_disk.readCtfsRootBlock` reads block 0 alone and stops at its
-> end; `container_append.nim` refuses a declared count that does not fit block 0.
-> So a container holds at most `(BlockSize - 16 - R) / 24` members in practice —
-> 170 at the defaults — and a writer MUST NOT declare more until readers read
-> `root_blocks` blocks, or the entries past block 0 are silently not found.  The
-> MCR recorder declares exactly 170 and fails a recording that needs more,
-> naming the member it could not add; a periodic checkpoint costs three entries
-> (`cpN.mzd`, `cpN.mzi`, `cpN.regs`), so a `--checkpoint-interval` recording
-> reaches the limit at about 50 checkpoints.
+> **Implementation status (2026-09-29, `MCR-Memory-Page-CAS.milestones.org`
+> CAS-Z0).**  The overflow is implemented by the Nim writer and by every reader
+> of MCR recordings:
+>
+> - `codetracer_ctfs` (`codetracer-trace-format-nim`): `createCtfs` reserves
+>   `root_blocks` blocks and starts data at block `root_blocks`
+>   (`rootBlockCount`); the streaming publishes (`addFile`,
+>   `truncateFileContent`, `syncRootBlock`, `syncAllEntries`) write the whole
+>   root region; `writeToFile` refuses a mapping or data block inside it.
+>   `readInternalFile` / `hasInternalFile` read the whole file and need no
+>   change.  Pinned by `tests/test_root_directory_overflow.nim`.
+> - The MCR recorder declares `root_blocks = 16` (2730 entries) for a
+>   recording that takes periodic checkpoints (three members each) and block 0
+>   alone (170) for every other recording.  Its disk root reader
+>   (`ctfs_disk.readCtfsRootBlock`, under the replay-worker's and debugserver's
+>   streaming loader) reads the whole region; `export --portable` and `slice`
+>   size their output past block 0 when they must.
+> - `ct upload`'s enrichment check (`codetracer`,
+>   `mcr_enrichment.readCtfsRootDir`) reads the whole region instead of
+>   clamping the count to block 0.
+>
+> Still block 0 only, and not handed an MCR recording today:
+> `codetracer_ctfs`'s `container_append` (refuses a count past block 0, by
+> name); the Rust `codetracer_ctfs` writers (`writer.rs`,
+> `concurrent_writer.rs`: one root block, allocation from block 1, so they
+> MUST NOT be given a count past block 0); the Go reader in
+> `codetracer-wasm-recorder` (refuses).  Still block 0 only and ON an MCR
+> recording's path, though dormant: `db-backend`'s `block_overlay.rs`, which
+> the materialization cache opens over the session's `.ct` to persist into it
+> (reached only once a replay worker answers `MaterializeInterval`, which
+> `ct-native-replay` refuses today); on a recording past 170 entries it would
+> report the directory full.  Filed as
+> `codetracer-specs/issues/2026-09-29-db-backend-block-overlay-reads-root-directory-from-block-0-only.md`.  The other readers surveyed
+> on 2026-09-29 -- the Rust `CtfsReader` / `concurrent_reader.rs`,
+> `db-backend`'s `ctfs_container.rs`, `backend-manager`'s `meta_dat.rs`,
+> `codetracer-native-backend`'s `mcr_ctfs_read_file_from_data`,
+> `cas_dedup/ctfs.py` -- index the entry array from the start of the file by
+> the header's count, so they read an overflowed directory unchanged.  That is
+> established by reading their code, not by a test of each.
 
 ### Version History
 
