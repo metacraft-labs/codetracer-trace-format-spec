@@ -183,6 +183,30 @@ Requirements:
   error, and a shorter one fails — which of the two a caller sees
   depends on how long the path happens to be.
 
+#### `paths.dat` path versions (line-count-table traces)
+
+A trace that declares bit 14 MAY register the same path more than once, as
+successive **versions** of the file — what a recorder does when the program's
+source changes under it and it keeps running. Each version is its own
+`paths.dat` record, with its own path id, its own `line_count` and its own
+slot in the position space; the path bytes of all versions are identical, and
+only the id tells them apart. A step addresses the version whose id it was
+written against.
+
+* **Versions require bit 14.** Without the line-count table a second record
+  would carry no size, and both versions would be laid out at the conventional
+  stride where no step could be bounded against its own version's lines.
+  Writers MUST refuse a version on a trace without bit 14, and on a
+  column-aware trace (bit 4), whose files are sized in columns.
+* **Readers MUST NOT deduplicate `paths.dat` by path bytes.** Two records with
+  equal bytes are two ids; merging them would move every step of the later
+  version into the earlier one's range.
+* **A writer resolves a bare path to its newest version.** After a version is
+  registered, a step (or registration) that names the path by string alone is
+  attributed to the newest version's id, so a recorder's hot path need not
+  track versions. Which version was live when is recorded in the execution
+  stream by `SourceReload` markers, not inferred from ids.
+
 #### `paths.dat` line-count table (line-only traces)
 
 When `meta.dat` bit 14 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
@@ -743,6 +767,43 @@ Header (8 bytes):
 
     No bit is reserved: version 4 assigns all sixteen. A further flag needs a
     meta.dat version bump, not a spare bit.
+  flags_ext: u32 LE -- VERSION 5 ONLY; see "Extended flags (`flags_ext`,
+    version 5)" below. Absent at version 4, where the body follows `flags`.
+
+### Extended flags (`flags_ext`, version 5)
+
+Version 5 is version 4 with one field inserted: a `flags_ext: u32 LE` word at
+bytes 8..12, immediately after the u16 `flags`. Everything else — the u16
+`flags` at offset 6 and the body, which starts at byte 12 instead of 8 — is
+unchanged.
+
+```
+  flags_ext bit 0     -- FLAG_EXT_HAS_SOURCE_RELOAD: steps.dat may contain
+                         SourceReload records (tag 0x08); see trace-events.md
+                         §"Source Reload Marker (Tag 0x08)"
+  flags_ext bits 1-31 -- reserved
+```
+
+Requirements:
+
+* **The version follows the word.** A writer MUST write version 5 exactly when
+  at least one extended flag is set, and version 4 otherwise. A recording that
+  uses no extended feature is therefore byte-identical to one written before
+  the word existed, and a reader that predates the word refuses only the
+  containers that actually need it — by name, at metadata-parse time, rather
+  than by misreading their streams.
+* **A version 5 header with `flags_ext == 0` MUST be refused.** It is the
+  shape a writer produces when it bumps the version unconditionally, and
+  accepting it would make "no extended feature" and "extended machinery that
+  recorded nothing" indistinguishable.
+* **Unknown extended bits MUST be refused.** Unlike the u16 capability and
+  stream-presence bits, every allocated extended bit changes what a stream may
+  contain (bit 0 admits a step-stream tag), so a reader that ignored one it
+  does not know would misdecode the stream. A reader refuses a container
+  whose `flags_ext` carries a bit it does not implement, naming the bits.
+* **A version 5 header shorter than 12 bytes MUST be refused.**
+* **Bit 0 is set exactly when `steps.dat` contains at least one
+  `SourceReload` record.**
 
 ### Two classes of flag bit
 
@@ -867,12 +928,11 @@ missing or malformed value. Rationale and migration roadmap:
   `markers.dat` table listed above as v3.1 / v3.2 were allocated after
   this bump, under version 4.)
 - **v5** (GDH-M2, 2026-09-10) -- a `flags_ext: u32 LE` word follows the
-  u16 `flags`. A writer emits version 5 only when an extended flag is
-  set, so a recording without one is still a byte-identical v4 one; the
-  version is what says the word is present. Its one allocated bit (bit
-  0, source reload) is defined by the GDScript hot-reload design
-  (`codetracer-specs/Planned-Features/GDScript-Hot-Reload-Multi-Version-Sources.md`)
-  and is not yet specified in this document.
+  u16 `flags`, written only when an extended flag is set; see § "Extended
+  flags (`flags_ext`, version 5)". Bit 0 admits the `SourceReload`
+  execution-stream record (`trace-events.md` § "Source Reload Marker (Tag
+  0x08)"), which marks a switch to the path versions of § "`paths.dat`
+  path versions".
 
 ### Extended Fields (flags bitmask)
 

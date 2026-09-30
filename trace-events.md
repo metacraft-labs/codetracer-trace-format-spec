@@ -41,6 +41,20 @@ This is what the debugger steps through. Each record is compact and fixed-size w
 | 5 | ThreadStart | thread_id: varint | 2 bytes (legacy — present in the current canonical Nim writer; the spec intent is to infer this from the first ThreadSwitch to a new thread_id) |
 | 6 | ThreadExit | thread_id: varint | 2 bytes (legacy — present in the current canonical Nim writer; the spec intent is to infer this from the last step in a thread) |
 | 7 | DeltaColumn | delta: signed varint | 2 bytes (column-aware traces only) |
+| 8 | SourceReload | reload_ordinal, changed_count, changed[], in_flight_frames (varints) | varies (only in containers declaring `FLAG_EXT_HAS_SOURCE_RELOAD`; see §"Source Reload Marker (Tag 0x08)") |
+
+**Every record in `steps.dat` is one exec record, and exec records are what
+the other streams index.** Record N of `steps.dat` — whatever its tag — owns
+record N of `values.dat` (empty when the record carries no values), and the
+`first_step_id` / `last_step_id` of `calls.dat` and the `step_id` of
+`events.dat` are exec-record indices in the same numbering. A writer MUST
+advance that index for every record it writes to `steps.dat`, including the
+records that carry no position (tags 2–6 and 8) and `DeltaColumn`; a writer
+that counted only position-bearing records would attribute every call
+boundary, value and I/O event after the first such record to the wrong exec
+record, with nothing in the container to reveal the drift. A *logical* step
+count, where a tool needs one, is a derived quantity and excludes the records
+that are not steps (`DeltaColumn`, `SourceReload`).
 
 Step records do not carry `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` — each call record stores `[first_step_id, last_step_id]` ranges. This is O(log log C), typically 2-3 iterations, and avoids doubling the step record size.
 
@@ -111,6 +125,12 @@ Each record represents a complete function call with entry/exit information.
 | raised_exception | streaming CBOR, zero-length when the call returned normally |
 | children_count | varint |
 | children_keys | [varint] × children_count |
+
+**A call that returns no value carries the VoidReturn marker** — the single
+byte `0xFF` — as its `return_value`, with `return_value_len` 1; a returned
+value is its streaming CBOR. A writer whose API spells "no value" as a none
+value (the Rust `TraceWriter`'s `ValueRecord::None`) writes the marker for it,
+so the same call reads back the same way from either writer.
 
 **`call_key` is not stored in the record.** It is the record's position in
 `calls.dat`, which is what makes the stream addressable by it.
@@ -232,6 +252,59 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 | 5 | `ThreadStart` | `thread_id: varint` | Legacy — current canonical Nim writer emits this; spec intent is to infer from first ThreadSwitch |
 | 6 | `ThreadExit` | `thread_id: varint` | Legacy — current canonical Nim writer emits this; spec intent is to infer from last step |
 | 7 | `DeltaColumn` | `delta: signed varint` | Column-only step within the current line; emitted only when the trace's `meta.dat` `FLAG_HAS_COLUMN_AWARE_STEPS` bit is set (see §"Source Location Addressing") |
+| 8 | `SourceReload` | `reload_ordinal: varint`, `changed_count: varint`, `changed_count` × (`old_path_id`, `new_path_id`, `generation`: varint), `in_flight_frames: varint` | Source files were reloaded under new path ids; allowed only when `meta.dat` declares `FLAG_EXT_HAS_SOURCE_RELOAD` (see §"Source Reload Marker (Tag 0x08)") |
+
+#### Source Reload Marker (Tag 0x08)
+
+A `SourceReload` record marks the point in the execution stream at which one
+or more source files the program was executing changed and were re-registered
+as new versions (see `internal-files.md` §"`paths.dat` path versions"). It is a
+timeline annotation, not a position:
+
+```
+[Tag: 0x08]
+  reload_ordinal:   varint   1 for the trace's first marker, then +1 per marker
+  changed_count:    varint   >= 1
+  changed[]:        changed_count × {
+                      old_path_id: varint   the version steps resolved to before
+                      new_path_id: varint   the version they resolve to after
+                      generation:  varint   the observer's generation, >= 2
+                    }
+  in_flight_frames: varint   frames still running the old version
+```
+
+Requirements:
+
+* **Declared, or refused.** A writer that emits one or more `SourceReload`
+  records MUST set `FLAG_EXT_HAS_SOURCE_RELOAD` (`internal-files.md`
+  §"Extended flags (`flags_ext`, version 5)"), and a writer that emits none
+  MUST NOT. A reader MUST refuse tag 0x08, by name, in a container that does
+  not declare the flag. Skipping is not an option: the record's length is not
+  recoverable without decoding it, so a skip re-reads its payload as further
+  records and yields a shorter, plausible stream instead of an error.
+* **`reload_ordinal`** is 1 for the first marker of a trace and increases by
+  exactly one per marker, so two markers are never indistinguishable.
+* **`changed_count` MUST be at least 1**; a marker that records a reload
+  without recording what changed cannot be told apart from one whose files
+  were lost.
+* **Each change names two distinct path ids that were both registered before
+  the marker** (they index `paths.dat`). Equal ids would mean the reload minted
+  no new version, so the steps after it would be attributed to the version
+  before it.
+* **`generation` MUST be at least 2.** Generation 1 is the content the process
+  started with, so a reload is generation 2 or later. It is the observer's
+  number, one higher than the 0-based version ordinal of the path in the
+  container; the marker records it rather than leaving the mapping implied.
+* **`in_flight_frames`** is how many frames were still executing the old
+  version when the marker was written. Steps of those frames legitimately
+  follow the marker and resolve to `old_path_id`; the marker is not a clean
+  cut, and a consumer MUST NOT treat every later step of that file as the new
+  version.
+* **It occupies an exec record and nothing else.** Like the thread records it
+  owns an (empty) value record and advances the exec-record index. It carries
+  no `global_position_index`, does not change the running position a following
+  `DeltaStep` or `DeltaColumn` is relative to, and is not a step: a reader
+  MUST NOT resolve it to a source location or count it as a logical step.
 
 ### Value Stream Events (`values.dat`)
 
