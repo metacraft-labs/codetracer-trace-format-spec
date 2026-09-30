@@ -166,6 +166,23 @@ Pre-column traces have no `line_count` field; the record ends at
 the extra fields only when the flag is set. `paths.off` continues to
 point at record starts regardless of layout.
 
+Requirements:
+
+* **Bit 4 describes every record, so it is chosen before the first one.**
+  A writer that has already written a bare record cannot then declare
+  bit 4: nothing re-frames the earlier record, and the container would
+  state a layout its own first record is not in. A writer MUST refuse
+  that — at the opt-in, or at close if the opt-in has no way to fail —
+  rather than finalize the container.
+* **Readers MUST decode a Layout A record whole.** The record's length
+  is known from `paths.off`, so `path_len`, the path, `line_count` and
+  exactly `line_count` line lengths MUST consume it with nothing left
+  over. Reading only the `path_len` prefix accepts records in the other
+  layouts too: a bare absolute path begins with `/` (47), so a bare
+  record longer than 48 bytes "decodes" into the wrong path with no
+  error, and a shorter one fails — which of the two a caller sees
+  depends on how long the path happens to be.
+
 #### `paths.dat` line-count table (line-only traces)
 
 When `meta.dat` bit 14 (`FLAG_HAS_LINE_COUNT_TABLE`) is set, each
@@ -692,7 +709,7 @@ A single binary metadata file using split-binary encoding.
 ```
 Header (8 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (currently 4)
+  version: u16 LE (4; see "Version History" for 5)
   flags: u16 LE
     The flag word holds two DIFFERENT classes of bit (see "Two classes of
     flag bit" below). Section-presence bits gate the parse of a
@@ -813,7 +830,7 @@ missing or malformed value. Rationale and migration roadmap:
   fields out-of-band during the v1 window.
 - **v2** -- appended `hookProfile` + `hookStrategies` to the end of
   the MCR extended-fields block.
-- **v3** (current, M-REC-1, 2026-05-18) -- prepended a required
+- **v3** (M-REC-1, 2026-05-18) -- prepended a required
   `recording_id` UUIDv7 string before the existing `program` field.
   Pre-1.0 there is no backcompat shim: v2 fixtures must be
   regenerated. Spec:
@@ -840,6 +857,22 @@ missing or malformed value. Rationale and migration roadmap:
   for the same reason it would be for `spans.dat`. A further flag now
   needs a version bump rather than a spare bit. Contract:
   `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
+- **v4** (current, 2026-09-08) -- the line-only `global_position_index`
+  encode became `prefix_sums[k] + (line - 1)`; see § "Global Line
+  Index". No header field changed. The version moved because it is the
+  only thing in a container that tells the two encodes apart: both land
+  inside the trace's own address space, so a v3 container read under the
+  v4 decode reports every step one line high without failing. Readers
+  refuse v3 and below rather than read them. (Bits 14 and 15 and the
+  `markers.dat` table listed above as v3.1 / v3.2 were allocated after
+  this bump, under version 4.)
+- **v5** (GDH-M2, 2026-09-10) -- a `flags_ext: u32 LE` word follows the
+  u16 `flags`. A writer emits version 5 only when an extended flag is
+  set, so a recording without one is still a byte-identical v4 one; the
+  version is what says the word is present. Its one allocated bit (bit
+  0, source reload) is defined by the GDScript hot-reload design
+  (`codetracer-specs/Planned-Features/GDScript-Hot-Reload-Multi-Version-Sources.md`)
+  and is not yet specified in this document.
 
 ### Extended Fields (flags bitmask)
 
