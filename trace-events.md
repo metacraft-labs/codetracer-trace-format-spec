@@ -1245,6 +1245,21 @@ predict it, because whether the extra step appears depends on whether a value
 happened to be staged at that moment. It is the same class of defect as folding a
 column into a line-only address: a plausible position that is not a real one.
 
+### Which exec records are steps
+
+Only a step record (`AbsoluteStep`, `DeltaStep`) opens a step. The other exec records -- a thread
+switch, start or exit, a raise or a catch, a source reload -- close the open step like a call or a
+return does, and each owns a value record that stays **empty**: values staged after one of them
+attach to the next step, like values staged after a call. A value written into such a record sits
+at an exec index `variables_at` never answers for, which is the `DeltaColumn` failure above.
+
+### One `StepValues` event per record, first
+
+A step's value record holds at most one `StepValues` event (tag 0), carrying every value of the
+step in the order the values were registered, and it is the record's first event; the step's other
+value-stream events follow it in the order they were registered. Values carried forward to a step,
+or amended into it at the terminus below, join that one event rather than opening a second.
+
 ### Where the recording ends with values still staged
 
 Carry-forward needs a terminus. When a recording ends with values staged and no
@@ -1253,9 +1268,14 @@ them finalizes a container that is short in exactly the way described above, wit
 the same absence of any signal.
 
 **They attach to the last step the writer emitted, and the writer MUST NOT add a
-step to carry them.** The last step is the step that was current when they were
-staged, so it is where they are visible; and adding one would break the count
-guarantee this specification states elsewhere without qualification — a recording
+step to carry them.** The last *step*, not the last exec record: when thread or
+other non-step records follow the last step, the values still go to the step's
+record, and the non-step records stay empty. A streaming writer therefore keeps
+the last step's value record amendable, together with the value records after it,
+until a later step makes it final or the recording ends. The last step is the step
+that was current when they were staged, so it is where they are visible; and
+adding one would break the count guarantee this specification states elsewhere
+without qualification — a recording
 has **exactly N + 1 steps** for a recorder that emitted N (§"The entry step is
 part of `start`, not the recorder's first `register_step`"). A terminus that adds
 a step makes the total depend on whether a value happened to be staged when the

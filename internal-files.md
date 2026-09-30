@@ -58,6 +58,19 @@ writer must not substitute the position space merely because the trace is column
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
 
+**When an entry is interned.** A writer interns an entry at the first of: the recorder registering
+it (a path, a variable name, a function, a type), or a record that refers to it. Ids are assigned
+from 0 in that order, and an entry is interned once: registering an entry that is already in the
+table returns the id it has and writes nothing. A registered entry is interned even if no record
+ever refers to it. The two writers used to differ here -- one deferred a registered path or variable
+name until a step or a value first used it -- and the same registrations then produced different
+ids, and so a different `paths.dat`, `funcs.dat` (whose `global_line_index` is derived from the path
+id), `varnames.dat`, and a different address in every step record. A writer whose API takes ids
+from the recorder instead of names (a low-level event stream, where a `Path` event *is* the
+registration and its id is its position among the `Path` events) relies on the recorder never
+registering an entry twice; the tables are deduplicated, so a repeated registration there is a
+recorder error, not a second entry.
+
 #### `markers.dat` — correlation-marker labels
 
 The boundary label of a correlation marker (`corrmark.ns`, and the
@@ -276,7 +289,8 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 | `steps.idx` | Companion index | Chunk index for `steps.dat` |
 | `values.dat` | Chunked compressed | Value stream: one record per step with visible variable values |
 | `values.idx` | Companion index | Chunk index for `values.dat` |
-| `calls.dat` | Var-size record | Call stream (complete call records with args/return) |
+| `calls.dat` | Chunked compressed | Call stream (complete call records with args/return) |
+| `calls.idx` | Companion index | Chunk index for `calls.dat` |
 | `events.dat` | Chunked compressed | IO event stream (stdout, stderr, file ops, errors) |
 | `events.idx` | Companion index | Chunk index for `events.dat` |
 | `paths.dat` | Var-size record | Interned source paths |
@@ -287,6 +301,7 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 | `types.off` | Offset index | Type offset index |
 | `varnames.dat` | Var-size record | Interned variable names |
 | `varnames.off` | Offset index | Variable name offset index |
+| `step-map.ns` | Step-map blob | `(path_id, line)` to step ids; line-only traces (see below) |
 | `linehits.tc` | Namespace (Type A) | Source line to step ID mapping |
 | `memwrites.tc` | Namespace (Type A) | Variable/place to change history |
 
@@ -296,7 +311,7 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 |--------|-----------|-------------|----------------|
 | Execution | `steps.dat` | Chunked compressed | Sequential scan, point lookup |
 | Values | `values.dat` | Chunked compressed | Point lookup by step index |
-| Calls | `calls.dat` | Var-size record | Random access by call_key |
+| Calls | `calls.dat` | Chunked compressed | Random access by call_key |
 | IO Events | `events.dat` | Chunked compressed | Paginated scan |
 
 `steps.dat` records are tiny (2-4 bytes each), so chunks hold thousands of steps. The values stream is parallel-indexed with the execution stream -- record N in `values.dat` corresponds to step N in `steps.dat`.
@@ -304,6 +319,65 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 `calls.dat` is indexed by `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` -- each call record stores `[first_step_id, last_step_id]` ranges.
 
 Event type wire formats are specified in [trace-events.md](trace-events.md).
+
+### Chunking and compression of the runtime streams
+
+These are normative: two writers that differ here write containers of different size and
+seek granularity for the same recording.
+
+| Stream | Records per chunk (`chunk_size`) |
+|--------|----------------------------------|
+| `steps.dat` | 4096 |
+| `values.dat` | 256 |
+| `calls.dat` | 256 |
+| `events.dat` | 64 |
+
+Every chunk is exactly one Zstandard frame, compressed at level 3 in one shot, so that the frame
+declares its content size (`Frame_Content_Size` present); it carries no checksum and uses no
+dictionary. Readers size the decompression buffer from the declared content size. Every chunk but
+the last holds exactly `chunk_size` records. The smaller value and call chunks keep a point lookup
+-- the dominant read -- to decompressing at most 256 records.
+
+The interning tables, `meta.dat` and `step-map.ns` are stored uncompressed.
+
+### `step-map.ns`
+
+The `(path_id, line)` to step-id index a reader answers a line breakpoint, a "run to line" or a
+line-hit query from without scanning `steps.dat`. **A line-only trace (no `meta.dat` bit 4) MUST
+carry it; a column-aware trace MUST NOT** -- its step addresses are byte-offset positions, and a
+map keyed by the registered line would disagree with them. A reader that finds no `step-map.ns`
+falls back to scanning the execution stream.
+
+It is a single uncompressed blob (despite the `.ns` suffix it is not a CTFS namespace), all
+integers little-endian:
+
+```
+Header (18 bytes):
+  magic: u32 = 0x53544D50 ("STMP")
+  version: u16 = 1
+  path_count: u32            -- paths with at least one step
+  path_table_offset: u64     -- = 18
+Path table, path_count x 20 bytes, ascending path_id:
+  path_id: u64
+  line_count: u32            -- distinct lines of this path with steps
+  lines_offset: u64          -- byte offset of this path's line entries
+Line entries: every path's block, in path-table order; within a block,
+ascending line; 32 bytes each:
+  line: u32
+  step_count: u32
+  first_step_id: i64         -- = the list's first element
+  last_step_id: i64          -- = the list's last element
+  steps_offset: u64          -- byte offset of this line's step-id list
+Step-id lists, in line-entry order:
+  step_count x step_id: i64, ascending
+```
+
+A step id is the step's **exec-record index**: its index in `steps.dat`, and so the index of its
+value record in `values.dat`. Thread, raise/catch and source-reload records count, so the ids of a
+trace with thread switches are not consecutive. `path_id` and `line` are the coordinates the step
+was registered at (the `paths.dat` id and the line as registered, truncated to 32 bits), not its
+global line index. A trace with no steps carries the 18-byte header with `path_count = 0`, so the
+file's presence says the index was built.
 
 ---
 
@@ -870,6 +944,11 @@ Fields (varint-prefixed):
   path_count: varint
     paths[0..path_count-1]: varint length + UTF-8 bytes each
 ```
+
+`paths` is `paths.dat`'s path strings in id order -- `path_count` equals the number of `paths.dat`
+records -- however the paths were interned. A writer that assembled it from only one of its
+registration routes wrote an empty list for a recorder that interned its paths through a low-level
+`Path` event.
 
 Varints are unsigned LEB128 (max 10 bytes). Strings are UTF-8 without
 a NUL terminator.
