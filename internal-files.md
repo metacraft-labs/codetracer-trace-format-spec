@@ -245,7 +245,9 @@ Requirements:
   with the next file and the two become indistinguishable at decode.
   Readers MUST reject such a record rather than substitute a default.
 * **Writers MUST refuse a step whose line exceeds the file's recorded
-  `line_count`.** Such a step's address falls inside the *next* file's
+  `line_count`**, and the refusal fails the recording's close
+  (`trace-events.md` §"Recorder Integration — A Failed Call Fails the
+  Recording"). Such a step's address falls inside the *next* file's
   range, so it is a well-formed address of a location that was never
   recorded, and no reader can detect it — see `trace-events.md`
   §"Per-File Contiguous Integer Ranges".

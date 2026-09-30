@@ -1106,6 +1106,28 @@ The companion index `steps.idx` starts with the records-per-chunk count (u32 LE)
 
 Default Zstd compression level: 3.
 
+## Recorder Integration — A Failed Call Fails the Recording
+
+A writer API has calls that return nothing — a step, a variable, a thread
+switch — and calls whose failure value callers routinely ignore, such as an
+interned id. When such a call fails, whether by refusing its input (a step past
+its file's recorded line count, a path with no recorded size under the
+line-count table) or by an internal error, the event it carried is not in the
+container.
+
+* **Writers MUST NOT let that pass as success.** The failure is remembered, and
+  finishing the recording — `trace_writer_close` in the C ABI,
+  `finish_writing_trace_events` in the Rust `TraceWriter` — finalizes the
+  container, so what was recorded can be inspected, and then FAILS, naming the
+  first such failure.
+* **No internal error may cross an API boundary as success.** An exception
+  inside an entry point is caught there and reported as that entry point's
+  ordinary failure.
+* **One refusal is a notice, not a failure:** a return with no matching call.
+  A recorder that attaches mid-execution sees returns from frames it never saw
+  enter; there is no call record for them to close and nothing in the
+  container depends on them. It is reported and the recording is not failed.
+
 ## Recorder Integration — Starting a Recording
 
 `start(path, line)` is the first writer call a recorder makes after its paths are
