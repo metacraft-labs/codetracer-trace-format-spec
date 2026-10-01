@@ -6,7 +6,7 @@ CTFS (CodeTracer File System) is a block-based container format that stores mult
 
 | # | Property | Description |
 |---|----------|-------------|
-| 1 | Compressed storage | Per-stream Zstd via chunked compressed tables. Transparent to the container layer. |
+| 1 | Compressed storage | Per-member Zstd via chunked compressed tables, transparent to the container layer; and, from v6, an optional whole-file scheme declared in the header (§1a, §1b) because a scheme that covers `meta.dat` cannot be declared inside it. |
 | 2 | Random-access seeking | O(log n) block mapping (at most 5 reads); O(1) chunk seek via companion index. |
 | 3 | Low-contention concurrent writes | Single atomic `NextFreeBlock` counter; per-file single writer; no locks. |
 | 4 | Multiple concurrent readers | Readers see consistent file sizes updated atomically by writers. |
@@ -23,21 +23,24 @@ No directories (flat namespace only), no file deletion or truncation, no file at
 
 ---
 
-## 1. Container Header (16 bytes)
+## 1. Container Header (16 bytes through v5; 24 bytes at v6)
 
-Block 0 begins with a 16-byte header.
+Block 0 begins with the container header. Through version 5 it is 16 bytes. Version 6 extends it to 24 and is the only version that carries the `Profile` and `Compression` fields.
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0--4 | 5 | Magic | `C0 DE 72 AC E2` ("CODE TRACE") |
-| 5 | 1 | Version | `5` |
+| 5 | 1 | Version | `5`, or `6` for a container carrying the fields below |
 | 6 | 1 | Encryption | `0` = none, `1` = AES-256-GCM |
 | 7 | 1 | MaxShards | Maximum shard count (`0` = no sharding) |
 | 8--11 | 4 | BlockSize | Block size in bytes (u32 LE, default 4096) |
 | 12--15 | 4 | MaxRootEntries | Maximum file entries (u32 LE, `0` = auto-fill block 0) |
+| 16 | 1 | Profile | **v6 only.** `0` = full, `1` = compact. Closed set |
+| 17 | 1 | Compression | **v6 only.** Whole-file scheme: `0` = none, `1` = zstd. Closed set |
+| 18--23 | 6 | Reserved | **v6 only.** MUST be zero; a non-zero byte is a refusal |
 
 ```c
-struct ContainerHeader {
+struct ContainerHeader {        // versions 2 .. 5
     uint8_t  magic[5];          // C0 DE 72 AC E2
     uint8_t  version;           // 5
     uint8_t  encryption;        // 0=none, 1=AES-256-GCM
@@ -45,7 +48,23 @@ struct ContainerHeader {
     uint32_t block_size;        // default 4096
     uint32_t max_root_entries;  // 0 = auto-fill block 0
 };
+
+struct ContainerHeaderV6 {      // version 6
+    uint8_t  magic[5];          // C0 DE 72 AC E2
+    uint8_t  version;           // 6
+    uint8_t  encryption;        // 0=none, 1=AES-256-GCM
+    uint8_t  max_shards;        // 0 = no sharding
+    uint32_t block_size;        // default 4096
+    uint32_t max_root_entries;  // 0 = auto-fill block 0
+    uint8_t  profile;           // 0=full, 1=compact
+    uint8_t  compression;       // 0=none, 1=zstd (WHOLE-FILE)
+    uint8_t  reserved[6];       // MUST be zero
+};
 ```
+
+**Why the header grew by 8 bytes rather than 2.** `Profile` and `Compression` are one byte each, so 18 would carry them. The six reserved bytes buy one property, stated exactly because the general claim would be false: in an UNSHARDED container -- `max_shards = 0`, so the free list root area is empty and `R = 0` -- the `FileEntry` array starts at the header's own size, and its three `u64` fields with their 24-byte stride are 8-byte aligned at 24 and misaligned at 18. Unsharded is the default and it is the only thing the compact profile permits (§1a), so that is the case worth aligning. It is NOT a claim about sharded containers: there `R = 7 * max_shards * 6 = 42 * max_shards` already decides the alignment and already breaks it at odd shard counts, exactly as it does in the 16-byte header, and this version does not change that.
+
+The reserved bytes are not a growth area. A reader MUST refuse a non-zero value in them, because "ignored" and "unknown" are the same byte, and §1c says what ignoring an unknown byte has already cost this format. The only way to spend them is another version bump, which is the intended cost.
 
 **A container that is not sharded writes `max_shards = 0`, and `1` is not a synonym for it.** The
 parenthetical above says `0 = no sharding`, but it left "one shard" and "no sharding" describing the
@@ -55,7 +74,7 @@ that admits two spellings of one state is not a specification of that state, so:
 not shard MUST write `0`. `1` means a sharded container whose maximum is one shard, which is a
 different claim even where it is not yet a different layout.
 
-**Compression is not in the header.** Different internal files may use different compression settings.
+**PER-MEMBER compression is not in the header.** Different internal files may use different compression settings, and which one a member uses is fixed by its format and so by its name -- see the correction below, which is the whole of what this paragraph is about. Nothing in it was ever about compressing the container as a whole, and from version 6 that case IS in the header: §1a, §1b.
 
 > **Corrected 2026-09-25 (`MCR-Memory-Page-CAS.milestones.org` CAS-Z0).**  This
 > paragraph used to end "the compression mode is specified per-stream in
@@ -74,12 +93,16 @@ different claim even where it is not yet a different layout.
 
 **Encryption IS in the header** because an encrypted container is opaque -- even `meta.dat` is unreadable without the key.
 
+**WHOLE-FILE compression IS in the header, for exactly the reason encryption is.** A scheme applied to the container as a whole covers `meta.dat` and the entry array along with everything else, so a reader told to find the mode anywhere inside the container would have to decompress it in order to learn how to decompress it. That is the same circularity the encryption sentence above resolves, resolved the same way: the declaration sits in the one region the scheme does not cover. The two statements above are therefore not in tension with this one -- the first governs per-member compression, which is settled by a member's format inside the covered region and can be; the `Compression` field governs the whole-file scheme, which lives outside it and must.
+
+**And this is the field the removed buffered mode did not have.** The correction above records that the MCR recorder once compressed the container as a whole and that the mode has been removed. Nothing in the header said it had done so, which is why nothing could refuse such a container by name. Version 6 does not reinstate that mode; it makes the declaration a precondition of ever having one again.
+
 ### Block 0 Layout
 
-Block 0 contains the header, free list roots, and file entries:
+Block 0 contains the header, free list roots, and file entries. The offsets below are the versions 2--5 layout; for version 6 substitute the 24-byte header and the `24 + R` offsets given in §1a. The compact profile has no block 0 at all.
 
 ```
-Block 0:
+Block 0 (versions 2 .. 5):
   [0..15]                       ContainerHeader (16 bytes)
   [16..16+R-1]                  Free list roots (R bytes, fixed area)
   [16+R .. BlockSize-1]         FileEntry array (remaining space)
@@ -145,11 +168,70 @@ Data block allocation begins at block number `root_blocks`.
 > the header's count, so they read an overflowed directory unchanged.  That is
 > established by reading their code, not by a test of each.
 
+### 1a. Profile and Whole-File Compression (version 6)
+
+Version 6 is version 5's body plus eight header bytes. Everything §2 says about `MapBlock`'s three forms, and everything §4 says about the block map, holds in a version-6 full-profile container unchanged.
+
+`Profile` says which body layout follows the header:
+
+| Value | Name | Body |
+|-------|------|------|
+| `0` | full | Block 0, free list roots, `FileEntry` array, block map -- everything from *Block 0 Layout* above and §2 onward |
+| `1` | compact | A directory of `(name, offset, length)` and the members concatenated raw, with no block map and no mapping blocks. Specified by the compact-profile milestones; a reader that does not implement it MUST refuse it rather than attempt the full body |
+
+The set is CLOSED: `0` and `1` are the only defined values and every other value is a refusal.
+
+A compact container MUST write `max_shards = 0`. Block sharding (§9) partitions a block-number space, and the compact profile has no blocks, so "one shard" and "no sharding" would again be two spellings of one state -- the defect the `max_shards` note above was written for.
+
+In a version-6 **full** container the free list root area and the `FileEntry` array start 8 bytes later, because the header is 8 bytes longer. Every other offset in this document is relative to those and so is unchanged:
+
+```
+Block 0 (version 6, profile = full):
+  [0..23]                       ContainerHeaderV6 (24 bytes)
+  [24..24+R-1]                  Free list roots (R bytes, fixed area)
+  [24+R .. BlockSize-1]         FileEntry array (remaining space)
+
+auto_entries = (BlockSize - 24 - R) / 24
+root_blocks  = ceil((24 + R + MaxRootEntries * 24) / BlockSize)
+```
+
+`Compression` says whether the container body is stored under a whole-file scheme. The field covers **the container image from offset 24 to the end of the stored object**; the 24-byte header is always stored as plaintext, since it is what declares the scheme. A reader reconstructs the image as `header || decompress(rest)` and then every offset in this document holds unchanged, including block numbering -- block 0 is still the first `BlockSize` bytes of the reconstructed image and its first 24 bytes are still the header.
+
+Whole-file compression and per-member compression are independent, over disjoint regions. A writer that sets a whole-file scheme would normally leave its members uncompressed; nothing here forbids both and nothing here recommends it. Where `Encryption` and `Compression` are both set, the body is compressed first and encrypted second, and a reader reverses that order -- compressing ciphertext accomplishes nothing, and an unstated order is a field pair with two spellings of one state.
+
+A container at version 5 or below is a **full**-profile container with **no** whole-file compression. That is an inference from a KNOWN version with a fully specified body, not a default applied to an unrecognised value: versions 2 through 5 are each specified above and in the version history, and none of them admits a body a whole-file scheme could cover. The distinction matters because the opposite reading -- "a value I do not recognise means none" -- is the precise defect §1b and §1c close.
+
+### 1b. The Closed Set Of Whole-File Compression Schemes
+
+| Value | Name | Browser decompresses it transparently from `Content-Encoding`? | Offered by `DecompressionStream`? | Decoder already in the db-backend? |
+|-------|------|---|---|---|
+| `0` | `none` | n/a -- nothing to decompress | n/a | n/a |
+| `1` | `zstd` | Yes: Chrome/Edge 123+, Firefox 126+, Safari 26+ (macOS/iOS). Not universal historically | Yes, as `"zstd"` -- defined by the Compression Streams specification, but NOT yet shipped everywhere `"gzip"` is | Yes: `zstd`/`zstd-safe` on native targets and the pure-Rust `ruzstd` on `wasm32-unknown-unknown` |
+
+The set is CLOSED at those two members, and it is short on purpose. A member of this set is a promise that every reader of the format implements the scheme, so the set is bounded by the decoders the implementations already carry rather than by what compresses well. `gzip`, `deflate`, `deflate-raw` and `brotli` are each decompressed transparently by every browser and each offered by `DecompressionStream` (`"brotli"` in Chromium and Safari 18.4+, not yet in Firefox), and none of them is enumerated here, because adding one would oblige both the Nim and the Rust reader to take a new compression dependency -- including in the WebAssembly build. An enumerated member with no implementation is worse than an absent one: it is a capability a consumer can read in this document and cannot rely on.
+
+The per-member compression method enum that `codetracer_ctfs` carries has a third value, `2 = LZ4`, marked "reserved, not yet implemented". That is the shape this set refuses to repeat, and it is named here so the refusal is visibly deliberate.
+
+A BlockTracer archive declares `none`. Such an archive is stored pre-compressed and served with a `Content-Encoding`, so the browser has already decompressed it before any application code runs; what the loader holds is a compact container with raw members, and `none` is a true statement about those bytes rather than a convenient one.
+
+### 1c. The Refusal Rule For The Version-6 Fields (normative)
+
+§2's "Older versions are refused" already states this rule for the version byte, and states it as a MUST that names the value found. §1c extends the same rule to the two fields version 6 adds, and amends one word of §2's: the refusal is of a version the reader does not implement, which is every version other than the ones it reads.
+
+A reader that encounters a `Version`, `Profile` or `Compression` value it does not implement, or a non-zero byte in `Reserved`, MUST fail and MUST NAME THE OFFENDING VALUE in its diagnostic. It MUST NOT fall back to another value, infer one from the container's contents, or treat an unknown scheme as `none`. A header too short to carry a field the version declares is likewise a refusal and NOT an absent field: "the byte says 0" and "there is no byte" are different facts, and a parser that returns the permissive value for both has no way to report the second.
+
+**This is normative rather than advisory because the format has already paid for the advisory version.** Containers were once written with the corrected global line index packing while the version stamp still said 3, so a reader that trusted the stamp placed every step one line high and returned success while doing it. The repair is three artefacts that exist only because of it -- a supported-version set of `[4, 5]` in `meta.dat`'s schema, a named `LastShiftedGlobalIndexVersion = 3`, and an explicit opt-in whose own documentation says it exists so that behaviour does not depend on how a recording happened to be written. Nothing in the bytes could have caught that, because both packings addressed positions the trace's own space could address. A version whose accepted set is closed can catch it; a version a reader shrugs at cannot.
+
+So the refusal is also what makes the version bump the right mechanism for introducing the profile. A reader predating version 6 holds a closed accepted set and the magic is unchanged, so it rejects a version-6 container at the version check, before it computes a single file-entry offset. It cannot ignore the bump: the version is already the field it consults to decide which header shape and which `MapBlock` forms it is holding, and a version-6 container's entry array really is 8 bytes further along, so a reader that shrugged would resolve every entry out of the reserved area. A capability flag would not have this property -- an unknown flag bit is exactly what an old reader ignores -- and a distinct magic would cost more than it buys, since it would also take the container out of the reach of every tool that identifies a `.ct` file by its first five bytes, including the ones whose whole job is to report what it is.
+
+**What a writer writes.** Version 5 for a full-profile container with no whole-file scheme, which is every container any writer produces today and leaves them byte-identical. Version 6 only for a container that uses one of the two new fields. Reader support for 6 must ship everywhere before any writer emits it, which is the same rollout rule the version-5 note records.
+
 ### Version History
 
 | Version | Description |
 |---------|-------------|
-| 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 and MUST refuse every other version, naming it (§2, "Older versions are refused"). Writers MUST write 5. |
+| 6 | 24-byte header with `Profile` and whole-file `Compression` (§1a, §1b) and six reserved bytes that MUST be zero. Version 5's body, so §2's `MapBlock` forms are unchanged. NOT backward compatible, deliberately: the `FileEntry` array moves to `24 + R`, and a reader predating this version refuses the container at the version check rather than reading entries out of the reserved area (§1c). A writer emits 6 only for a container that uses one of the new fields. |
+| 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 -- and 6, which is 5's body behind the extended header -- and MUST refuse every version they do not implement, naming it (§2, "Older versions are refused"; §1c). Writers MUST write 5 unless the container uses a version-6 field. |
 | 4 | Query protocol, network reader, replication, RAM cache, cached trace reader. Backward compatible: v4 readers accept v3 and v2 containers. |
 | 3 | 16-byte header with encryption; binary metadata; BlockSize 4096; MaxRootEntries 0 auto-fill; small file optimization; namespaces |
 | 2 | Extended header with BlockSize and MaxRootEntries |
@@ -247,14 +329,23 @@ version would meet a block number beyond its bound check and refuse it there, no
 The small-member layout applies to `FileEntry.MapBlock` only. Namespace descriptors (§8) and the
 chain and child pointers inside a mapping (§4) are unchanged.
 
-**Older versions are refused.** A reader MUST refuse a container whose version byte is not 5,
-naming the version it found and the one it reads, before it resolves any member. Pre-1.0 there is
-no compatibility path: older containers are re-recorded, and fixtures are regenerated with their
-documented producers. Every writer of containers -- the trace-format libraries, the MCR recorder's
-`ctfs_disk`, the native backend's `ctfs_meta_writer`, the db-backend's overlay and test writers --
-writes version 5. Refusing is not merely tidy: a version 4 container read under version 5's rules
-happens to decode, but a reader that accepts it keeps every writer that still produces it alive,
-with its mapping block per member.
+**Older versions are refused.** A reader MUST refuse a container whose version byte is not one it
+implements, naming the version it found and the ones it reads, before it resolves any member.
+Pre-1.0 there is no compatibility path: older containers are re-recorded, and fixtures are
+regenerated with their documented producers. Every writer of containers -- the trace-format
+libraries, the MCR recorder's `ctfs_disk`, the native backend's `ctfs_meta_writer`, the
+db-backend's overlay and test writers -- writes version 5, or 6 where it uses a version-6 field
+(§1a). Refusing is not merely tidy: a version 4 container read under version 5's rules happens to
+decode, but a reader that accepts it keeps every writer that still produces it alive, with its
+mapping block per member.
+
+This sentence read "whose version byte is not 5" until version 6 was added, and the change is the
+word and not the rule. It was written against OLDER containers, where the hazard is a reader that
+accepts one and thereby keeps an obsolete writer alive. A NEWER version is the opposite hazard --
+a reader that accepts a header shape it does not know and resolves entries out of bytes that are
+not entries -- and both are refusals, so the rule holds in both directions once it is stated as
+"not one it implements". §1c carries the newer-version half, with the incident that makes it
+normative.
 
 **Measured effect.** See `measurements/2026-10-format-efficiency.md` §"Small and empty members":
 across 1,042 recordings, the mapping blocks of members that never outgrow one block, and of empty
