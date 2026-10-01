@@ -552,6 +552,34 @@ checkpoint index members stay raw: each is well under one block, and a
 compressed pair costs two members and at least four blocks where the raw member
 costs one member and two.
 
+**A payload that fits in one block is stored raw (normative since 2026-09-30,
+`MCR-Memory-Page-CAS.milestones.org` CAS-D1).**  The same arithmetic applies to
+a snapshot payload that happens to be small.  A writer MUST store a payload of
+**at most `block_size` bytes** (the container header's block size, 4096 for every
+MCR trace) in the **raw form**, under its logical name, and MUST store a payload
+of more than `block_size` bytes in the compressed form.  The threshold is on the
+PAYLOAD length, before compression, so the decision needs no trial compression
+and two writers given the same payload choose the same form.  Why exactly that
+threshold: a compressed form occupies at least one data block and one index
+block, each with its own block-map block, and a second root entry — four blocks
+where the raw member of a one-block payload occupies two (its data block and its
+block-map block) — so no payload of one block can be made smaller by
+compressing it, and the rule is exactly "compress only what compression can
+shrink by a block".  A payload of zero bytes is covered by the rule (a raw
+member of length 0); a producer that omits an empty payload altogether (the MCR
+recorder omits an empty `cp.<kind>.mem`, `MCR-Memory-Page-CAS.md` §5.1) writes
+no member at all.  In practice the payload the rule catches is a small stage-0
+boundary's `cp.<kind>.cas` (`cp.prein.cas`, ~1.5 KB on Windows).
+
+This adds no reader obligation.  The raw form is the legacy form in the table
+above, which every reader already resolves; the form is still decided by which
+members exist, never by the bytes; and the rule is a WRITER rule only — a reader
+MUST accept either form for a payload of any length (a pre-2026-09-25 trace
+carries large payloads raw, and a writer that predates this rule carries small
+ones compressed).  Consistent with the owner decision above: there is still one
+compression layer, the container's own; this only says when it is not worth
+applying.
+
 Implementations: `codetracer-native-recorder/ct_recorder/src/ct_recorder/snapshot_payload.nim`
 (writer and reader); `tracing-formats-benchmarks/cas_dedup/ctfs.py`
 (`read_payload`, independent Python reader).
@@ -1519,3 +1547,12 @@ contract.
 The campaign that drove this section is documented in
 `codetracer-specs/Planned-Features/Column-Aware-Tracing-And-Deminification.milestones.org`
 §P6.2.
+
+## Document history
+
+This file carried no history table before 2026-09-30; earlier changes are in
+the git history of `codetracer-trace-format-spec`.
+
+| Date | Change |
+|---|---|
+| 2026-09-30 | **Snapshot payloads: a payload that fits in one block is stored raw** (`MCR-Memory-Page-CAS.milestones.org` CAS-D1).  "Snapshot payloads (MCR recorder)" gains a normative writer rule: a snapshot payload of at most `block_size` bytes (4096) is stored in the raw form under its logical name, one of more than `block_size` in the compressed form; the threshold is on the uncompressed length, so the choice needs no trial compression.  A compressed form costs at least four blocks (data and index members, each with a block-map block) and two root entries where a one-block raw member costs two blocks and one entry, so compression cannot shrink such a payload.  No reader change: the raw form is the legacy form every reader already resolves, told apart by which members exist.  Measured cause: on a Windows `fx_small` page-CAS trace the boundary-A `cp.prein.cas` (1 228 bytes compressed) occupied four blocks for a ~1.5 KB payload, the two blocks that tied a page-CAS trace with the compressed legacy trace it replaces. |
