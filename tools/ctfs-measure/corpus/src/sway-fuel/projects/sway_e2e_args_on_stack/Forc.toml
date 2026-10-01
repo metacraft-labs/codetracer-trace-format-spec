@@ -1,0 +1,7 @@
+[project]
+authors = ["Fuel Labs <contact@fuel.sh>"]
+license = "Apache-2.0"
+name = "args_on_stack"
+entry = "main.sw"
+
+[dependencies]

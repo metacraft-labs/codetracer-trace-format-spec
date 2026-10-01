@@ -294,7 +294,7 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 
 | File | Abstraction | Purpose |
 |------|-------------|---------|
-| `meta.dat` | Binary metadata | Program, paths, recorder info (see Metadata section) |
+| `meta.dat` | Binary metadata | Program, arguments, recorder identity (see Metadata section); source paths are in `paths.dat` |
 | `steps.dat` | Chunked compressed | Execution stream: one compact record per debugger step |
 | `steps.idx` | Companion index | Chunk index for `steps.dat` |
 | `values.dat` | Chunked compressed | Value stream: one record per step with visible variable values |
@@ -348,7 +348,8 @@ dictionary. Readers size the decompression buffer from the declared content size
 the last holds exactly `chunk_size` records. The smaller value and call chunks keep a point lookup
 -- the dominant read -- to decompressing at most 256 records.
 
-The interning tables, `meta.dat` and `step-map.ns` are stored uncompressed.
+The interning tables and `meta.dat` are stored uncompressed. `step-map.ns` compresses its own
+lists (§"`step-map.ns`").
 
 ### `step-map.ns`
 
@@ -358,36 +359,89 @@ carry it; a column-aware trace MUST NOT** -- its step addresses are byte-offset 
 map keyed by the registered line would disagree with them. A reader that finds no `step-map.ns`
 falls back to scanning the execution stream.
 
-It is a single uncompressed blob (despite the `.ns` suffix it is not a CTFS namespace), all
-integers little-endian:
+It is a single member (despite the `.ns` suffix it is not a CTFS namespace). Version 2, current
+since the 2026-10 revision, run-length-codes the gaps between step ids, delta-codes the keys, and
+stores the result as zstd chunks; integers outside the frames are little-endian:
 
 ```
-Header (18 bytes):
+Header (26 bytes):
   magic: u32 = 0x53544D50 ("STMP")
-  version: u16 = 1
-  path_count: u32            -- paths with at least one step
-  path_table_offset: u64     -- = 18
-Path table, path_count x 20 bytes, ascending path_id:
-  path_id: u64
-  line_count: u32            -- distinct lines of this path with steps
-  lines_offset: u64          -- byte offset of this path's line entries
-Line entries: every path's block, in path-table order; within a block,
-ascending line; 32 bytes each:
-  line: u32
-  step_count: u32
-  first_step_id: i64         -- = the list's first element
-  last_step_id: i64          -- = the list's last element
-  steps_offset: u64          -- byte offset of this line's step-id list
-Step-id lists, in line-entry order:
-  step_count x step_id: i64, ascending
+  version: u16 = 2
+  chunk_count: u32
+  path_count: u32            -- distinct path_ids with at least one step
+  line_count: u32            -- distinct (path_id, line) keys
+  step_count: u64            -- step ids in all lists together
+Chunk table, chunk_count x 20 bytes, in key order:
+  frame_offset: u64          -- offset of the chunk's frame, counted from the end of the table
+  first_path_id: u64         -- key of the chunk's first line record
+  first_line: u32
+Frames: one Zstandard frame per chunk, back to back. Frame i spans
+  [frame_offset[i], frame_offset[i+1]); the last one ends at the end of the member.
+Chunk content (a frame, decompressed): line records in ascending (path_id, line) order:
+  path_delta: varint         -- path_id minus the previous record's; 0 for a chunk's first record,
+                                whose path_id is the table's first_path_id
+  line: varint               -- the line itself when path_delta > 0 or the record is the chunk's
+                                first; otherwise the line minus the previous record's line (>= 1)
+  count: varint              -- step ids on this line (>= 1)
+  runs, until their repeats add up to count:
+    gap: varint              -- the difference between consecutive step ids (>= 1)
+    repeat: varint           -- how many consecutive step ids have that gap (>= 1)
+                                The id before a list's first is -1, so the first run's gap is the
+                                first step id plus 1. Runs are maximal: adjacent runs of a list
+                                never have the same gap.
 ```
+
+**Chunking (normative, so that two writers produce the same bytes).** Line records are appended to
+the current chunk in key order; when an append brings the chunk's decompressed size to 65,536 bytes
+or more, the chunk is closed after that record, and the next record opens a new one. A record is
+never split, so one hot line's list may make a chunk larger than the target. Every frame follows the
+rule of the runtime streams above: level 3, compressed in one shot so that it declares its content
+size, no checksum, no dictionary. A trace with no steps carries the 26-byte header with every count
+`0` and no chunk, so the file's presence still says the index was built.
+
+**Reading.** A reader that wants the whole map -- the db-backend builds `(path, line) -> ids` at
+open -- inflates the chunks in order and decodes the records. A reader that wants one line
+binary-searches the chunk table for the last chunk whose first key is not above the target,
+inflates that chunk alone and scans it. A reader MUST refuse, by name, a step map whose decoded
+counts disagree with the header, a chunk whose first record's key is not its table key, keys that
+do not ascend strictly, a `count`, `gap` or `repeat` of `0`, runs whose repeats overshoot `count`,
+or a frame that does not decode to its declared size: each is a map that would answer some
+breakpoint with the wrong steps.
+
+**Why this layout (measured; `measurements/2026-10-format-efficiency.md` §"`step-map.ns`").**
+Version 1 stored every step id as an uncompressed `i64` behind a 32-byte entry per line: 8.1 bytes
+per step over the corpus's maps of 1,000 steps or more, and 806 KB of a 938 KB container on the
+writer benchmark's 100,000 steps. The ids of one line ascend, usually by the length of a loop body,
+so their gaps are small and repeat. Over those maps:
+
+| Layout | Bytes per step | Full load in WASM, ns per step | Reading the member too |
+|---|---:|---:|---:|
+| v1 | 8.07 | 0.70 | 1.63 |
+| v1, zstd'd as it stands | 1.43-1.58 | -- | -- |
+| gap varints, no zstd | 1.03 | 1.84 | 2.40 |
+| gap varints, zstd | 0.087 | 6.98 | 7.53 |
+| **run-length gaps, zstd (version 2)** | **0.100** | **4.71** | **5.24** |
+
+Compressing version 1 as it stood ("chunked zstd like the other streams") recovers far less,
+because eight-byte integers that grow by small, irregular steps are poor zstd input. Gap varints
+alone leave the map the largest member of most containers. Gap varints under zstd are the smallest,
+but every gap then has to come out of the zstd decoder, and ruzstd -- the decoder the WASM reader
+uses -- is slow on the long repeats a loop produces: one 98,301-step map of 81 bytes took 2.1 ms to
+load. Run-length coding hands the decoder a run instead of its expansion: 14% larger than gap
+varints under zstd, a third faster to load in WASM, and 81 times smaller than version 1.
+
+The cost is decoding at open. Loading every list into memory, which is what the db-backend does,
+costs about 3.6 ns per step more than version 1 in WASM, counting the read of the member: 0.4 ms
+for a 100,000-step map, 36 ms for 10 million. That is with the member in the page cache, the case
+most favourable to the larger layout; from a disk or over the network, the 81-fold smaller member
+pays back more than its decoding. A lookup after the load is unchanged, and a reader that wants one
+line inflates one chunk of at most about 64 KiB.
 
 A step id is the step's **exec-record index**: its index in `steps.dat`, and so the index of its
 value record in `values.dat`. Thread, raise/catch and source-reload records count, so the ids of a
 trace with thread switches are not consecutive. `path_id` and `line` are the coordinates the step
 was registered at (the `paths.dat` id and the line as registered, truncated to 32 bits), not its
-global line index. A trace with no steps carries the 18-byte header with `path_count = 0`, so the
-file's presence says the index was built.
+global line index.
 
 ---
 
@@ -580,6 +634,10 @@ member of length 0); a producer that omits an empty payload altogether (the MCR
 recorder omits an empty `cp.<kind>.mem`, `MCR-Memory-Page-CAS.md` §5.1) writes
 no member at all.  In practice the payload the rule catches is a small stage-0
 boundary's `cp.<kind>.cas` (`cp.prein.cas`, ~1.5 KB on Windows).
+(The block counts above are container version 4's, where every member has a
+block-map block. Under version 5 a member of at most one block has none
+(`ctfs-container.md` §2), so the compressed form costs at least two blocks and
+the raw one-block member costs one; the threshold and its reason are unchanged.)
 
 This adds no reader obligation.  The raw form is the legacy form in the table
 above, which every reader already resolves; the form is still decided by which
@@ -845,9 +903,9 @@ A single binary metadata file using split-binary encoding.
 ### Layout
 
 ```
-Header (8 bytes):
+Header (12 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (4; see "Version History" for 5)
+  version: u16 LE (6; see "Version History")
   flags: u16 LE
     The flag word holds two DIFFERENT classes of bit (see "Two classes of
     flag bit" below). Section-presence bits gate the parse of a
@@ -879,17 +937,15 @@ Header (8 bytes):
     -- Stream-presence, continued (see the note below on why it is not adjacent):
     bit 15      -- FLAG_HAS_CORRELATION_INDEX (corrmark.ns + markers.dat/.off) WTCI
 
-    No bit is reserved: version 4 assigns all sixteen. A further flag needs a
-    meta.dat version bump, not a spare bit.
-  flags_ext: u32 LE -- VERSION 5 ONLY; see "Extended flags (`flags_ext`,
-    version 5)" below. Absent at version 4, where the body follows `flags`.
+    No bit is reserved: version 4 assigned all sixteen. A further flag goes
+    in `flags_ext`.
+  flags_ext: u32 LE -- always present at version 6; see "Extended flags
+    (`flags_ext`)" below.
 
-### Extended flags (`flags_ext`, version 5)
+### Extended flags (`flags_ext`)
 
-Version 5 is version 4 with one field inserted: a `flags_ext: u32 LE` word at
-bytes 8..12, immediately after the u16 `flags`. Everything else — the u16
-`flags` at offset 6 and the body, which starts at byte 12 instead of 8 — is
-unchanged.
+`flags_ext` is the u32 at bytes 8..12, immediately after the u16 `flags`; the
+body starts at byte 12. Version 6 always carries it, `0` included.
 
 ```
   flags_ext bit 0     -- FLAG_EXT_HAS_SOURCE_RELOAD: steps.dat may contain
@@ -900,22 +956,16 @@ unchanged.
 
 Requirements:
 
-* **The version follows the word.** A writer MUST write version 5 exactly when
-  at least one extended flag is set, and version 4 otherwise. A recording that
-  uses no extended feature is therefore byte-identical to one written before
-  the word existed, and a reader that predates the word refuses only the
-  containers that actually need it — by name, at metadata-parse time, rather
-  than by misreading their streams.
-* **A version 5 header with `flags_ext == 0` MUST be refused.** It is the
-  shape a writer produces when it bumps the version unconditionally, and
-  accepting it would make "no extended feature" and "extended machinery that
-  recorded nothing" indistinguishable.
+* **One layout.** Version 5 carried the word only when an extended flag was
+  set and version 4 never did, so a reader had two header lengths to tell
+  apart by version; version 6 always carries it and has one. A `flags_ext` of
+  `0` is the ordinary value for a recording that uses no extended feature.
 * **Unknown extended bits MUST be refused.** Unlike the u16 capability and
   stream-presence bits, every allocated extended bit changes what a stream may
   contain (bit 0 admits a step-stream tag), so a reader that ignored one it
   does not know would misdecode the stream. A reader refuses a container
   whose `flags_ext` carries a bit it does not implement, naming the bits.
-* **A version 5 header shorter than 12 bytes MUST be refused.**
+* **A header shorter than 12 bytes MUST be refused.**
 * **Bit 0 is set exactly when `steps.dat` contains at least one
   `SourceReload` record.**
 
@@ -979,14 +1029,29 @@ Fields (varint-prefixed):
     args[0..args_count-1]: varint length + UTF-8 bytes each
   workdir: varint length + UTF-8 bytes
   recorder_id: varint length + UTF-8 bytes
-  path_count: varint
-    paths[0..path_count-1]: varint length + UTF-8 bytes each
 ```
 
-`paths` is `paths.dat`'s path strings in id order -- `path_count` equals the number of `paths.dat`
-records -- however the paths were interned. A writer that assembled it from only one of its
-registration routes wrote an empty list for a recorder that interned its paths through a low-level
-`Path` event.
+The flag-gated blocks of §"Extended Fields (flags bitmask)" follow `recorder_id`.
+
+**`meta.dat` carries no path list (version 6).** A trace's source paths are the
+records of `paths.dat` (+ `paths.off`, §"Interning Tables"), in id order, and
+nothing else. Versions 3 to 5 also wrote every path into `meta.dat`, after
+`recorder_id`: a second copy of `paths.dat` that every reader parsed on open.
+On the WASM writer's benchmark recording it was 46,904 of `meta.dat`'s 47,023
+bytes and 14% of the container (`measurements/2026-10-format-efficiency.md`
+§"`meta.dat`'s path list"), and two copies of one list are two answers that
+can disagree -- the reason this section once had to say that the list "is
+`paths.dat`'s path strings in id order", after one writer assembled it from
+only one of its registration routes. Therefore:
+
+- **A writer that knows a source path MUST intern it in `paths.dat`**, however
+  the recorder supplied it -- a registration, a step, a `Path` event, or a
+  `--source` list given to a recorder that writes no steps (the MCR recorder,
+  the native backend's RR/TTD exporter). A container whose recording names no
+  source path has an empty `paths.dat` or none.
+- **A reader takes source paths from `paths.dat` only.** There is no fallback
+  to `meta.dat`, and a reader MUST NOT look for one: in a version 6 header the
+  bytes after `recorder_id` are the next flag-gated block, or nothing.
 
 Varints are unsigned LEB128 (max 10 bytes). Strings are UTF-8 without
 a NUL terminator.
@@ -1037,7 +1102,7 @@ missing or malformed value. Rationale and migration roadmap:
   for the same reason it would be for `spans.dat`. A further flag now
   needs a version bump rather than a spare bit. Contract:
   `codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`.
-- **v4** (current, 2026-09-08) -- the line-only `global_position_index`
+- **v4** (2026-09-08) -- the line-only `global_position_index`
   encode became `prefix_sums[k] + (line - 1)`; see § "Global Line
   Index". No header field changed. The version moved because it is the
   only thing in a container that tells the two encodes apart: both land
@@ -1052,11 +1117,23 @@ missing or malformed value. Rationale and migration roadmap:
   execution-stream record (`trace-events.md` § "Source Reload Marker (Tag
   0x08)"), which marks a switch to the path versions of § "`paths.dat`
   path versions".
+- **v6** (current, 2026-10-01) -- the path list after `recorder_id` is
+  gone; `paths.dat` is the only list of source paths (§ "`meta.dat` carries
+  no path list"). `flags_ext` is always present, so there is one header
+  length. Readers refuse every other version: the bytes after
+  `recorder_id` mean something different in v5 and below, and a reader
+  that guessed would read a path count as an MCR field. Pre-1.0, there is
+  no compatibility shim; fixtures are regenerated. The same revision moved
+  the container to version 5 (`ctfs-container.md` §2), compressed
+  `step-map.ns` (§ "`step-map.ns`"), made the step-encoding rule
+  normative (`trace-events.md` § "Encoding Rules"), and made an
+  `events.dat` record's kind the recorder's exact `EventLogKind`
+  (`trace-events.md` § "EventLogKind (u8 enum)").
 
 ### Extended Fields (flags bitmask)
 
-**Flag bit 0 -- MCR fields.** When set, the block below follows the
-paths list. Every field is varint-encoded (no fixed-width integers):
+**Flag bit 0 -- MCR fields.** When set, the block below follows
+`recorder_id`. Every field is varint-encoded (no fixed-width integers):
 
 ```
   tick_source: varint (TickSource enum ordinal)
@@ -1093,7 +1170,7 @@ Notes:
 
 **Flag bit 1 -- Replay-launch fields (M-RLP-1, §6A.5).** When set,
 the block below follows the MCR extended-fields block (or, if
-`FLAG_HAS_MCR_FIELDS` is clear, follows the `paths` list directly).
+`FLAG_HAS_MCR_FIELDS` is clear, follows `recorder_id` directly).
 Records replay-launch address-space hardening state captured at
 record time so the replay backend can decide between hard-pin and
 soft-pin modes:
@@ -1104,8 +1181,8 @@ soft-pin modes:
 
 **Flag bit 2 -- Layout snapshot (M-RLP-2, §6B.7).** When set, the
 block below follows the replay-launch block (or, if
-`FLAG_HAS_REPLAY_LAUNCH_FIELDS` is clear, follows the MCR / `paths`
-block per the same composition rules).  Carries a fingerprint of the
+`FLAG_HAS_REPLAY_LAUNCH_FIELDS` is clear, follows the MCR block or
+`recorder_id` per the same composition rules).  Carries a fingerprint of the
 recording process's address-space layout at `__libc_start_main`
 wrapper entry; the replay side computes the same fingerprint at the
 same instrumentation point and compares against `layout_hash`:
@@ -1566,3 +1643,4 @@ the git history of `codetracer-trace-format-spec`.
 | Date | Change |
 |---|---|
 | 2026-09-30 | **Snapshot payloads: a payload that fits in one block is stored raw** (`MCR-Memory-Page-CAS.milestones.org` CAS-D1).  "Snapshot payloads (MCR recorder)" gains a normative writer rule: a snapshot payload of at most `block_size` bytes (4096) is stored in the raw form under its logical name, one of more than `block_size` in the compressed form; the threshold is on the uncompressed length, so the choice needs no trial compression.  A compressed form costs at least four blocks (data and index members, each with a block-map block) and two root entries where a one-block raw member costs two blocks and one entry, so compression cannot shrink such a payload.  No reader change: the raw form is the legacy form every reader already resolves, told apart by which members exist.  Measured cause: on a Windows `fx_small` page-CAS trace the boundary-A `cp.prein.cas` (1 228 bytes compressed) occupied four blocks for a ~1.5 KB payload, the two blocks that tied a page-CAS trace with the compressed legacy trace it replaces. |
+| 2026-10-01 | **Format-efficiency revision** (`measurements/2026-10-format-efficiency.md`). `meta.dat` version 6: no path list, `paths.dat` is the only list of source paths, and `flags_ext` is always present. `step-map.ns` version 2: keys delta-coded, step-id gaps run-length-coded, zstd chunks of about 64 KiB behind an uncompressed chunk table; 81 times smaller than version 1 on the corpus. Together with container version 5 (`ctfs-container.md` §2), the normative step-encoding rule and the exact `EventLogKind` in `events.dat` (`trace-events.md`). |

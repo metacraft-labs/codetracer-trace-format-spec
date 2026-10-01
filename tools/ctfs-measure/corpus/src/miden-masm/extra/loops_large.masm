@@ -1,0 +1,72 @@
+# Larger loop-heavy program: iterated Fibonacci, collatz walks and a
+# memory-backed running sum, so the trace has thousands of steps.
+
+proc.fib.2
+    push.0 loc_store.0
+    push.1 loc_store.1
+    push.1 sub
+    dup push.0 neq
+    while.true
+        loc_load.0 loc_load.1 add
+        loc_load.1 loc_store.0
+        loc_store.1
+        push.1 sub
+        dup push.0 neq
+    end
+    drop
+    loc_load.1
+end
+
+# collatz step count for n (u32), n >= 1
+proc.collatz.1
+    push.0 loc_store.0
+    dup push.1 neq
+    while.true
+        dup push.2 u32mod push.0 eq
+        if.true
+            push.2 u32div
+        else
+            push.3 u32wrapping_mul push.1 u32wrapping_add
+        end
+        loc_load.0 push.1 add loc_store.0
+        dup push.1 neq
+    end
+    drop
+    loc_load.0
+end
+
+proc.store_and_sum.1
+    # writes i*i to mem[i] for i in 0..40, then sums them
+    push.0 loc_store.0
+    push.40
+    dup push.0 neq
+    while.true
+        push.1 sub
+        dup dup mul dup.1 mem_store
+        dup push.0 neq
+    end
+    drop
+    push.40
+    dup push.0 neq
+    while.true
+        push.1 sub
+        dup mem_load loc_load.0 add loc_store.0
+        dup push.0 neq
+    end
+    drop
+    loc_load.0
+end
+
+begin
+    push.30
+    dup push.0 neq
+    while.true
+        dup push.2 add exec.fib drop
+        dup exec.collatz drop
+        push.1 sub
+        dup push.0 neq
+    end
+    drop
+    exec.store_and_sum
+    drop
+end

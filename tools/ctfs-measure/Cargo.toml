@@ -1,0 +1,29 @@
+[package]
+name = "ctfs-measure"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Measurements behind the CTFS step-encoding, meta.dat, step-map.ns and small-file decisions"
+
+[features]
+default = ["native"]
+# The C zstd binding: what the native writers and readers ship with. Not
+# available on wasm32, where the decode benchmark uses ruzstd instead.
+native = ["dep:zstd"]
+
+[dependencies]
+ruzstd = "0.8"
+zstd = { version = "0.13", optional = true }
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "ctfs-measure"
+required-features = ["native"]
+
+[[bin]]
+name = "decode-bench"

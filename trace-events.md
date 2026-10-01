@@ -244,7 +244,7 @@ Events are no longer in a single stream. Each event type belongs to exactly one 
 
 | Tag | Variant | Fields | Description |
 |-----|---------|--------|-------------|
-| 0 | `AbsoluteStep` | `global_position_index: varint` | Execution stepped to a source position (full state at chunk/function boundaries) |
+| 0 | `AbsoluteStep` | `global_position_index: varint` | Execution stepped to a source position (the first position of every chunk, and wherever it is no longer than the delta) |
 | 1 | `DeltaStep` | `delta: signed varint` | Compact step encoding — signed delta from previous step's `global_position_index` |
 | 2 | `Raise` | `exception_type_id: varint`, `message_len: varint`, `message: bytes` | Exception raised (before unwinding) |
 | 3 | `Catch` | `exception_type_id: varint` | Exception caught by a try/except handler |
@@ -644,19 +644,54 @@ When `end_value` is called:
 
 ### EventLogKind (u8 enum)
 
-| Value | Kind | Description |
-|-------|------|-------------|
-| 0 | Stdout | Standard output write |
-| 1 | Stderr | Standard error write |
-| 2 | Stdin | Standard input read |
-| 3 | FileWrite | File write |
-| 4 | FileRead | File read |
-| 5 | NetworkSend | Network send |
-| 6 | NetworkRecv | Network receive |
-| 7 | Error | Uncaught exception / error |
-| 8 | Log | Application log message |
+The `kind` byte of an `events.dat` record (and of the legacy `Event` event) is the recorder's
+`EventLogKind`, by ordinal. The table is the enum recorders build against,
+`codetracer_trace_types::EventLogKind`, in its declaration order:
 
-Removed unused kinds (ReadDir, OpenDir, CloseDir, Socket, Open — these can be re-added when recorders actually emit them).
+| Value | Kind | Recorded for |
+|-------|------|--------------|
+| 0 | `Write` | Output to stdout, or an unspecified write |
+| 1 | `WriteFile` | A write to a named file |
+| 2 | `WriteOther` | A write to anything else -- stderr, a pipe, a socket |
+| 3 | `Read` | Input from stdin, or an unspecified read |
+| 4 | `ReadFile` | A read from a named file |
+| 5 | `ReadOther` | A read from anything else |
+| 6 | `ReadDir` | Reading a directory's entries |
+| 7 | `OpenDir` | Opening a directory |
+| 8 | `CloseDir` | Closing a directory |
+| 9 | `Socket` | A socket operation |
+| 10 | `Open` | Opening a file |
+| 11 | `Error` | An uncaught exception or error |
+| 12 | `TraceLogEvent` | A message the program or recorder logged into the trace |
+| 13 | `EvmEvent` | An EVM host event (Stylus, EVM recorders) |
+
+Values 14-255 are unassigned.
+
+Requirements (meta.dat version 6 onward):
+
+- **A kind round-trips exactly.** A writer MUST store the ordinal its recorder gave, and a reader
+  MUST report that ordinal, as that kind, to its caller -- `ct-print`, the db-backend, an FFI
+  accessor. Neither side may map it onto a coarser set. Every value in the table stays allocated,
+  whether or not a current recorder emits it, so that every ordinal keeps its meaning.
+- **An unassigned value is refused.** A writer MUST NOT write one, and a reader MUST refuse a record
+  that carries one, naming the value, rather than substitute a kind for it.
+
+**Why this is spelled out.** Until this revision the table here listed a different nine-value enum
+(`Stdout`, `Stderr`, `Stdin`, ..., `Log`) that no implementation used, and the implementations
+filled the gap three different ways. The Rust writer stored the recorder's ordinal. The Nim writer's
+API had a four-value `IOEventKind` (stdout, stderr, file op, error), so it collapsed every kind into
+one of four on write -- `EvmEvent` was stored as `TraceLogEvent` (12) -- and collapsed again on read.
+The db-backend decoded on-disk bytes 1, 2 and 3 as that API's ordinals (`WriteOther`, `WriteFile`,
+`Error`), not as `EventLogKind`'s (`WriteFile`, `WriteOther`, `Read`), so it mislabelled even the
+Rust writer's records. A Stylus recording, whose host events are all `EvmEvent`, therefore read back
+as other kinds, and its test had to stop asserting the kind. Every recording in the measurement
+corpus carries only kinds 0, 4, 11 and 12 -- the four the Nim API could express.
+
+**Size.** The kind is one byte in either case, so preserving it adds nothing to the record. It can
+affect compression only through the variety of kinds a recording actually uses. As an upper bound,
+`measurements/2026-10-format-efficiency.md` §"`events.dat` kinds" re-expands every collapsed kind
+pseudo-randomly within its class: `events.dat` grows by at most 5%, almost all of it in one corpus
+of 962,000 log events. A recorder that uses one kind for each kind of event pays nothing.
 
 ## Raw Byte Fidelity
 
@@ -858,7 +893,7 @@ Total decode cost is `O(log F + log L)` per step. Cumulative-sum tables are comp
 
 Step records reference source locations through `global_position_index` (absolute) or signed deltas of `global_position_index` (delta). The compact variants are documented in §"Compact Step Encoding".
 
-A delta within the same line moves through column positions only (small magnitude, typically ±1 to ±N where N is the line length). A delta that crosses a line boundary jumps by at least `current_column + 1`. A delta that crosses a file boundary jumps by potentially millions and is normally promoted to an AbsoluteStep.
+A delta within the same line moves through column positions only (small magnitude, typically ±1 to ±N where N is the line length). A delta that crosses a line boundary jumps by at least `current_column + 1`. A delta that crosses a file boundary jumps by potentially millions. Which moves are written as deltas is fixed by §"Encoding Rules": those whose delta is strictly shorter than the position.
 
 ### Back-Compatibility
 
@@ -876,7 +911,7 @@ Step events use two variants for efficient encoding. Both variants address sourc
 
 ### AbsoluteStep (Tag 0)
 
-Used at function entry, after large jumps, or when the delta would exceed DeltaStep's range.
+Used for the first position of every `steps.dat` chunk, and wherever the position's varint is no longer than the delta's (§"Encoding Rules").
 
 ```
 [Tag: 0x00] [global_position_index: varint]
@@ -885,7 +920,7 @@ Total: 3-4 bytes typical (1 tag + 2-3 varint bytes)
 
 ### DeltaStep (Tag 1)
 
-Used for consecutive steps within the same function or nearby code. Stores the signed delta from the previous step's `global_position_index`.
+Used when the delta's varint is strictly shorter than the position's (§"Encoding Rules"). Stores the signed delta from the previous position record's `global_position_index`.
 
 ```
 [Tag: 0x01] [delta: signed varint]
@@ -899,14 +934,67 @@ The signed varint uses zigzag encoding: `(delta << 1) ^ (delta >> 63)`, then uns
 | ±63 | 1 byte | 2 bytes |
 | ±8191 | 2 bytes | 3 bytes |
 | ±1048575 | 3 bytes | 4 bytes |
-| Larger | Use AbsoluteStep | 3-4 bytes |
+
+A delta is written only where it is strictly shorter than the position itself; otherwise the record is an AbsoluteStep (§"Encoding Rules").
 
 ### Encoding Rules
 
-1. The first step in a trace is always AbsoluteStep
-2. After a Call event, the next step is AbsoluteStep (new function context)
-3. After a Return event, the next step is AbsoluteStep (returning to caller)
-4. All other steps use DeltaStep if the delta fits in 3 varint bytes (±1048575), otherwise AbsoluteStep
+These rules are normative for writers: two writers given the same recording write the same
+`steps.dat`, byte for byte. They bind readers only where §"Reading" says so.
+
+**The cursor.** Position records -- `AbsoluteStep` (0), `DeltaStep` (1) and `DeltaColumn` (7) --
+each leave a running position, the *cursor*, at the position they denote. Every other record
+(tags 2-6 and 8) leaves it where it was. There is one cursor for the whole stream, whatever thread a
+record belongs to, and it does not survive a chunk boundary: each `steps.dat` chunk (§"Chunked
+Compression") starts without one.
+
+**The rule.** For each position record, with `p` its `global_position_index`:
+
+1. If it is the first position record of its chunk, it is an `AbsoluteStep`. That holds whatever
+   records precede it in the chunk: a chunk that opens with a `ThreadSwitch` or a `Raise` still has
+   its first position written absolute.
+2. Otherwise, with `d = p - cursor`: if the varint of `zigzag(d)` is strictly shorter than the
+   varint of `p`, it is a delta -- a `DeltaColumn` when the recorder registered it as a column step,
+   a `DeltaStep` otherwise.
+3. Otherwise -- the position's varint is no longer than the delta's -- it is an `AbsoluteStep`.
+
+So each record takes the shorter encoding, and a tie goes to the `AbsoluteStep`.
+
+There is no other case. In particular, calls, returns, thread switches and source reloads force
+nothing: a position after a call is written by rule 2 or 3 like any other.
+
+**Reading.** A reader decodes a chunk by itself, starting without a cursor:
+
+- A `DeltaStep` or `DeltaColumn` that comes before the chunk's first `AbsoluteStep` has nothing to
+  be relative to. A reader MUST refuse it, naming the chunk; it MUST NOT resolve it against `0`, and
+  MUST NOT carry a cursor over from the previous chunk. Either would turn a damaged or non-conforming
+  chunk into well-formed positions that were never recorded.
+- After the anchor a reader accepts both forms wherever they occur. Which form a writer chose is the
+  writer's obligation, checked by the cross-writer tests, not something a reader re-derives.
+
+**Why this rule (measured).** `measurements/2026-10-format-efficiency.md` §"`steps.dat`" compares
+nine candidate rules on 1,042 recordings in 25 corpora -- each recorder's own test programs and
+examples plus larger programs in each language: 5.6 million exec records.
+
+- *Size as stored.* Once zstd has run, every rule but "always absolute" lands within a few percent
+  of the others, because the stream is tiny either way -- about 0.1 byte per record. "Shorter
+  encoding, ties to absolute" is the smallest overall, 2.6% below this section's previous rule
+  (absolute after every call and return, delta whenever it fits three bytes), and within 1% of the
+  smallest rule on 16 of the 25 corpora, more than any other. It is not uniformly best: on programs
+  whose whole position space is below 128, every position is a one-byte absolute, which costs up to
+  10.5% (Circom) and saves up to 51% (PolkaVM) on recordings of a few hundred records. Absolutes win
+  after compression because a jump to a given target -- a loop head, a function's first line -- is
+  the same `AbsoluteStep` from every source, and therefore a repeated string for zstd, while its
+  delta differs with every source. A tie therefore goes to the `AbsoluteStep`.
+- *Decode speed* does not separate the rules that delta-code small moves: inflating and decoding a
+  chunk costs 6.2-6.3 ns per record in WASM (ruzstd) and 2.6-2.8 natively (C zstd) under every one
+  of them, within run-to-run noise. "Always absolute" is 30-37% slower.
+- *Anchors.* No reader uses an `AbsoluteStep` at a call or a return. Every reader decodes a chunk on
+  its own: the Rust `StepStreamReader`, the db-backend's live-follow source, and Nim's single-step
+  `stepAbsoluteGlobalLineIndex`. So the anchor a reader needs is the first position of each chunk,
+  and the old rule's call and return anchors cost bytes for nothing. The Nim writer anchored a chunk
+  only when its first *record* was a step; every Ruby recording in the corpus has a first chunk that
+  opens with a thread record followed by an unanchored delta.
 
 ### Column Encoding — `DeltaColumn` (chosen)
 
@@ -1095,7 +1183,7 @@ The synthetic-corpus numbers are subject to revision once column-aware recorders
 
 ### Chunked Compression
 
-Events are grouped into **chunks** of `chunk_size` records (default: 4096). Each chunk is independently Zstd-compressed. Chunks contain **only compressed data** -- no inline headers. All metadata lives in companion index streams.
+Events are grouped into **chunks** of `chunk_size` records (default: 4096). Each chunk is independently Zstd-compressed and independently decodable: its first position record is an `AbsoluteStep` (§"Encoding Rules"), so a reader that seeks to a record inflates and decodes that one chunk and nothing before it. Chunks contain **only compressed data** -- no inline headers. All metadata lives in companion index streams.
 
 ```
 steps.dat:  [compressed_chunk_0][compressed_chunk_1][compressed_chunk_2]...

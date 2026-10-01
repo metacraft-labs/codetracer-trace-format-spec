@@ -30,7 +30,7 @@ Block 0 begins with a 16-byte header.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0--4 | 5 | Magic | `C0 DE 72 AC E2` ("CODE TRACE") |
-| 5 | 1 | Version | `4` |
+| 5 | 1 | Version | `5` |
 | 6 | 1 | Encryption | `0` = none, `1` = AES-256-GCM |
 | 7 | 1 | MaxShards | Maximum shard count (`0` = no sharding) |
 | 8--11 | 4 | BlockSize | Block size in bytes (u32 LE, default 4096) |
@@ -39,7 +39,7 @@ Block 0 begins with a 16-byte header.
 ```c
 struct ContainerHeader {
     uint8_t  magic[5];          // C0 DE 72 AC E2
-    uint8_t  version;           // 4
+    uint8_t  version;           // 5
     uint8_t  encryption;        // 0=none, 1=AES-256-GCM
     uint8_t  max_shards;        // 0 = no sharding
     uint32_t block_size;        // default 4096
@@ -149,6 +149,7 @@ Data block allocation begins at block number `root_blocks`.
 
 | Version | Description |
 |---------|-------------|
+| 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 and SHOULD accept 4, whose layout is version 5's without the tag (§2, "Reading a version 4 container"). Writers MUST write 5. |
 | 4 | Query protocol, network reader, replication, RAM cache, cached trace reader. Backward compatible: v4 readers accept v3 and v2 containers. |
 | 3 | 16-byte header with encryption; binary metadata; BlockSize 4096; MaxRootEntries 0 auto-fill; small file optimization; namespaces |
 | 2 | Extended header with BlockSize and MaxRootEntries |
@@ -163,22 +164,100 @@ An array of file entries follows the free list roots in block 0.
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
 | 0 | 8 | u64 LE | Size | Logical file size in bytes |
-| 8 | 8 | u64 LE | MapBlock | Root mapping block number (0 = no data) |
+| 8 | 8 | u64 LE | MapBlock | `0` for an empty member; the member's only data block with bit 63 set; otherwise its root mapping block (see below) |
 | 16 | 8 | u64 LE | Name | Base40-encoded filename (12 chars max) |
 
 ```c
 struct FileEntry {
     uint64_t size;       // logical file size in bytes
-    uint64_t map_block;  // root mapping block (0 = no data)
+    uint64_t map_block;  // 0 = empty; DIRECT|b = only data block; else root mapping block
     uint64_t name;       // base40-encoded name
 };
 ```
 
 An entry where all 24 bytes are zero is an empty slot.
 
-### Small File Optimization
+### `MapBlock` has three forms (version 5)
 
-If `Size <= BlockSize`, the `MapBlock` field points directly to the single data block (no mapping block allocated). Once a file grows beyond one block, a mapping block is allocated and the data block becomes the first entry in the mapping hierarchy.
+```c
+#define CTFS_DIRECT (1ull << 63)
+```
+
+| `MapBlock` | The member is | `Size` |
+|---|---|---|
+| `0` | empty; it owns no block | `0` |
+| `CTFS_DIRECT \| b` | one data block, `b`; it owns no mapping block | `1` .. `BlockSize` |
+| any other value `m` | mapped: `m` is its level-1 mapping block (§4) | any |
+
+**Writers.** A member's layout follows its size:
+
+- **Created empty, and stays so until written.** Creating a member writes its name and nothing else
+  (§5); no block is allocated for it. A member that is never written is `(Size, MapBlock) = (0, 0)`
+  in the finished container.
+- **First write: one data block, tagged.** The first append claims a data block `b` and stores
+  `MapBlock = CTFS_DIRECT | b`. No mapping block exists while the member fits in one block.
+- **Growing past one block: mapped from then on.** The append that takes `Size` past `BlockSize`
+  claims a level-1 mapping block, puts `b` in its slot 0, claims the new data block(s), and then
+  stores the untagged mapping block number in `MapBlock`, *before* it stores the new `Size` (§6).
+- **In a container its writer has closed, a member with `0 < Size <= BlockSize` MUST be direct and
+  a member with `Size > BlockSize` MUST be mapped.** A writer never allocates a mapping block for a
+  member that never outgrows one block, so a small member costs one block instead of two, and an
+  empty one costs none.
+
+**Readers.** Decide the layout from `MapBlock`, never from `Size`:
+
+- `MapBlock = 0`: the member is empty. A non-zero `Size` with it is a null pointer (§4, "Null block
+  pointers on the read path") and MUST be refused.
+- Tagged: the data block is `MapBlock & ~CTFS_DIRECT`. It is subject to every check a data-block
+  pointer is -- not `0`, inside the container -- and a `Size` above `BlockSize` with it MUST be
+  refused: one block cannot hold it.
+- Untagged and non-zero: §4's mapping, whatever `Size` is. A mapped member with `Size <= BlockSize`
+  is legitimate while its writer is between the two stores of a transition, and a live reader can
+  observe exactly that (below); in a closed container it does not occur, but a reader cannot tell
+  the two apart and does not need to.
+
+**Why a tag, and not `Size <= BlockSize`.** The rule this replaced (container versions 3 and 4)
+said "if `Size <= BlockSize`, `MapBlock` is the data block", and no writer ever implemented it.
+Two things are wrong with it, and either would be disqualifying:
+
+1. **A live reader cannot apply it.** A member crossing one block changes `MapBlock` (data block to
+   mapping block) and `Size` (small to large) with two separate stores, and a concurrent reader
+   (§6) loads them separately. Whichever order the writer stores them in, some interleaving hands
+   the reader one old value and one new one: an old `Size` with the new `MapBlock` makes it read the
+   mapping block as the member's bytes, and a new `Size` with the old `MapBlock` makes it read the
+   data bytes as block pointers. Re-reading `Size` does not close the window -- the reader can see
+   `Size` small on both reads with the new `MapBlock` between them. With the tag, the form travels
+   in the same 8-byte word as the pointer, which is loaded atomically: the writer stores `MapBlock`
+   before `Size`, a reader loads `Size` before `MapBlock`, and the one mixed pairing that remains
+   possible -- an old `Size` with the new mapping -- reads the right bytes, because the mapping's
+   slot 0 is the old data block.
+2. **It cannot be told apart from the layout every writer produced.** Containers written before
+   version 5 give every member, empty or not, a mapping block. A reader applying the size rule to
+   them reads each small member's mapping block as its content; a reader that does not apply it
+   reads a direct member's data as block pointers. Nothing in the bytes distinguishes them (the
+   wasm recorder's Go reader says so in `container.go`, and the one reader that guessed,
+   `tracing-formats-benchmarks/cas_dedup/ctfs.py`, guesses from slot contents and can be wrong on a
+   short index member). The tag and the version bump make the layout explicit.
+
+Bit 63 is free because no block number reaches it: block `2^63` would begin `2^63 * BlockSize`
+bytes into the container, past any file a 64-bit offset can address. A
+reader that predates version 5 refuses the container by its version byte; one that ignored the
+version would meet a block number beyond its bound check and refuse it there, not misread it.
+
+The small-member layout applies to `FileEntry.MapBlock` only. Namespace descriptors (§8) and the
+chain and child pointers inside a mapping (§4) are unchanged.
+
+**Reading a version 4 container.** Version 4 has no tag: every non-empty member is mapped, and an
+empty member's `MapBlock` is either `0` or a mapping block of zeros. Version 5's reading rules
+read it unchanged, since an untagged pointer means "mapped" in both. A version 4 container whose
+`MapBlock` carries bit 63 is damaged and MUST be refused. Readers SHOULD keep accepting version 4,
+because writers outside the trace-format libraries (the MCR recorder's `ctfs_disk`, the native
+backend's `ctfs_meta_writer`) still produce it.
+
+**Measured effect.** See `measurements/2026-10-format-efficiency.md` §"Small and empty members":
+across 1,042 recordings, the mapping blocks of members that never outgrow one block, and of empty
+members, are 27.4% of all container bytes, and the median container is half that size without them.
+Most recordings are small, and in a small recording almost every member fits one block.
 
 ---
 
@@ -260,7 +339,7 @@ Maximum 5 levels. With BlockSize=4096, max file size is ~133 PB.
 
 Given byte offset `pos`:
 
-1. If `file_entry.size <= BlockSize`: `MapBlock` is the data block directly (small file optimization).
+1. If `MapBlock` is `0`, the member is empty (§2). If it carries `CTFS_DIRECT`, the data block is `MapBlock & ~CTFS_DIRECT` and `pos` is below `BlockSize` (§2). Neither case reads a mapping block.
 2. Otherwise, compute `block_index = pos / BlockSize`. Determine the mapping level, follow chain pointers to that level, navigate down through mapping entries (dividing by powers of `usable`) to reach the data block. At most 5 block reads.
 
 ### Block Allocation
@@ -316,25 +395,25 @@ FileEntry
 ### Creating a File
 
 1. Find an empty slot in the file entry array (all 24 bytes zero).
-2. Encode the filename using base40 and write to the `Name` field. Leave `Size` and `MapBlock` as zero.
+2. Encode the filename using base40 and write to the `Name` field. Leave `Size` and `MapBlock` as zero. Claim no block: a member that is never written stays `(0, 0)` (§2).
 3. Sync block 0 for concurrent readers.
 
 ### Appending Data
 
 Four cases based on current file state:
 
-1. **First write** (size=0, map_block=0): Allocate a data block, set `MapBlock`.
-2. **Small file, fits** (size <= BlockSize, no boundary crossing): Write to existing block.
-3. **Small-to-mapped transition** (size <= BlockSize, crosses boundary): Allocate mapping block, move data block ref to slot 0, update `MapBlock`, allocate new data block.
-4. **Normal mapped file** (size > BlockSize): Resolve/allocate through mapping hierarchy.
+1. **First write** (`MapBlock = 0`): claim a data block `b`, write the bytes, set `MapBlock = CTFS_DIRECT | b`. If the first write is longer than one block, it is case 3 applied to an empty member: claim the mapping block first, then the data blocks.
+2. **Direct, fits** (`MapBlock` tagged, the new size `<= BlockSize`): write into the existing block.
+3. **Direct-to-mapped transition** (`MapBlock` tagged, the new size `> BlockSize`): claim a level-1 mapping block, store `b` in its slot 0, claim and write the new data block(s) and record them in the mapping, then store the untagged mapping block number in `MapBlock`. Claims are made in that order -- mapping block, then data blocks in file order -- so two writers given the same appends allocate the same blocks.
+4. **Mapped** (`MapBlock` untagged and non-zero): resolve/allocate through the mapping hierarchy.
 
-After writing: atomically update `FileEntry.Size` (makes data visible to readers). Data must be fully written before Size is updated. Write barriers enforce ordering.
+After writing: atomically update `FileEntry.Size` (makes data visible to readers). Data must be fully written before Size is updated. Write barriers enforce ordering. In case 3 the store of `MapBlock` precedes the store of `Size`, with a barrier between them, so a reader that observes the new `Size` observes the mapped `MapBlock` (§6).
 
 ### Reading Data
 
 - Return EOF if `offset >= file_entry.size`.
 - Clamp read length to file size boundary.
-- For each spanned block: resolve via mapping hierarchy (or directly for small files), read bytes.
+- For each spanned block: resolve it as §4 says -- the tagged block directly, otherwise through the mapping hierarchy -- and read its bytes.
 
 ---
 
@@ -359,7 +438,7 @@ No locks, mutexes, or CAS loops -- only atomic fetch-and-add and atomic stores.
 
 1. Claim block(s) via `atomic_fetch_add(NextFreeBlock, count)`
 2. Write data to claimed blocks
-3. Update mapping block pointers (thread-local, no contention)
+3. Update mapping block pointers (thread-local, no contention); on a direct-to-mapped transition, store the untagged `FileEntry.MapBlock` (one atomic 8-byte store)
 4. Write barrier
 5. Atomically store new `FileEntry.Size`
 6. Flush file entry for concurrent readers
@@ -367,8 +446,8 @@ No locks, mutexes, or CAS loops -- only atomic fetch-and-add and atomic stores.
 ### Reader Protocol
 
 1. Read block 0 for file entry array
-2. Read `FileEntry.Size` (re-read periodically for streaming)
-3. Read data up to `Size` via block mapping
+2. Read `FileEntry.Size` (re-read periodically for streaming), then `FileEntry.MapBlock`, each with one atomic load
+3. Read data up to `Size` via the form `MapBlock` has (§2). Across a direct-to-mapped transition, loading `Size` before `MapBlock` (acquire) rules out pairing a new `Size` with the old, tagged `MapBlock`, because the writer stored `MapBlock` first; the remaining mixed pairing, an old `Size` with the new mapping, reads correct bytes, because the mapping's slot 0 is the old data block
 4. For compressed streams: use companion index for chunk-level seeking
 
 ### Guarantees

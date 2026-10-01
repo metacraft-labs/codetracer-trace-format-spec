@@ -12,6 +12,11 @@ This repository is the source-of-truth specification for the CodeTracer trace fo
 | [internal-files.md](internal-files.md) | Conventions for files stored inside a CTFS container |
 | [Trace-Filters.md](Trace-Filters.md) | Cross-language trace filter contract: schema, hot-path requirement, provenance |
 | [conformance-testing.md](conformance-testing.md) | How to test an implementation, and how such tests fail to fail — written from the defects that got through |
+| [measurements/2026-10-format-efficiency.md](measurements/2026-10-format-efficiency.md) | The measurements behind the 2026-10 revision: step encoding, `step-map.ns`, `meta.dat`'s path list, small and empty members, `events.dat` kinds |
+
+## Tools
+
+- [`tools/ctfs-measure`](tools/ctfs-measure) -- the measurement harness: an independent `.ct` reader, the candidate encodings, native and WASM decode benchmarks, and the scripts that rebuild the recording corpus (`corpus/build_corpus.sh`) and the report (`run_measurements.sh`).
 
 ## Implementations
 
