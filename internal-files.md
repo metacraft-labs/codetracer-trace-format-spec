@@ -58,6 +58,16 @@ writer must not substitute the position space merely because the trace is column
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
 
+**An empty name is a name.** No interned name has a minimum length: a zero-length
+`varnames.dat` record, a `types.dat` record with `lang_type_len = 0`, and a `funcs.dat`
+record with `name_len = 0` are well-formed, and recorders write them (a type a language
+leaves unnamed). A writer records an empty name like any other, and interns it once. A
+reader returns it as the empty string. It must not report an empty name as a failed
+lookup: one implementation's C ABI returned the same null for "empty" as for "failed",
+its caller read every empty name as an error with no message, and a recording that held
+one did not open. An API that signals failure through a null or absent result must
+therefore return an empty name as a present, zero-length result.
+
 **When an entry is interned.** A writer interns an entry at the first of: the recorder registering
 it (a path, a variable name, a function, a type), or a record that refers to it. Ids are assigned
 from 0 in that order, and an entry is interned once: registering an entry that is already in the
