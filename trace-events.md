@@ -135,6 +135,14 @@ so the same call reads back the same way from either writer.
 **`call_key` is not stored in the record.** It is the record's position in
 `calls.dat`, which is what makes the stream addressable by it.
 
+**Each record is framed by its length.** Inside a decompressed chunk of `calls.dat`, `values.dat`
+or `events.dat`, every record is preceded by `record_len: varint`, its byte length, so a chunk is
+`(record_len, record)*`. (`steps.dat` records are not framed; each tag fixes its own length.) The
+frame is what lets a reader reach record `k` of a chunk without decoding the fields of the `k`
+records before it. A reader MUST refuse a record whose fields do not consume exactly `record_len`
+bytes, naming the stream and record index. Both writers have always written the frame; the record
+tables in this document did not show it until 2026-10.
+
 **Each argument is its own entry, and carries its own `varname_id`.** The
 framing is the one `values.dat` tag 0 `StepValues` uses for the same job — a
 count, then that many `(name, value)` pairs — and for the same reason: an
@@ -341,7 +349,7 @@ Call records are not tagged events — each record is a complete function call w
 | `children_count` | varint | Number of child calls |
 | `children_keys` | [varint] × children_count | Child call keys |
 
-`call_key` is the record's position in `calls.dat`, not a stored field.
+`call_key` is the record's position in `calls.dat`, not a stored field. Within a chunk each record is preceded by `record_len: varint` (§"Call Stream (`calls.dat`)", "Each record is framed by its length").
 
 ### IO Event Stream Records (`events.dat`)
 

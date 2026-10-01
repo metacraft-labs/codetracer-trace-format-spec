@@ -149,7 +149,7 @@ Data block allocation begins at block number `root_blocks`.
 
 | Version | Description |
 |---------|-------------|
-| 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 and SHOULD accept 4, whose layout is version 5's without the tag (§2, "Reading a version 4 container"). Writers MUST write 5. |
+| 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 and MUST refuse every other version, naming it (§2, "Older versions are refused"). Writers MUST write 5. |
 | 4 | Query protocol, network reader, replication, RAM cache, cached trace reader. Backward compatible: v4 readers accept v3 and v2 containers. |
 | 3 | 16-byte header with encryption; binary metadata; BlockSize 4096; MaxRootEntries 0 auto-fill; small file optimization; namespaces |
 | 2 | Extended header with BlockSize and MaxRootEntries |
@@ -247,12 +247,14 @@ version would meet a block number beyond its bound check and refuse it there, no
 The small-member layout applies to `FileEntry.MapBlock` only. Namespace descriptors (§8) and the
 chain and child pointers inside a mapping (§4) are unchanged.
 
-**Reading a version 4 container.** Version 4 has no tag: every non-empty member is mapped, and an
-empty member's `MapBlock` is either `0` or a mapping block of zeros. Version 5's reading rules
-read it unchanged, since an untagged pointer means "mapped" in both. A version 4 container whose
-`MapBlock` carries bit 63 is damaged and MUST be refused. Readers SHOULD keep accepting version 4,
-because writers outside the trace-format libraries (the MCR recorder's `ctfs_disk`, the native
-backend's `ctfs_meta_writer`) still produce it.
+**Older versions are refused.** A reader MUST refuse a container whose version byte is not 5,
+naming the version it found and the one it reads, before it resolves any member. Pre-1.0 there is
+no compatibility path: older containers are re-recorded, and fixtures are regenerated with their
+documented producers. Every writer of containers -- the trace-format libraries, the MCR recorder's
+`ctfs_disk`, the native backend's `ctfs_meta_writer`, the db-backend's overlay and test writers --
+writes version 5. Refusing is not merely tidy: a version 4 container read under version 5's rules
+happens to decode, but a reader that accepts it keeps every writer that still produces it alive,
+with its mapping block per member.
 
 **Measured effect.** See `measurements/2026-10-format-efficiency.md` §"Small and empty members":
 across 1,042 recordings, the mapping blocks of members that never outgrow one block, and of empty

@@ -1120,7 +1120,7 @@ missing or malformed value. Rationale and migration roadmap:
 - **v6** (current, 2026-10-01) -- the path list after `recorder_id` is
   gone; `paths.dat` is the only list of source paths (§ "`meta.dat` carries
   no path list"). `flags_ext` is always present, so there is one header
-  length. Readers refuse every other version: the bytes after
+  length. Readers refuse every other version, naming it: the bytes after
   `recorder_id` mean something different in v5 and below, and a reader
   that guessed would read a path count as an MCR field. Pre-1.0, there is
   no compatibility shim; fixtures are regenerated. The same revision moved
