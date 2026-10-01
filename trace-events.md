@@ -294,10 +294,10 @@ timeline annotation, not a position:
 
 Requirements:
 
-* **Declared, or refused.** A writer that emits one or more `SourceReload`
-  records MUST set `FLAG_EXT_HAS_SOURCE_RELOAD` (`internal-files.md`
-  §"Extended flags (`flags_ext`, version 5)"), and a writer that emits none
-  MUST NOT. A reader MUST refuse tag 0x08, by name, in a container that does
+* **Declared, or refused.** A writer emits `SourceReload` records only in a
+  trace whose recorder declared `FLAG_EXT_HAS_SOURCE_RELOAD` at open
+  (`internal-files.md` §"Extended flags (`flags_ext`)"), and refuses one
+  otherwise; a declared trace may contain none. A reader MUST refuse tag 0x08, by name, in a container that does
   not declare the flag. Skipping is not an option: the record's length is not
   recoverable without decoding it, so a skip re-reads its payload as further
   records and yields a shorter, plausible stream instead of an error.

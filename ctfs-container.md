@@ -502,7 +502,8 @@ memory -- leaves a container a reader opens and reads up to the last chunk it co
 Concretely:
 
 1. **At open**, before the first chunk of any stream is published, the writer writes block 0 and
-   `meta.dat`.
+   `meta.dat`, complete: `meta.dat` is never rewritten, so every field and flag in it is fixed at
+   open (`internal-files.md` §"Extended flags (`flags_ext`)").
 2. **When a chunk of a Chunked Compressed Table seals** (§7: it reaches `chunk_size` records), the
    writer writes, before the append that sealed it returns: the chunk's bytes to their data blocks,
    every mapping slot or block that changed, the chunk's offset in the companion `.idx`, every
@@ -514,7 +515,10 @@ Concretely:
    only in memory; a crash loses them, and nothing earlier.
 4. **Close-time members** -- `step-map.ns` and any other index built from the whole recording --
    are written at close. A crashed container lacks them, and readers fall back as they do for any
-   container without one.
+   container without one. `calls.dat` is a chunked table in call-key order whose records complete
+   when their calls return, so its first chunk seals only once its 256 lowest-key calls have all
+   returned -- in practice, at close, since the root call is among them. A crashed container
+   therefore usually carries no call records; its steps, values and events are still readable.
 5. **"Written" means handed to the operating system** (`write`/`pwrite`): it survives the death of
    the process, not the loss of power. A writer need not `fsync`, at a seal or at close; a caller
    that wants power-loss durability syncs the file itself.

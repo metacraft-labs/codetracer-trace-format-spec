@@ -967,8 +967,24 @@ Requirements:
   does not know would misdecode the stream. A reader refuses a container
   whose `flags_ext` carries a bit it does not implement, naming the bits.
 * **A header shorter than 12 bytes MUST be refused.**
-* **Bit 0 is set exactly when `steps.dat` contains at least one
-  `SourceReload` record.**
+* **Bit 0 is a capability declared at open** (version 6). It says that
+  `steps.dat` MAY contain `SourceReload` records, not that it does. A recorder
+  that can observe a reload -- one attached to a reload agent -- declares it
+  before the first record, as it chooses bits 4 and 14, and a writer MUST
+  refuse a `SourceReload` in a trace that did not, failing the call
+  (`trace-events.md` §"Recorder Integration — A Failed Call Fails the
+  Recording"). A trace that declared it and recorded no reload is
+  well-formed. Version 5 set the bit exactly when a reload had occurred, which
+  is only known at close; under the durability rule (`ctfs-container.md` §6)
+  `meta.dat` is written at open and never rewritten, so a crashed recording
+  would otherwise hold a sealed chunk with tag 8 under a `meta.dat` that
+  makes its readers refuse it.
+* **`meta.dat` is written once, at open, and is complete then.** Every field
+  and every flag is fixed before the first record. A writer MUST refuse a
+  call that would change one after that -- setting the working directory or
+  the arguments, enabling a capability -- rather than rewrite the member.
+  (Stream-presence bits 8-13 and 15 are hints decided at open from what the
+  writer will create; see §"Stream-presence flags are a hint, not a gate".)
 
 ### Two classes of flag bit
 
