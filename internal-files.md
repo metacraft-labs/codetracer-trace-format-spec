@@ -17,13 +17,20 @@ A CTFS file storing N records of constant size S. Record `i` occupies bytes `[i*
 Two CTFS files working together:
 
 - **Data file** (e.g., `paths.dat`): records appended sequentially, variable length
-- **Offset file** (e.g., `paths.off`): fixed-size table of u64 values, entry `i` = byte offset of record `i` in the data file
+- **Offset file** (e.g., `paths.off`): fixed-size table of u64 values. For a table of `N` records it
+  holds **`N + 1`** entries: entry `i` is the byte offset of record `i` in the data file, and entry
+  `N` is the data file's length. An empty table's offset file is the single entry `0`.
 
 To read record `i`:
 
-1. Read `offset[i]` from offset file (8 bytes at position `i * 8`)
-2. Read `offset[i+1]` to determine length (or use data file size for last record)
-3. Read `offset[i+1] - offset[i]` bytes from data file at `offset[i]`
+1. Read `offset[i]` and `offset[i+1]` from the offset file (16 bytes at position `i * 8`)
+2. Read `offset[i+1] - offset[i]` bytes from the data file at `offset[i]`
+
+The record count is `offset_file_size / 8 - 1`. A reader MUST refuse an offset file that is not a
+non-empty multiple of 8 bytes, whose entries decrease, whose first entry is not `0`, or whose last
+entry is not the data file's length. (Both writers have always written the trailing entry; this
+section described `N` entries with a fallback to the data file's size until 2026-10, and one
+downstream writer followed that reading and produced tables the libraries' readers refused.)
 
 ### Chunked Compressed Table (dat + idx)
 
