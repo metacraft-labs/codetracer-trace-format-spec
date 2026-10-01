@@ -66,16 +66,21 @@ One record per step, containing all variable values visible at that step. This i
 
 | Tag | Event | Fields |
 |-----|-------|--------|
-| 0 | StepValues | count: varint, then count × (name_id: varint, value: streaming CBOR) |
-| 1 | BindVariable | variable_id: varint, place: varint |
+| 0 | StepValues | count: varint, then count × (name_id: varint, value_len: varint, value: CBOR) |
+| 1 | BindVariable | variable_id: varint, place: signed varint |
 | 2 | DropVariable | variable_id: varint |
 | 3 | DropVariables | count: varint, ids: [varint] |
-| 4 | CellValue | place: varint, value: streaming CBOR |
-| 5 | CompoundValue | place: varint, value: streaming CBOR |
-| 6 | AssignCell | place: varint, new_value: streaming CBOR |
-| 7 | AssignCompoundItem | place: varint, index: varint, item_place: varint |
-| 8 | VariableCell | variable_id: varint, place: varint |
-| 9 | Assignment | to: varint, pass_by: u8, from: varint |
+| 4 | CellValue | place: signed varint, value_len: varint, value: CBOR |
+| 5 | CompoundValue | place: signed varint, value_len: varint, value: CBOR |
+| 6 | AssignCell | place: signed varint, value_len: varint, new_value: CBOR |
+| 7 | AssignCompoundItem | place: signed varint, index: varint, item_place: signed varint |
+| 8 | VariableCell | variable_id: varint, place: signed varint |
+| 9 | Assignment | to: varint, pass_by: u8, from_len: varint, from: CBOR (the `RValue`) |
+
+A *signed varint* is zigzag then LEB128 (a `Place` is an `i64`). Every value is its CBOR prefixed
+by its byte length; "streaming" describes how a writer produces the CBOR, not the framing. (This
+table showed unsigned places and unframed values until 2026-10; both writers have always written
+the layout above.)
 
 **Every tag in the table is part of the format.** Tags 1-8 carry the place model (bindings, cells,
 compound values and their updates) and tag 9 the assignment model; recorders reach them through

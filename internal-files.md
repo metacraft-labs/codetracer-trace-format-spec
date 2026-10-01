@@ -921,7 +921,7 @@ Header (12 bytes):
     bit 3       -- FLAG_HAS_TRACE_FILTER_PROVENANCE (filter chain block present, TF-M7)
     -- Capability (format-variant declared at open; not a stream gate):
     bit 4       -- FLAG_HAS_COLUMN_AWARE_STEPS (column-aware step encoding, see trace-events.md §"Reader Behaviour and Back-Compat")
-    bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (srcviews.dat present, see §"Alternate Source Views" below)
+    bit 5       -- FLAG_HAS_ALTERNATE_SOURCE_VIEWS (allocated; not set from version 6 on -- srcviews.dat is found by presence, see §"Alternate Source Views")
     bit 6       -- FLAG_SUPPORTS_COLUMN_BREAKPOINTS (capability bit; see §"Column-Aware Capability Flags" below)
     bit 7       -- FLAG_SUPPORTS_COLUMN_MOTIONS (capability bit; see §"Column-Aware Capability Flags" below)
     -- Stream-presence (ADDITIVE HINT; tautological with a named stream file;
@@ -1033,11 +1033,15 @@ authoritative answer to "does this trace carry stream X?" is the
   ignores its file (and its bit) and reads the rest correctly. Bit 14
   (`corrmark.ns`) is additive on the same terms. No bit is reserved for
   reject-on-unknown in version 4.
-- Writers MAY still set bits 8..13 and bit 15 as a fast-path hint. When they do, the bit
-  MUST be set as soon as the stream is created (so it is visible mid-run),
-  never deferred to close; a writer that cannot guarantee mid-run stamping
-  SHOULD leave the bit clear and rely on structural presence rather than emit
-  a bit that lies to a live reader.
+- **Version 6: a stream-presence bit is set exactly for the streams a writer
+  creates at open.** `meta.dat` is written once, complete, before the first
+  record (ctfs-container.md §6), so a bit can only state what is known then.
+  The runtime writers create `calls`, `steps`, `values`, `events` and the
+  interning tables at open and set bits 8-12. They create `spans.dat`,
+  `corrmark.ns` / `markers.dat` and `srcviews.dat` lazily, when the first
+  record of that kind arrives, so they never set bits 13, 15 or 5; a reader
+  finds those members by presence. Two writers given the same recording
+  therefore write the same flag word.
 
 Fields (varint-prefixed):
   recording_id: varint length + UTF-8 bytes (required, M-REC-1)
@@ -1616,10 +1620,11 @@ A replay-server consuming a CTFS trace SHOULD:
 
 Recorders that emit alternate views MUST:
 
-1. Set the `meta.dat` flag bit 5 = `FLAG_HAS_ALTERNATE_SOURCE_VIEWS`
-   (bits 0-4 were allocated by prior milestones — see
-   trace-events.md §"Reader Behaviour and Back-Compat" for the
-   strict-rejection contract on unknown bits).
+1. Write `srcviews.dat` / `srcviews.off`. Readers find them by presence.
+   (Bit 5, `FLAG_HAS_ALTERNATE_SOURCE_VIEWS`, stays allocated but is not set
+   from version 6 on: the members are created when the first view is, after
+   `meta.dat` has been written; see §"Stream-presence flags are a hint, not a
+   gate".)
 2. Run the formatter as a one-shot at record start, NOT per-step.
 3. Skip the format pass when:
    - The source has a sibling `<source>.map` upstream (the

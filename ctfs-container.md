@@ -501,8 +501,8 @@ readable while it records, so that a recording whose process dies -- killed, cra
 memory -- leaves a container a reader opens and reads up to the last chunk it completed.
 Concretely:
 
-1. **At open**, before the first chunk of any stream is published, the writer writes block 0 and
-   `meta.dat`, complete: `meta.dat` is never rewritten, so every field and flag in it is fixed at
+1. **At open** -- at the latest, before the recording's first record -- the writer writes block 0
+   and `meta.dat`, complete: `meta.dat` is never rewritten, so every field and flag in it is fixed at
    open (`internal-files.md` §"Extended flags (`flags_ext`)").
 2. **When a chunk of a Chunked Compressed Table seals** (§7: it reaches `chunk_size` records), the
    writer writes, before the append that sealed it returns: the chunk's bytes to their data blocks,
