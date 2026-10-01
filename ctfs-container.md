@@ -6,11 +6,11 @@ CTFS (CodeTracer File System) is a block-based container format that stores mult
 
 | # | Property | Description |
 |---|----------|-------------|
-| 1 | Compressed storage | Per-member Zstd via chunked compressed tables, transparent to the container layer; and, from v6, an optional whole-file scheme declared in the header (§1a, §1b) because a scheme that covers `meta.dat` cannot be declared inside it. |
-| 2 | Random-access seeking | O(log n) block mapping (at most 5 reads); O(1) chunk seek via companion index. |
+| 1 | Compressed storage | Per-member Zstd via chunked compressed tables, transparent to the container layer; and, from v6, an optional whole-file scheme declared in the header (§1a, §1b) because a scheme that covers `meta.dat` cannot be declared inside it. The compact profile uses neither chunked tables nor seekable zstd (§1d). |
+| 2 | Random-access seeking | O(log n) block mapping (at most 5 reads); O(1) chunk seek via companion index. Full profile only: the compact profile is resident before its first query and seeks in memory (§1d). |
 | 3 | Low-contention concurrent writes | Single atomic `NextFreeBlock` counter; per-file single writer; no locks. |
 | 4 | Multiple concurrent readers | Readers see consistent file sizes updated atomically by writers. |
-| 5 | Network-efficient | Block-aligned layout maps to HTTP range requests; one 4 KB fetch reveals full structure. |
+| 5 | Network-efficient | Block-aligned layout maps to HTTP range requests; one 4 KB fetch reveals full structure. Full profile only, and deliberately so: §1d has no alignment because a one-shot load issues no ranged read. |
 | 6 | Self-contained | All metadata in binary format within the container; no external files or JSON. |
 | 7 | Streaming-compatible | Companion index available during recording; no finalization needed. |
 | 8 | Encryption-aware | Container-level encryption flag; all content opaque without the key. |
@@ -177,7 +177,7 @@ Version 6 is version 5's body plus eight header bytes. Everything §2 says about
 | Value | Name | Body |
 |-------|------|------|
 | `0` | full | Block 0, free list roots, `FileEntry` array, block map -- everything from *Block 0 Layout* above and §2 onward |
-| `1` | compact | A directory of `(name, offset, length)` and the members concatenated raw, with no block map and no mapping blocks. Specified by the compact-profile milestones; a reader that does not implement it MUST refuse it rather than attempt the full body |
+| `1` | compact | A directory of `(name, offset, length)` and the members concatenated raw, with no block map and no mapping blocks -- §1d, which is normative for every offset. A reader that does not implement it MUST refuse it rather than attempt the full body |
 
 The set is CLOSED: `0` and `1` are the only defined values and every other value is a refusal.
 
@@ -226,11 +226,72 @@ So the refusal is also what makes the version bump the right mechanism for intro
 
 **What a writer writes.** Version 5 for a full-profile container with no whole-file scheme, which is every container any writer produces today and leaves them byte-identical. Version 6 only for a container that uses one of the two new fields. Reader support for 6 must ship everywhere before any writer emits it, which is the same rollout rule the version-5 note records.
 
+### 1d. The Compact Profile Body (version 6, `Profile = 1`) -- normative
+
+A compact container is the 24-byte header, a **directory** of `(name, offset, length)`, and the members concatenated. It has no block 0, no free list root area, no `FileEntry` array, no mapping block and no padding of any kind. Nothing in §2 and §4 onward applies to it.
+
+```
+Compact container (version 6, profile = 1):
+  [0 .. 23]                     ContainerHeaderV6 (24 bytes, §1)
+  [24 .. 27]                    MemberCount, N (u32 LE)
+  [28 .. 28 + 24*N - 1]         Directory: N CompactDirectoryEntry records, 24 bytes each
+  [28 + 24*N .. Size - 1]       The members' bytes, concatenated in directory order
+```
+
+```c
+struct CompactDirectoryEntry {   // 24 bytes
+    uint64_t name;               // base40-encoded name (§3), the packing FileEntry uses
+    uint64_t offset;             // from the start of the container image
+    uint64_t length;             // the member's bytes
+};
+```
+
+| Offset | Size | Type | Field | Description |
+|--------|------|------|-------|-------------|
+| 0 | 8 | u64 LE | Name | Base40-encoded member name (§3) -- **the same packing, in the same byte order, as `FileEntry.Name`** |
+| 8 | 8 | u64 LE | Offset | Byte offset of the member's first byte from the start of the container image |
+| 16 | 8 | u64 LE | Length | The member's size in bytes. There is no separate stored/logical distinction |
+
+So the first directory entry is at offset 28, entry `i` is at `28 + 24*i`, the `Name` of entry `i` is at `28 + 24*i`, its `Offset` at `36 + 24*i`, its `Length` at `44 + 24*i`, and the first member's byte is at `28 + 24*N`. A compact container's size is exactly
+
+```
+Size = 28 + 24*N + sum(entry[i].Length)
+```
+
+and a container whose length is not that value is refused. That identity is the layout's whole claim, so it is stated as an equation rather than as an absence of padding.
+
+**Header fields in a compact container.** `Version = 6` and `Profile = 1`, by definition. `MaxShards = 0`, as §1a already requires. `BlockSize = 0` and `MaxRootEntries = 0`, and both are MUSTs with a reader-side refusal: there are no blocks, so a block size is not a smaller or larger version of anything, and there is no `FileEntry` array for a maximum to bound. Writing `4096` there because it is the default would be the `max_shards` defect again -- two spellings of one state, this time "there are no blocks" spelled as a block size. `Compression` is as §1b, and covers the container image from offset 24 to the end of the stored object exactly as it does for the full profile; a reader reconstructs `header || decompress(rest)` and then every offset above holds. Note what that means for the field, because it is easy to read backwards: the reconstructed image keeps the original 24-byte header and therefore still DECLARES its scheme. The `Compression` byte describes how the object was stored, not what the bytes in hand are, so a reader must not treat "declares a scheme" as "is still compressed" -- the two are the same byte in a stored object and different facts in a reconstructed one, and a decoder that refused every container declaring a scheme would refuse the reconstructed image along with the stored one. The checks above apply to the reconstructed image.
+
+**Member names are carried unchanged from the full profile.** The `Name` field is §3's base40 packing in a `u64`, bit for bit what `FileEntry.Name` carries, so a compact container and a full container of one recording name the same members identically and a tool can compare the two name sets without transcoding either. §3's limits come with it: 12 characters, from `\0` (padding, index 0), `0`--`9` (1--10), `a`--`z` (11--36), `.` (37), `/` (38), `-` (39). **The alphabet has no space character and no capital letters**, and index 1 is `0` and not `\0`: a decoder whose table is off by one decodes `meta.dat` into something else entirely and reports success, which is why the packing is specified by reference here rather than restated.
+
+**Members appear in directory order and the directory is not sorted.** Entry `i`'s member precedes entry `i+1`'s in the file. The order is the producing container's own member order, which is creation order for a full container's `FileEntry` array; a reader MUST NOT assume lexical or numeric order and MUST find a member by searching the directory, which is N comparisons of one `u64` each.
+
+**A reader MUST refuse, naming the offending value, a compact container in which any of the following does not hold** (§1c's rule, applied to this body):
+
+1. `28 + 24*N <= Size` -- the directory itself fits.
+2. `entry[0].Offset == 28 + 24*N`, when `N > 0` -- the first member begins immediately after the directory.
+3. `entry[i].Offset == entry[i-1].Offset + entry[i-1].Length` for every `i` in `1 .. N-1` -- the members are contiguous: no gap, no overlap, and ascending.
+4. `entry[N-1].Offset + entry[N-1].Length == Size`, when `N > 0`; `Size == 28` when `N == 0` -- nothing follows the last member.
+5. Every `Name` is non-zero and round-trips through §3's packing: re-encoding the decoded name reproduces the `u64`. This refuses a `u64` at or above `40^12`, which names nothing, and a packing with a padding character before a non-padding one, which §3's encoder cannot produce and whose decoded string is not the name the writer meant.
+6. The `N` names are distinct.
+
+**Why contiguity and the total, and not merely a bounds check.** A reader that checked only `Offset + Length <= Size` would accept a directory one of whose offsets had been perturbed and would then serve a member that is SHIFTED, or one of whose lengths had been perturbed and serve a member that is SHORT -- in both cases successfully, with no indication. Checks 2, 3 and 4 make a single perturbed `Offset` or `Length` field unrepresentable: either it breaks contiguity with its neighbour or it breaks the total, and there is no value it can take that does neither while leaving the member it describes wrong. This is the same argument as §1c's, one level down -- a structure that admits a wrong value a reader cannot distinguish from a right one is not a specification of that structure. It is not a checksum and does not claim to be: a flipped bit in a `Name` yields a different, well-formed name, and what the checks guarantee is that it cannot yield a wrong member's bytes under a right name.
+
+**The directory is not a block map, and that is the design rather than a simplification.** A block map answers *which block holds byte N of this member*, which is what random access into a large member needs and what property 2 and design goal 5 are about. A directory answers *where does this member start and how long is it*, which is what a one-shot load needs. The second costs one `(u64, u64)` per member against a 4 KB mapping block per member, and it is sufficient precisely because the whole file is resident before the first query is asked. The compact profile is therefore not a cheaper encoding of the full profile's structure; it answers a different question, and it is the right profile only for a container small enough that the answer to the first question is always "all of it".
+
+**There is NO alignment requirement, and that is a statement about what alignment is for.** Nothing in a compact container is padded to a block, a page or a word: the directory begins at 28, a member begins wherever its predecessor ended, and a 12-byte member occupies 12 bytes. Design goal 5 -- "block-aligned layout maps to HTTP range requests; one 4 KB fetch reveals full structure" -- is what alignment serves, and it is correct for the full profile. A compact container is fetched whole and issues no ranged read, so there is nothing for alignment to serve and a reader MUST NOT round any offset or length to a boundary. A writer that aligned anyway would reintroduce exactly the cost the profile exists to remove, and because of check 4 it would also produce a container every conforming reader refuses.
+
+**Measured effect.** See [`measurements/2026-10-compact-profile.md`](measurements/2026-10-compact-profile.md). On a 17-member, 20,000-step version-5 container the compact layout is 38,481 bytes against 110,592, a 65.2% reduction, and its structural overhead is 436 bytes (1.1%) against 72,547 (65.5%); on the five-member `fixtures/minimal_trace.ct` it is 474 against 24,576, 98.0%. Both predictions -- `28 + 24*N + sum(length)` for the compact size and an independent block model for the version-5 size -- reproduce the measured containers to the byte. The saving is one data block per member plus block 0, and NOT mapping blocks: fifteen of the seventeen members are direct at version 5 and the two mapped ones own 8,192 bytes between them. The same document records a finding that the compact profile's *compressed*-size advantage is compressor-dependent and does not reproduce under `gzip` on that container.
+
+**Per-member compression is not used in a compact container.** The member formats that keep independent zstd frames inside themselves -- the chunked compressed tables of §7 and the seekable-zstd streams of [seekable-zstd.md](seekable-zstd.md) -- exist for one purpose: so that a reader can inflate the single frame a seek lands in rather than the whole member. A compact container is resident before its first query and seeks in memory, so that purpose does not arise, and the framing is pure cost -- a frame header per chunk, an index member describing offsets nothing consults, and a decompressor in a path whose whole claim is that it has one decompression step. A compact container's members are therefore stored as written, and `Compression` (§1b) or the transport's `Content-Encoding` is the only compression in the path. This is a constraint on WRITERS; a reader needs it only to know that a member's bytes are its content.
+
+What is deliberately NOT claimed here is that raw members also make the stored object SMALLER. The argument for that is real -- independently compressed members deny a one-shot compressor the redundancy across members it would otherwise find, and it cannot un-compress them to look -- but it is a trade, not an identity: undoing per-member compression grows the input by the per-member ratio in exchange for a whole-file view of it, and it reduces the compressed size only when the one-shot ratio exceeds the per-member one. Measured both ways. On the published container of [`measurements/2026-10-compact-profile.md`](measurements/2026-10-compact-profile.md)'s reference the trade pays, 15.4% of `gzip -9`; on that document's container A it loses, making `gzip -9` 2.7x worse and `zstd -19` 7.2% worse, and only `xz -9e` improves -- by 44.5%, more than the claim. So the paragraph above stands on the framing being useless in this profile, which is a property of the profile, and not on a size figure that is a property of a corpus and a compressor.
+
 ### Version History
 
 | Version | Description |
 |---------|-------------|
-| 6 | 24-byte header with `Profile` and whole-file `Compression` (§1a, §1b) and six reserved bytes that MUST be zero. Version 5's body, so §2's `MapBlock` forms are unchanged. NOT backward compatible, deliberately: the `FileEntry` array moves to `24 + R`, and a reader predating this version refuses the container at the version check rather than reading entries out of the reserved area (§1c). A writer emits 6 only for a container that uses one of the new fields. |
+| 6 | 24-byte header with `Profile` and whole-file `Compression` (§1a, §1b) and six reserved bytes that MUST be zero. At `Profile = 0` the body is version 5's, so §2's `MapBlock` forms are unchanged; at `Profile = 1` the body is the compact layout of §1d -- a directory and the members concatenated, with no block 0, no mapping block and no alignment. NOT backward compatible, deliberately: the `FileEntry` array moves to `24 + R`, and a reader predating this version refuses the container at the version check rather than reading entries out of the reserved area (§1c). A writer emits 6 only for a container that uses one of the new fields. |
 | 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 -- and 6, which is 5's body behind the extended header -- and MUST refuse every version they do not implement, naming it (§2, "Older versions are refused"; §1c). Writers MUST write 5 unless the container uses a version-6 field. |
 | 4 | Query protocol, network reader, replication, RAM cache, cached trace reader. Backward compatible: v4 readers accept v3 and v2 containers. |
 | 3 | 16-byte header with encryption; binary metadata; BlockSize 4096; MaxRootEntries 0 auto-fill; small file optimization; namespaces |
