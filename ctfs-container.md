@@ -494,6 +494,42 @@ reader gating on the bit could not read a stream that structurally exists in a
 still-recording trace. A reader resolves each optional stream by structural
 presence + `FileEntry.Size`, exactly as it follows live progress.
 
+### Durability: a writer publishes every sealed chunk
+
+A writer that writes a container to a file (not one that builds it in memory) MUST keep the file
+readable while it records, so that a recording whose process dies -- killed, crashed, out of
+memory -- leaves a container a reader opens and reads up to the last chunk it completed.
+Concretely:
+
+1. **At open**, before the first chunk of any stream is published, the writer writes block 0 and
+   `meta.dat`.
+2. **When a chunk of a Chunked Compressed Table seals** (§7: it reaches `chunk_size` records), the
+   writer writes, before the append that sealed it returns: the chunk's bytes to their data blocks,
+   every mapping slot or block that changed, the chunk's offset in the companion `.idx`, every
+   interning record registered so far (`paths`, `funcs`, `types`, `varnames`, `markers` and their
+   offset tables -- so that whatever the chunk refers to is readable), and then the root entries (`Size`,
+   `MapBlock`) of every member it grew -- in that order, data before the entry that publishes it
+   (§6, "Writer Protocol").
+3. **Within a chunk, buffering is allowed.** The records of a chunk that has not sealed may live
+   only in memory; a crash loses them, and nothing earlier.
+4. **Close-time members** -- `step-map.ns` and any other index built from the whole recording --
+   are written at close. A crashed container lacks them, and readers fall back as they do for any
+   container without one.
+5. **"Written" means handed to the operating system** (`write`/`pwrite`): it survives the death of
+   the process, not the loss of power. A writer need not `fsync`, at a seal or at close; a caller
+   that wants power-loss durability syncs the file itself.
+
+A writer MAY write more often than this -- the Nim writer historically wrote every append through
+-- but not less: the Rust writer kept every split stream in memory until `finish`, so a recording
+whose process died left nothing at all.
+
+**Cost (measured, `measurements/2026-10-format-efficiency.md` §"Durability").** Replaying the 1,042
+corpus recordings as a writer would emit them: writing each container once at close took 0.53 s in
+total; publishing at every seal as above, with no attempt to coalesce writes, took 3.30 s -- 2.8 s
+more for 202 MB and 5.6 million exec records, about 0.5 µs per exec record or 69 µs per seal, on a
+btrfs NVMe file system. Adding an `fdatasync` at every seal took 110 s, which is why rule 5 does not
+require one.
+
 ### Background Compression Writer
 
 An alternative pattern: multiple producer threads write to per-thread buffers, a single background thread compresses and writes to CTFS. Since only one thread does block allocation, `NextFreeBlock` can be a plain local counter (no atomic overhead).

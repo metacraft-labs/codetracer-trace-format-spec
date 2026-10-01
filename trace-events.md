@@ -77,6 +77,17 @@ One record per step, containing all variable values visible at that step. This i
 | 8 | VariableCell | variable_id: varint, place: varint |
 | 9 | Assignment | to: varint, pass_by: u8, from: varint |
 
+**Every tag in the table is part of the format.** Tags 1-8 carry the place model (bindings, cells,
+compound values and their updates) and tag 9 the assignment model; recorders reach them through
+the writer API (`bind_variable`, `register_cell_value`, `register_compound_value`,
+`assign_compound_item`, `assign_cell`, `register_variable` (`VariableCell`), `drop_variable`, `drop_variables`, `assign`), and the db-backend consumes
+them. A writer MUST be able to write every tag its API exposes, and a reader MUST decode tags 0-9.
+A writer that cannot represent an event its caller hands it MUST fail the call, not drop the event
+(§"Recorder Integration — A Failed Call Fails the Recording"). Until 2026-10 the Nim writer and
+reader handled only tags 0, 2, 3 and 9, so a container the Rust writer produced from a recorder
+that binds variables -- the Python recorder emits `BindVariable` -- did not open in the Nim reader,
+and the same recorder writing through Nim lost its bindings with a warning.
+
 The value stream is indexed in parallel with the execution stream — record N in `values.dat` corresponds to step N in `steps.dat`. For steps with no variables (possible), the record is empty (just a zero count).
 
 The materialized container stores the value stream as its own seekable CTFS file pair, `values.dat` + `values.idx`, because execution records and value records have fundamentally different sizes and chunking needs. It is gated additively behind the `meta.dat` capability flag `has_value_stream` (bit 10); readers that do not know the bit ignore `values.dat`/`values.idx`.

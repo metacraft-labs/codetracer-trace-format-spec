@@ -281,6 +281,12 @@ def main():
     stepmap_tables(out, an)
     meta_and_blocks(an)
     event_kinds(out)
+    p = f"{out}/durability.md"
+    if os.path.exists(p):
+        print("## Durability\n")
+        print("Replaying each recording as a writer would emit it; see `examples/durability.rs`. Times in ms, best of three, on btrfs over NVMe.\n")
+        print(open(p).read().rstrip())
+        print()
 
 
 if __name__ == "__main__":

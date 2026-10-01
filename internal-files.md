@@ -441,7 +441,8 @@ A step id is the step's **exec-record index**: its index in `steps.dat`, and so 
 value record in `values.dat`. Thread, raise/catch and source-reload records count, so the ids of a
 trace with thread switches are not consecutive. `path_id` and `line` are the coordinates the step
 was registered at (the `paths.dat` id and the line as registered, truncated to 32 bits), not its
-global line index.
+global line index -- except that a step registered at line `0` is keyed under line `1`, as it is
+recorded everywhere else (§"Global Line Index", "Line 0 is line 1, everywhere").
 
 ---
 
@@ -1311,6 +1312,20 @@ per line instead of one per column position, and `line = q + 1` inverts it.
 > allocated a fixed oversized stride, and becomes a wrong answer at every
 > file boundary the moment real line counts are used: with counts `[10, 10]`,
 > `(file 0, line 10)` encodes to `10`, which decodes to `(file 1, line 0)`.
+
+**Line 0 is line 1, everywhere.** A recorder may hand a writer line `0` -- some language runtimes
+report it for code that has no source line of its own. Line 0 is not a source line, and the
+encode above would put it one address below the file's base, in the previous file (or, for file
+0, at `2^64 - 1`). A writer therefore records a step, a function or any other location registered at
+line `0` as line `1` of the same file, in **every** member that carries the location: the
+`global_position_index` of `steps.dat` (line-only and column-aware alike), `funcs.dat`'s
+`global_line_index`, and the key of `step-map.ns`, whose `line` is the line *as recorded*, so `1`.
+A reader that resolves the address and a reader that looks the line up in `step-map.ns` then
+agree. Until 2026-10 the step stream recorded `1` while `step-map.ns` keyed the raw `0`, so a
+breakpoint on line 1 missed those steps and one on line 0 found steps the step stream placed on
+line 1. No line-only recording in the measurement corpus (288 step maps from 14 recorders) has a
+step at line 0, so the rule changes no measured trace; it settles what the writers already did in
+the address and did not do in the index. A writer MUST NOT refuse line 0.
 
 `line_count[k]` is the count `paths.dat` records for file `k` when
 `meta.dat` bit 14 is set (§"`paths.dat` line-count table"). A trace

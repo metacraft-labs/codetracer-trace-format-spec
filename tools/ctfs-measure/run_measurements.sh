@@ -41,6 +41,9 @@ BENCH_MS=60 node --no-warnings "$HERE/run_wasi.mjs" "$WASM" --dir "$OUT/analyze"
   stepmap "$OUT/analyze/stepmaps" > "$OUT/stepmap.wasm.tsv"
 "$BIN/examples/stepmap_sweep" "$OUT/analyze/stepmaps" > "$OUT/stepmap_sweep.txt"
 "$BIN/examples/event_kinds" "$CORPUS" "$OUT/corpus.list" > "$OUT/event_kinds.md"
+# Durability: the cost of publishing every sealed chunk (ctfs-container.md
+# §6). Needs a directory on a real file system (not tmpfs): DURABILITY_DIR.
+"$BIN/examples/durability" "$CORPUS" "$OUT/corpus.list" "${DURABILITY_DIR:-$OUT}" > "$OUT/durability.md"
 # (awk, not head: under pipefail, head closing the pipe early fails the sort.)
 sort -t$'\t' -k3 -n -r "$OUT/analyze/stepmap.tsv" | awk -F'\t' '$2=="v1" && n++ < 6 {print $1}' \
   | sed "s|^|$CORPUS/|" > "$OUT/stepmap_latency.list"

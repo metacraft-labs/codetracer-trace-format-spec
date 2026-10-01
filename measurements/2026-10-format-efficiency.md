@@ -483,6 +483,64 @@ Mapping blocks a container would not have under version 5's rules (one data bloc
 | ALL | 1017 | 964098 | 17184312 | 18059657 | +875345 B (+5.094%) | |
 
 
+### Durability
+
+What it costs a writer to keep its container readable while it records (`ctfs-container.md` §6,
+"Durability"). `examples/durability.rs` replays each recording as a writer emits it: every chunk of
+every chunked stream is a *seal*, interleaved by how far through its stream it lies, the other
+members growing in proportion. The same version 5 container is then written to a file on btrfs
+over NVMe in three ways: once at close (*buffered*); publishing at every seal the new bytes, changed
+mapping slots and root entries (*per-seal*, uncoalesced `pwrite`s); and per-seal with an
+`fdatasync` after each seal. Times are in ms, best of three.
+
+| corpus | containers | MB | seals | writes | buffered ms | per-seal ms | per-seal cost | per-seal+fsync ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| aiken-cardano | 20 | 1.5 | 22 | 740 | 5.4 | 9.1 | +3.7 ms (1.68x) | 30 |
+| aztec-avm | 10 | 5.0 | 16 | 1504 | 19.4 | 22.1 | +2.7 ms (1.14x) | 37 |
+| bash | 19 | 2.1 | 197 | 4667 | 6.0 | 25.3 | +19.3 ms (4.22x) | 262 |
+| beam-elixir | 16 | 1.2 | 21 | 683 | 3.1 | 7.3 | +4.2 ms (2.37x) | 28 |
+| beam-erlang | 20 | 19.7 | 15572 | 111381 | 51.4 | 571.1 | +519.6 ms (11.10x) | 20819 |
+| cadence-flow | 17 | 1.2 | 29 | 821 | 3.1 | 7.4 | +4.3 ms (2.39x) | 35 |
+| cairo | 39 | 2.7 | 39 | 1256 | 8.1 | 16.1 | +8.0 ms (1.98x) | 51 |
+| circom | 31 | 2.3 | 36 | 1200 | 6.2 | 13.7 | +7.6 ms (2.23x) | 47 |
+| gdscript | 19 | 1.9 | 130 | 3479 | 4.0 | 15.2 | +11.2 ms (3.82x) | 147 |
+| javascript | 23 | 11.1 | 7889 | 74780 | 46.2 | 394.7 | +348.5 ms (8.54x) | 10239 |
+| leo | 25 | 1.9 | 25 | 866 | 4.9 | 12.0 | +7.2 ms (2.48x) | 35 |
+| miden-masm | 31 | 2.4 | 52 | 1642 | 6.1 | 16.5 | +10.4 ms (2.72x) | 68 |
+| move | 26 | 2.2 | 57 | 1658 | 6.1 | 16.7 | +10.7 ms (2.75x) | 74 |
+| noir | 513 | 58.0 | 4151 | 72539 | 146.5 | 451.7 | +305.3 ms (3.08x) | 11858 |
+| php | 9 | 0.8 | 19 | 635 | 2.6 | 5.3 | +2.7 ms (2.07x) | 102 |
+| polkavm | 10 | 0.8 | 137 | 2077 | 2.1 | 8.6 | +6.5 ms (4.08x) | 598 |
+| python | 32 | 48.1 | 7804 | 83053 | 91.7 | 976.9 | +885.2 ms (10.65x) | 43475 |
+| ruby | 24 | 26.0 | 2065 | 39901 | 87.7 | 593.9 | +506.2 ms (6.77x) | 13022 |
+| solana | 15 | 1.2 | 106 | 2625 | 2.7 | 17.5 | +14.8 ms (6.49x) | 509 |
+| solidity-evm | 40 | 3.0 | 173 | 3567 | 6.7 | 19.8 | +13.1 ms (2.95x) | 730 |
+| sway-fuel | 22 | 1.9 | 244 | 3929 | 4.6 | 17.8 | +13.2 ms (3.86x) | 1078 |
+| tolk-ton | 25 | 1.9 | 29 | 965 | 3.8 | 8.7 | +4.9 ms (2.30x) | 164 |
+| wasm-wasmi | 10 | 0.7 | 10 | 326 | 1.6 | 3.3 | +1.8 ms (2.12x) | 55 |
+| wasm-wazero | 29 | 2.6 | 1222 | 13933 | 7.0 | 50.1 | +43.1 ms (7.14x) | 5646 |
+| zsh | 17 | 1.8 | 148 | 3754 | 5.4 | 22.8 | +17.4 ms (4.20x) | 777 |
+| ALL | 1042 | 202.1 | 40193 | 431981 | 532.4 | 3303.9 | +2771.5 ms (6.21x) | 109886 |
+
+Publishing at every seal costs 2.8 s across 202 MB and 5.6 million exec records: about 0.5 µs per
+exec record. A writer that coalesces each seal's writes would pay less. Syncing at every seal costs
+110 s, 200 times the buffered write, which is why the spec requires publication (survives a
+process crash) and not synchronisation (survives power loss).
+
+### `values.dat` event tags in the corpus
+
+`examples/value_tags.rs`, counts per corpus. Tags 0 (`StepValues`), 3 (`DropVariables`) and 9
+(`Assignment`) occur; tags 1 and 4-8 do not -- not because no recorder emits them, but because every
+corpus recording that would carry them was written through the Nim writer, which dropped them
+(the Python recorder emits `BindVariable` and logged "bind_variable records are dropped" on every
+run). The spec therefore keeps all ten tags, and both writers and readers must handle them
+(`trace-events.md` §"Value Stream").
+
+### Steps at line 0
+
+No step map in the corpus has a step at line 0: 288 maps, 14 line-only recorders. The line-0 rule
+(`internal-files.md` §"Global Line Index") changes no measured recording.
+
 ## Reproducing
 
 ```sh
