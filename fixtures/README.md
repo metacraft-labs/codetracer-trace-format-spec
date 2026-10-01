@@ -33,10 +33,13 @@ A small but representative CTFS container produced by the Nim `TraceWriter` API 
 
 ### Internal CTFS files
 
+Container version 5 (`ctfs-container.md` §1); every member here fits one block,
+so each `MapBlock` is its data block with the direct tag (§2).
+
 - `events.log` -- legacy unified event stream, compressed with seekable Zstd
 - `events.fmt` -- legacy stream format marker, the string `split-binary`
-- `meta.json` -- `{"recording_id":"<uuidv7>","program":"factorial","args":["5"],"workdir":"/home/user/demo"}`
-- `paths.json` -- `["/src/main.nim","/src/math_utils.nim"]`
+- `meta.dat` -- version 6 (`internal-files.md` §"Metadata (meta.dat)"): recording id, program, args, workdir; no path list
+- `paths.dat` / `paths.off` -- the two source paths, in id order
 
 This fixture predates the split-stream CTFS layout. Current materialized traces store execution records in `steps.dat`, values in `values.dat`, call records in `calls.dat`, and event-log records in `events.dat`, each with the corresponding companion index where the stream is chunked.
 
