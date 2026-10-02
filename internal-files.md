@@ -180,7 +180,7 @@ reader can resolve `global_position_index → (file, line, column)`:
 paths.dat record (column-aware traces):
   path_len:    varint
   path_bytes:  [u8] × path_len
-  line_count:  varint
+  line_count:  varint                     (0 = the conventional table; see below)
   line_lengths: [varint] × line_count    (zigzag-delta encoded from previous line)
 ```
 
@@ -223,7 +223,24 @@ Requirements:
     line `0` as line `1` (§"Global Line Index"), and refuses a line above
     `100000`.
   The two writers apply these rules identically, so recorders do not each
-  re-implement them. The cost of the conventional table is address space: a
+  re-implement them.
+
+  **The conventional table is written as `line_count = 0`**, with no
+  `line_lengths` after it: a one-byte record body instead of the 100,000
+  varints of the table spelled out (about 100 KB in an uncompressed member,
+  and 0.4-0.8 MB of memory in each writer, per file). `0` was never a valid
+  count -- a file of no positions is refused above -- so the value is free,
+  and it is the **only** encoding of the conventional table: a writer that
+  records it, whether by the fallback or because a recorder passed the same
+  100,000 × 1024 table itself, MUST write `0`, so two writers agree byte for
+  byte. A reader MUST decode `line_count = 0` as 100,000 lines of 1024
+  positions, and SHOULD hold it as that rule rather than as an array.
+  Recorders hit the fallback routinely -- the PolkaVM recorder registers every
+  program binary this way, and the JS and EVM recorders an `<unknown>` path --
+  so on a recording of a few hundred kilobytes the spelled-out table would have
+  been the largest member.
+
+  The cost of the conventional table that remains is address space: a
   file with it occupies about 10^8 positions, so files interned after it get
   longer absolute positions. A recorder SHOULD therefore give a file's real
   table whenever it can read the source, and give it **before** the file's
