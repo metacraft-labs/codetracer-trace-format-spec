@@ -1,15 +1,22 @@
 //! A minimal CTFS container reader (`ctfs-container.md` §1–§4).
 //!
-//! Reads every writer revision seen in the corpus: all of them give every
-//! member a level-1 mapping block, including empty members. A member whose
-//! `MapBlock` points directly at its data block (the small-file layout, §2) is
-//! recognised too, by `size <= BlockSize` together with the absence of a
-//! plausible mapping table, so the reader also handles containers written
-//! under the revised rule.
+//! Reads every writer revision seen in the corpus. Through container version 4
+//! every member has a level-1 mapping block, including empty ones; from version
+//! 5 a member of at most one block has no mapping block and its `MapBlock`
+//! carries §2's direct-block tag in bit 63.
+//!
+//! Which of the two a member uses is read from THE TAG. It used to be guessed
+//! from the bytes — see [`Container::direct_data_block`] for the guess, why §1c
+//! forbids it, and the version-5 containers it had already silently failed on.
 
 use std::fmt;
 
 pub const MAGIC: [u8; 5] = [0xC0, 0xDE, 0x72, 0xAC, 0xE2];
+
+/// `ctfs-container.md` §2, "Members of at most one block": bit 63 of a
+/// `FileEntry.MapBlock` tags it as naming the member's ONLY data block rather
+/// than its mapping block. Version 5 on.
+const DIRECT_TAG: u64 = 1 << 63;
 
 #[derive(Debug)]
 pub struct Error(pub String);
@@ -147,20 +154,34 @@ impl Container {
         Ok(u64::from_le_bytes(b[o..o + 8].try_into().unwrap()))
     }
 
-    /// Whether `e`'s `MapBlock` is the data block itself (small-file layout).
-    /// Every writer in the corpus allocates a mapping block, so this is only
-    /// true for containers written under the revised rule; it is decided by
-    /// whether slot 0 of the would-be mapping block is a plausible block
-    /// number, which a data block of text or compressed bytes almost never is.
-    fn is_direct(&self, e: &Entry) -> bool {
-        if e.size > self.block_size {
-            return false;
+    /// The data block `e`'s `MapBlock` names directly, or `None` when it names
+    /// a mapping block.
+    ///
+    /// **Decided by the TAG, which is the only thing that can decide it.**
+    /// `ctfs-container.md` §2 puts the direct-block tag in bit 63 of
+    /// `MapBlock`, and §1c says a reader MUST NOT "infer [a value] from the
+    /// container's contents".
+    ///
+    /// This function used to do exactly that inferring, and the comment it
+    /// carried said so: it decided "by whether slot 0 of the would-be mapping
+    /// block is a plausible block number, which a data block of text or
+    /// compressed bytes almost never is". "Almost never" is the whole problem —
+    /// it is a guess with a failure mode on both sides, and it had already
+    /// broken. On a container version 5 member the tagged `MapBlock` is
+    /// `0x8000_0000_0000_0005`; `self.ptr` of that is out of range and returns
+    /// `Err`, which the heuristic read as "direct" **by accident**, and then
+    /// `self.block` of the still-tagged value failed too — so every member of
+    /// every version-5 container failed to read, and the caller's `continue`
+    /// turned that into a measurement of nothing.
+    ///
+    /// The tag is unambiguous and free, and bit 63 is available because no real
+    /// block number reaches it: block `2^63` would begin `2^63 * BlockSize`
+    /// bytes in, past anything a 64-bit offset addresses.
+    fn direct_data_block(&self, e: &Entry) -> Option<u64> {
+        if e.map_block & DIRECT_TAG == 0 {
+            return None;
         }
-        let nblocks = (self.bytes.len() as u64).div_ceil(self.block_size);
-        match self.ptr(e.map_block, 0) {
-            Ok(p) => !(p > 0 && p < nblocks),
-            Err(_) => true,
-        }
+        Some(e.map_block & !DIRECT_TAG)
     }
 
     fn resolve(&self, e: &Entry, block_index: u64) -> Result<u64, Error> {
@@ -202,8 +223,22 @@ impl Container {
         if e.size == 0 {
             return Ok(Vec::new());
         }
-        if self.is_direct(e) {
-            let b = self.block(e.map_block)?;
+        if let Some(direct) = self.direct_data_block(e) {
+            // `ctfs-container.md` §2: the member's only data block, and the
+            // entry's `Size` is how much of it is the member. A declared size
+            // past one block contradicts the tag, so it is refused rather than
+            // truncated to a block -- a short member is a wrong answer the
+            // caller cannot detect, where a refusal is one it cannot miss.
+            if e.size > self.block_size {
+                return err(format!(
+                    "{}: direct-tagged but declares {} bytes, more than one {}-byte block holds",
+                    e.name, e.size, self.block_size
+                ));
+            }
+            let b = self.block(direct)?;
+            if (b.len() as u64) < e.size {
+                return err(format!("{}: short direct data block", e.name));
+            }
             return Ok(b[..e.size as usize].to_vec());
         }
         let bs = self.block_size;
@@ -247,7 +282,7 @@ impl Container {
 
     pub fn block_use(&self, e: &Entry) -> BlockUse {
         let data = e.size.div_ceil(self.block_size);
-        let direct = e.size > 0 && self.is_direct(e);
+        let direct = e.size > 0 && self.direct_data_block(e).is_some();
         let mapping = if direct {
             0
         } else {

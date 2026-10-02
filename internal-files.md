@@ -1209,6 +1209,27 @@ missing or malformed value. Rationale and migration roadmap:
   `events.dat` record's kind the recorder's exact `EventLogKind`
   (`trace-events.md` § "EventLogKind (u8 enum)").
 
+  **`flags_ext = 0` is valid at v6, and a reader MUST NOT refuse it.**
+  Spelled out because it is v5's rule reversed, and a reader that carried
+  v5's forward would refuse the common case. At v5 the word exists ONLY
+  because a bit is set, so a zero word there is a writer that emitted a
+  version it did not need, and refusing it is what keeps "the version says
+  the word is there" from decaying into "the word is always there". At v6
+  the word is unconditional -- that is the whole of what "one header
+  length" means -- so a recording with no extended capability carries
+  `flags_ext = 0`, and most recordings do. The two rules are not in tension:
+  each says the word's presence is decided by the version and never guessed
+  from its value.
+
+  **A v6 reader also needs the container's version 5 body**, in practice if
+  not in principle: the two moved in the same revision, and every v6
+  `meta.dat` in the corpus sits inside a version-5 container, whose members
+  of at most one block carry `ctfs-container.md` §2's direct-block tag. A
+  reader that admitted this schema without that form would refuse at the
+  container layer instead, which is a correct refusal on a different field
+  and reads like an unrelated failure. `ctfs-container.md` §2, "The container
+  version is one gate of several", is the general statement.
+
 ### Extended Fields (flags bitmask)
 
 **Flag bit 0 -- MCR fields.** When set, the block below follows

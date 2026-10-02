@@ -33,12 +33,44 @@ struct Meta {
     path_list_bytes: usize,
 }
 
-fn parse_meta(b: &[u8]) -> Option<Meta> {
-    if b.get(0..4)? != b"CTMD" {
-        return None;
+/// The last `meta.dat` schema whose body carries the `paths_count` + `paths[]`
+/// block after `recorder_id`. From version 6 `paths.dat` is the only list of
+/// source paths and the block is ABSENT -- not empty, so there is no count
+/// varint to consume (`internal-files.md` §"Metadata (meta.dat)", v6).
+const META_PATH_LIST_LAST_VERSION: u16 = 5;
+
+/// The highest `meta.dat` schema whose body this tool implements.
+const META_MAX_VERSION: u16 = 6;
+
+/// Parse a `meta.dat` header far enough to fill [`Meta`].
+///
+/// **Returns `Err` for a schema it does not implement, rather than `None`.**
+/// It used to return `None` from a dozen `?`s, which the caller spelled
+/// `.ok().and_then(parse_meta)` and then reported as `meta_version 0` -- a
+/// version that does not exist, in a column a report reads. `ctfs-container.md`
+/// §1c forbids exactly that shape ("treat an unknown scheme as `none`"), and
+/// measured on a version-6 container it was already happening: with no MCR
+/// block set, the bytes after `recorder_id` are the END of the payload, the
+/// unconditional path-count read ran off the buffer, and the row said 0.
+fn parse_meta(b: &[u8]) -> Result<Meta, String> {
+    let missing = || "meta.dat: truncated header".to_owned();
+    if b.get(0..4).ok_or_else(missing)? != b"CTMD" {
+        return Err("meta.dat: bad magic bytes".to_owned());
     }
-    let version = u16::from_le_bytes(b[4..6].try_into().ok()?);
-    let flags = u16::from_le_bytes(b[6..8].try_into().ok()?);
+    let version = u16::from_le_bytes(b[4..6].try_into().map_err(|_| missing())?);
+    if version > META_MAX_VERSION {
+        return Err(format!(
+            "meta.dat: schema version {version} is not supported; this tool reads up to \
+             {META_MAX_VERSION}"
+        ));
+    }
+    parse_meta_body(b, version).ok_or_else(|| {
+        format!("meta.dat: schema version {version} header did not parse (truncated or not the layout this version declares)")
+    })
+}
+
+fn parse_meta_body(b: &[u8], version: u16) -> Option<Meta> {
+    let flags = u16::from_le_bytes(b.get(6..8)?.try_into().ok()?);
     let mut p = 8;
     let mut flags_ext = 0;
     if version >= 5 {
@@ -60,11 +92,21 @@ fn parse_meta(b: &[u8]) -> Option<Meta> {
     }
     skip_str(&mut p)?; // workdir
     skip_str(&mut p)?; // recorder_id
+    // The path list, through `META_PATH_LIST_LAST_VERSION` only. Branching on
+    // the VERSION and not on a length, because a v6 body's next varint is
+    // whatever the flags say follows -- or nothing at all -- and a small
+    // plausible number read as a path count consumes the MCR block as path
+    // strings before failing somewhere unrelated to the cause.
     let start = p;
-    let pc = get_u(b, &mut p)?;
-    for _ in 0..pc {
-        skip_str(&mut p)?;
-    }
+    let pc = if version <= META_PATH_LIST_LAST_VERSION {
+        let pc = get_u(b, &mut p)?;
+        for _ in 0..pc {
+            skip_str(&mut p)?;
+        }
+        pc
+    } else {
+        0
+    };
     Some(Meta {
         version,
         flags,
@@ -173,7 +215,13 @@ fn label_for(p: &Path, corpus_root: Option<&Path>) -> String {
 
 fn load(p: &Path, root: Option<&Path>) -> Result<(Trace, Container, Option<Meta>), String> {
     let c = Container::open(p).map_err(|e| e.to_string())?;
-    let meta = c.read("meta.dat").ok().and_then(|b| parse_meta(&b));
+    // A `meta.dat` this tool cannot parse is a REFUSAL, not an absent one: the
+    // output has meta_* columns, so a container whose header did not parse
+    // would contribute wrong numbers rather than no numbers.
+    let meta = match c.read("meta.dat") {
+        Ok(b) => Some(parse_meta(&b)?),
+        Err(_) => None,
+    };
     let column_aware = meta.as_ref().is_some_and(|m| m.flags & (1 << 4) != 0);
     let (recs, stats) = load_steps(&c)?;
     let (mut marks, ncalls) = load_calls(&c, recs.len());
@@ -224,6 +272,107 @@ fn write_pack(path: &Path, chunks: &[Vec<u8>], records: u64, positions: u64) {
     std::fs::write(path, out).unwrap();
 }
 
+/// How a corpus sweep ended, per input, so that a sweep over a corpus NOTHING
+/// can read is distinguishable from a sweep over no corpus at all.
+///
+/// # Why this type exists
+///
+/// Both sweeps below used to `continue` past an input they could not load —
+/// `analyze` after an `eprintln!` whose stream `run_measurements.sh` redirects
+/// into a log nothing reads, and `stepmap_latency` with no message at all. The
+/// binary then exited 0 having written header-only TSVs, the report rendered a
+/// report of nothing, and the shell script's `set -euo pipefail` could not help
+/// because nothing had failed.
+///
+/// That is the same defect, in the same campaign, as a reader probe that cannot
+/// tell "the reader is absent" from "the reader is present and refusing": a
+/// missing input and an unreadable one have different remedies, and collapsing
+/// them loses the remedy along with the finding. So there are THREE outcomes
+/// here, and the one in the middle is fatal:
+///
+/// * `not_a_container` — no CTFS magic. The conformance kit's ASCII
+///   placeholders are these, legitimately, and they are reported and skipped.
+/// * `no_step_stream` — a container that READ, and carries no `steps.dat`.
+///   This tool measures the step encoding, so such a container is outside its
+///   scope rather than beyond its reach: the events.log-shaped bundles are
+///   these. Reported and skipped, and kept apart from the row below because
+///   "I read it and there is nothing here to measure" and "I could not read
+///   it" have different remedies, which is the distinction this whole type is
+///   for.
+/// * `refused` — a container this tool could not decode. **A finding.** The
+///   tool's reader is in this repository, so an input it cannot read is either
+///   a format revision this reader has not followed or a corrupt artefact, and
+///   both want someone's attention rather than a silent omission.
+/// * `measured` — decoded, and in the output.
+#[derive(Default)]
+struct Census {
+    measured: usize,
+    not_a_container: Vec<String>,
+    no_step_stream: Vec<String>,
+    refused: Vec<(String, String)>,
+}
+
+impl Census {
+    fn record(&mut self, path: &Path, outcome: Result<(), String>) {
+        match outcome {
+            Ok(()) => self.measured += 1,
+            Err(e) if e.contains("not a CTFS container") => {
+                self.not_a_container.push(path.display().to_string());
+            }
+            // Matched on the member NAME rather than on a generic "not found",
+            // so a missing `steps.dat` stays a scope statement while a missing
+            // `meta.dat` or a short mapping block stays a finding.
+            Err(e) if e == "no member steps.dat" || e == "no member steps.idx" => {
+                self.no_step_stream.push(path.display().to_string());
+            }
+            Err(e) => self.refused.push((path.display().to_string(), e)),
+        }
+    }
+
+    /// Print the census and EXIT NON-ZERO if anything was refused, or if a
+    /// non-empty corpus produced no measurement at all.
+    ///
+    /// Exits rather than returning a flag because every caller is the end of
+    /// `main` and a flag is a thing a caller can drop. Exit code 3 is "the
+    /// corpus did not resolve", distinct from a panic's 101.
+    fn verdict(&self, what: &str, total: usize) {
+        eprintln!(
+            "{what}: {} of {total} inputs measured, {} not containers, {} without a step stream, \
+             {} refused",
+            self.measured,
+            self.not_a_container.len(),
+            self.no_step_stream.len(),
+            self.refused.len()
+        );
+        for p in &self.not_a_container {
+            eprintln!("  not a container (no CTFS magic), skipped: {p}");
+        }
+        for p in &self.no_step_stream {
+            eprintln!("  read, but carries no steps.dat (outside this tool's scope), skipped: {p}");
+        }
+        for (p, e) in &self.refused {
+            eprintln!("  REFUSED by this tool's own reader: {p}: {e}");
+        }
+        if !self.refused.is_empty() {
+            eprintln!(
+                "{what}: FAILED — {} input(s) are containers this tool could not read. A \
+                 measurement taken with those omitted is a measurement of a different corpus, so \
+                 this is an error and not a note. Fix the reader (tools/ctfs-measure/src/ctfs.rs) \
+                 or re-record the input; do NOT re-run with them removed from the list.",
+                self.refused.len()
+            );
+            std::process::exit(3);
+        }
+        if total > 0 && self.measured == 0 && self.no_step_stream.len() < total {
+            eprintln!(
+                "{what}: FAILED — a corpus of {total} input(s) produced zero measurements. \
+                 Header-only output is not a result."
+            );
+            std::process::exit(3);
+        }
+    }
+}
+
 fn analyze(out: &Path, root: Option<&Path>, files: &[PathBuf]) {
     std::fs::create_dir_all(out.join("packs")).unwrap();
     let mut t_tr = tsv(
@@ -246,11 +395,15 @@ fn analyze(out: &Path, root: Option<&Path>, files: &[PathBuf]) {
         "stepmap.tsv",
         "trace\tcandidate\tsteps\tlines\tpaths\tstored_bytes\tdirectory_bytes\tsynth",
     );
+    let mut census = Census::default();
     for (n, f) in files.iter().enumerate() {
         let (tr, c, meta) = match load(f, root) {
-            Ok(x) => x,
+            Ok(x) => {
+                census.record(f, Ok(()));
+                x
+            }
             Err(e) => {
-                eprintln!("skip {}: {e}", f.display());
+                census.record(f, Err(e));
                 continue;
             }
         };
@@ -447,6 +600,7 @@ fn analyze(out: &Path, root: Option<&Path>, files: &[PathBuf]) {
             tr.recs.len()
         );
     }
+    census.verdict("analyze", files.len());
 }
 
 /// Times `f` until at least `min_ms` have elapsed, returning ns per call.
@@ -476,9 +630,17 @@ fn stepmap_latency(out: &Path, root: Option<&Path>, files: &[PathBuf]) {
         "stepmap_latency.tsv",
         "trace\tcandidate\tinflater\tsteps\tlines\tstored_bytes\topen_ns\tall_hits_ns_mean\tall_hits_ns_hottest\tnext_hit_ns_mean\tnext_hit_ns_hottest\tcold_breakpoint_ns\tload_all_ns",
     );
+    let mut census = Census::default();
     for f in files {
-        let Ok((tr, _, _)) = load(f, root) else {
-            continue;
+        let tr = match load(f, root) {
+            Ok((tr, _, _)) => {
+                census.record(f, Ok(()));
+                tr
+            }
+            Err(e) => {
+                census.record(f, Err(e));
+                continue;
+            }
         };
         let Some((sm, _)) = &tr.stepmap else { continue };
         if sm.steps() == 0 {
@@ -642,6 +804,7 @@ fn stepmap_latency(out: &Path, root: Option<&Path>, files: &[PathBuf]) {
         }
         eprintln!("latency {}", tr.label);
     }
+    census.verdict("stepmap-latency", files.len());
 }
 
 fn main() {

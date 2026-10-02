@@ -424,6 +424,38 @@ not entries -- and both are refusals, so the rule holds in both directions once 
 "not one it implements". §1c carries the newer-version half, with the incident that makes it
 normative.
 
+**The container version is one gate of several, and it is not the gate that decides.** Stated here
+because the opposite reading is natural and has been acted on: that a reader's accepted container
+versions are *the* compatibility statement, so widening them admits the containers they name. They
+are not. A container's members carry their own independently versioned schemas -- `meta.dat`'s
+(`internal-files.md` §"Metadata (meta.dat)"), `step-map.ns`'s, and whatever a later member adds --
+and a reader has a separate accepted set for each. §1c's rule is per FIELD: refuse a `Version`,
+a `Profile`, a `Compression` or a member schema the reader does not implement, naming the one that
+is wrong.
+
+Two consequences, and the second is the one that costs time if it is not written down:
+
+1. **A reader must name the field it is refusing on.** "Unsupported version" without saying *which*
+   version -- the container's or a member's -- sends the reader of the diagnostic to the wrong
+   field. A reader that admits a container version and then meets an unimplemented `meta.dat`
+   schema must say `meta.dat`, and in particular must not report the member as *missing*: "absent"
+   and "present at a schema I do not read" are the different facts §1c is about, one field down.
+2. **Widening one accepted set does not widen another, and may change nothing at all.** The two
+   versions move together in practice -- each revision that changes the body tends to change a
+   member schema -- so a corpus at an older container version is usually also at an older member
+   schema, and admitting its container version leaves it refused one layer in. MEASURED over the
+   173 containers of the workspace this document is maintained in, at the 2026-10 revision: 136 at
+   container version 3 or 4, every one of them carrying `meta.dat` schema 3, 4 or 5 or no
+   `meta.dat` at all; 24 at container version 5, every one carrying schema 6; no counterexample in
+   either direction. So a reader that widened its container set to admit the older corpus would
+   have changed the refusal message on all 136 and the outcome on none of them.
+
+   The corollary is the one worth acting on: **"the reader refuses our corpus" does not by itself
+   identify the gate to move.** Measure which field refuses, per container, before changing any
+   accepted set -- and, since a gate that admits a version commits the reader to its body, measure
+   that the admitted bodies decode CORRECTLY and not merely that `open` succeeds. §1c's incident is
+   exactly a body that parsed and was wrong.
+
 **Measured effect.** See `measurements/2026-10-format-efficiency.md` §"Small and empty members":
 across 1,042 recordings, the mapping blocks of members that never outgrow one block, and of empty
 members, are 27.4% of all container bytes, and the median container is half that size without them.
