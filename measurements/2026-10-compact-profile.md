@@ -167,3 +167,138 @@ for f in tmp_compact_container_layout/full.ct concat_stored.bin concat_raw.bin; 
     "$(xz -9e -c "$f" | wc -c)"
 done
 ```
+
+---
+
+# CCP-4: the writer's threshold, and a container whose members are genuinely raw
+
+Added 2026-10-02 when the profile-choosing writer landed. Everything above is about a compact
+container built by CONVERTING a full one, whose members therefore still carry the full container's
+per-member zstd frames -- the finding recorded as "a compact container's members are NOT raw today".
+The containers below are the first ones written compact from the start, so they are the first
+measurement of the raw-member representation that is not a reconstruction of it.
+
+Produced by `codetracer-trace-format-nim/tests/test_profile_threshold_choice.nim` through
+`src/codetracer_profile_writer.nim`. Reproduce with:
+
+```bash
+cd codetracer-trace-format-nim
+nix develop --command bash -c \
+  'CCP4_KEEP_FIXTURES=1 nim c -r -d:release -p:src tests/test_profile_threshold_choice.nim'
+# leaves tmp_profile_threshold_choice/ with both containers of every pair
+```
+
+## C: a 12,000-event recording, written both ways
+
+Paths, steps and calls; 17 members in neither case -- five, since this writer's member set is
+`events.log`, `events.fmt`, `meta.dat`, `paths.dat`, `paths.off`. The two files are the SAME
+recording: `raw_members_compact.ct` is the compact profile with raw members, `raw_members_full.ct`
+is the full profile with the writer's ordinary chunked zstd.
+
+| quantity | COMPACT (raw members) | FULL (per-member zstd) |
+|---|---|---|
+| container at rest | 204,582 | 61,440 |
+| sum of member payloads | 204,434 | 33,858 |
+| zstd frame magics in the whole image | **0** | 3 |
+| `gzip -9` | 36,471 | 33,797 |
+| `zstd -19` | **22,886** | 33,507 |
+| `xz -9e` | **20,624** | 34,004 |
+| `brotli -q 11` | **23,463** | 33,462 |
+
+`events.log` in the compact container is 203,741 bytes and is byte-identical to the full container's
+own `events.log` with all three of its chunks inflated and concatenated -- asserted, not assumed, so
+"raw" means *the bytes the other profile would have compressed* rather than *the bytes this writer
+chose to emit*.
+
+### The arithmetic rule from the campaign's RESOLVED section reproduces, and it predicts the gzip reversal
+
+The rule is that raw-plus-one-shot pays if and only if the one-shot ratio exceeds the per-member
+ratio. This container's per-member ratio is 204,434 / 33,858 = **6.04x**. Applying the rule per
+compressor, against the compact rows above:
+
+| compressor | one-shot ratio on the raw image | vs 6.04x per-member | predicted | measured |
+|---|---|---|---|---|
+| `gzip -9` | 204,434 / 36,471 = 5.61x | below | raw loses | raw loses, 7.9% worse |
+| `zstd -19` | 204,434 / 22,886 = 8.93x | above | raw wins | raw wins, 31.7% better |
+| `xz -9e` | 204,434 / 20,624 = 9.91x | above | raw wins | raw wins, 39.3% better |
+| `brotli -q 11` | 204,434 / 23,463 = 8.71x | above | raw wins | raw wins, 29.9% better |
+
+Four for four, including the sign. This is a sixth container and the first non-reconstructed one,
+and the rule holds on it -- which is worth more than another win, because the rule is what the
+campaign actually decided on and a sample that only confirmed the conclusion would not have tested
+it. The per-member ratio here is 6.04x, between the five production traces' 3.1x--6.1x and
+container A's 9.30x, and the outcome is correspondingly between them: raw wins under three
+compressors and loses under the one whose 32 KiB window cannot see across a 204 KB payload.
+
+### FINDING: brotli is NOT best in every row here. `xz -9e` beats it by 12%
+
+The campaign's RESOLVED section records brotli as "best in EVERY row" of its tables. On this
+container it is not: `xz -9e` is 20,624 against brotli's 23,463, 12.1% smaller, and `zstd -19` at
+22,886 also beats it. Brotli is still comfortably better than `gzip -9` (23,463 against 36,471,
+35.7%) and it is still the right choice, but the reason is the browser-transparency column and not
+a size win it does not have on this sample. Recorded because "best in every row" is the kind of
+claim a reader will quote, and on a sixth container it is false. This is a SYNTHETIC recording, so
+it is a second sample rather than a refutation of the five production traces -- the same caveat
+container A carries, and the same reason the benchmark milestone must keep both populations.
+
+## D: the boundary, and the three figures a publisher needs
+
+A recording 6 bytes under the 1 MiB default threshold (61,675 identical steps, chosen so the raw
+size is 1,048,570) written both ways. It is the most compressible recording this writer can produce,
+which is what makes it the extreme case rather than a typical one.
+
+| quantity | COMPACT (raw members) | FULL (per-member zstd) |
+|---|---|---|
+| container at rest | 1,048,670 | 16,384 |
+| `gzip -9` | 2,763 | 358 |
+| `zstd -19` | 268 | 280 |
+| `xz -9e` | 432 | 360 |
+| `brotli -q 11` | **192** | 285 |
+
+**At rest the compact container is 64x larger. Served under `brotli`, it is 33% smaller.** Both
+figures are of the same two files. This is the clearest available statement of why the three sizes
+-- at rest, on the wire, and as the loader sees it -- have to be reported separately: the compact
+profile's raw members are a bet on the serving path, and a compact archive that is NOT stored
+pre-compressed is strictly worse than a full container on every axis except load-path simplicity.
+`ctfs-container.md` §1e says so normatively; this is the measurement behind it.
+
+Note also that `gzip -9` is 14x worse than `brotli -q 11` on the compact row (2,763 against 192)
+while being only 1.26x worse on the full row. A 1 MB payload of a 17-byte repeating record is
+exactly what a 32 KiB window handles badly, and it is the same mechanism as container A's reversal
+seen on a corpus where raw still wins overall.
+
+## E: the threshold's unit, measured
+
+Two recordings of EQUAL raw size and very different compressibility: 4,700 plain `Step` events each,
+79,995 raw bytes each (17 bytes per step plus the 95-byte `meta.dat` + `events.fmt` preamble). One
+emits the same step every time; the other takes `pathId` and `line` from a fixed xorshift PRNG. Both
+reach a 65,536-byte threshold at the same event and at the same measured size, 65,545 bytes.
+
+| | total raw bytes | compressed by the writer's own chunked zstd | raw-byte rule at 65,536 | compressed-size rule at 65,536 |
+|---|---|---|---|---|
+| every step identical | 79,995 | 54 | full | compact |
+| pseudo-random steps | 79,995 | 78,441 | full | full |
+
+The compressed sizes are **1,452x apart** for the same raw size. A raw-byte threshold classifies the
+two identically, which is the property §1e requires; a compressed-size threshold splits them. The
+table is the control: without it the arm asserting "same path" would pass on either implementation.
+
+## Reproducing the CCP-4 compression tables
+
+The four compressed columns are taken from the kept fixtures with the CLI tools, so nothing in them
+depends on the test binary. `brotli` is not in this repo's dev shell and is fetched for the reading:
+
+```bash
+cd codetracer-trace-format-nim/tmp_profile_threshold_choice
+nix shell nixpkgs#brotli --command bash -c '
+printf "%-30s %10s %10s %10s %10s %10s\n" file at-rest gzip-9 zstd-19 xz-9e brotli-11
+for f in raw_members_compact.ct raw_members_full.ct boundary_under.ct boundary_under_oracle.ct; do
+  printf "%-30s %10d %10d %10d %10d %10d\n" $f $(stat -c %s $f) \
+    $(gzip -9 -c $f | wc -c) $(zstd -19 -q -c $f | wc -c) \
+    $(xz -9e -c $f | wc -c) $(brotli -q 11 -c $f | wc -c)
+done'
+```
+
+Taken twice, on two separate runs of the test, byte-identical both times -- the recordings are
+generated from a written-out xorshift PRNG with a fixed seed precisely so that a compressed size can
+be quoted at all.
