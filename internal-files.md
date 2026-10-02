@@ -206,8 +206,9 @@ Requirements:
   rather than finalize the container.
 * **Every Layout A record carries a non-empty table, and a file's table is
   fixed by its first registration.** A writer MUST refuse, naming the path, a
-  column-aware registration whose table is empty (the file would have
-  `file_size` 0, `trace-events.md` §"Per-File Contiguous Integer Ranges"), and
+  column-aware registration whose table is empty or sums to `0` (either way
+  the file would have `file_size` 0, `trace-events.md` §"Per-File Contiguous
+  Integer Ranges"), and
   a registration that names an already-interned path with a table different
   from the one recorded -- including a table offered for a path first interned
   without one. Returning the existing id silently, as both writers did, hid a
@@ -215,6 +216,12 @@ Requirements:
   its table: the file was recorded with no table, and every later position in
   it resolved into the next file. (The Python recorder did exactly this from
   2026-09-30 until `e573455`.)
+* **A file that exists but holds nothing** -- an empty `__init__.py`, whose
+  one line has no bytes -- is registered with the table `[1]`: one line with
+  one position, so its own column 1 is addressable and its size is not `0`.
+  (Lines of `0` positions elsewhere in a table are allowed -- a blank line
+  in a recorder that does not add the one-past-EOL position -- since only the
+  file's total size must be non-zero.)
 * **A file whose source the recorder cannot read** -- a frozen module, code
   compiled from a string -- is registered with the conventional table:
   `100000` lines of `1024` positions each, the column-aware counterpart of the
