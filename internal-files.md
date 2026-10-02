@@ -204,36 +204,40 @@ Requirements:
   state a layout its own first record is not in. A writer MUST refuse
   that — at the opt-in, or at close if the opt-in has no way to fail —
   rather than finalize the container.
-* **Every Layout A record carries a non-empty table, and a file's table is
-  fixed by its first registration.** A writer MUST refuse, naming the path, a
-  column-aware registration whose table is empty or sums to `0` (either way
-  the file would have `file_size` 0, `trace-events.md` §"Per-File Contiguous
-  Integer Ranges"), and
-  a registration that names an already-interned path with a table different
-  from the one recorded -- including a table offered for a path first interned
-  without one. Returning the existing id silently, as both writers did, hid a
-  recorder that interned a file through a step or a call before registering
-  its table: the file was recorded with no table, and every later position in
-  it resolved into the next file. (The Python recorder did exactly this from
-  2026-09-30 until `e573455`.)
-* **A file whose lines hold nothing** -- an empty `__init__.py`, whose one
-  line has no bytes, or a file of blank lines only -- gives its first line one
-  position: `[0]` is registered as `[1]` and `[0, 0]` as `[1, 0]`, keeping the
-  line count. Its column 1 on line 1 is then addressable and its size is not
-  `0`.
-  (Lines of `0` positions elsewhere in a table are allowed -- a blank line
-  in a recorder that does not add the one-past-EOL position -- since only the
-  file's total size must be non-zero.)
-* **A file whose source the recorder cannot read** -- a frozen module, code
-  compiled from a string -- is registered with the conventional table:
-  `100000` lines of `1024` positions each, the column-aware counterpart of the
-  line-count table's `100000` ceiling (§"`paths.dat` line-count table"). A step
-  on such a file whose column exceeds `1024` is recorded at column `1024` of
-  its line, as a line `0` is recorded as line `1` (§"Global Line Index"); a step
-  whose line exceeds `100000` is refused, as under bit 14. The cost is address
-  space: such a file occupies about 10^8 positions, so files registered after it
-  get longer absolute positions. A recorder SHOULD therefore register a file it
-  can read whenever it can, and use the fallback only where no source exists.
+* **Every Layout A record carries a table of non-zero size, and a file's table
+  is fixed when the file is first interned.** In a column-aware trace a path
+  is interned by its first mention -- an explicit registration, or a step, a
+  function, a call or an id request that names it -- and its table is decided
+  then, by the **writer**:
+  - a table the caller gives is recorded as given, except that a table whose
+    lines hold nothing (all zero, including `[0]` for an empty file) gives its
+    first line one position (`[0]` becomes `[1]`, `[0, 0]` becomes `[1, 0]`),
+    so that the file's size is not `0` (`trace-events.md` §"Per-File
+    Contiguous Integer Ranges");
+  - an empty table, or no table at all (the path was first mentioned by a
+    step, a function, a call or an id request), records the **conventional
+    table**: `100000` lines of `1024` positions each, the column-aware
+    counterpart of the line-count table's `100000` ceiling (§"`paths.dat`
+    line-count table"). On a file with the conventional table the writer
+    records a column above `1024` at column `1024` of its line, as it records
+    line `0` as line `1` (§"Global Line Index"), and refuses a line above
+    `100000`.
+  The two writers apply these rules identically, so recorders do not each
+  re-implement them. The cost of the conventional table is address space: a
+  file with it occupies about 10^8 positions, so files interned after it get
+  longer absolute positions. A recorder SHOULD therefore give a file's real
+  table whenever it can read the source, and give it **before** the file's
+  first mention.
+* **A table offered after the file was interned is refused unless it is the
+  table already recorded.** The file's size fixed the base of every file
+  interned after it, and positions already written depend on those bases, so a
+  later, different table cannot be honoured. A writer MUST refuse it, naming
+  the path, and fail the call. Returning the existing id silently, as both
+  writers did, hid a recorder that mentioned a file in a step or a call before
+  registering its table: the file kept a table that did not describe it, and
+  positions in it resolved to the wrong lines. (The Python recorder did exactly
+  this from 2026-09-30 until `e573455`; a 2026-10 survey found the same
+  ordering in the JS, Solana and PolkaVM recorders.)
 * **Readers MUST decode a Layout A record whole.** The record's length
   is known from `paths.off`, so `path_len`, the path, `line_count` and
   exactly `line_count` line lengths MUST consume it with nothing left
