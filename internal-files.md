@@ -216,9 +216,11 @@ Requirements:
   its table: the file was recorded with no table, and every later position in
   it resolved into the next file. (The Python recorder did exactly this from
   2026-09-30 until `e573455`.)
-* **A file that exists but holds nothing** -- an empty `__init__.py`, whose
-  one line has no bytes -- is registered with the table `[1]`: one line with
-  one position, so its own column 1 is addressable and its size is not `0`.
+* **A file whose lines hold nothing** -- an empty `__init__.py`, whose one
+  line has no bytes, or a file of blank lines only -- gives its first line one
+  position: `[0]` is registered as `[1]` and `[0, 0]` as `[1, 0]`, keeping the
+  line count. Its column 1 on line 1 is then addressable and its size is not
+  `0`.
   (Lines of `0` positions elsewhere in a table are allowed -- a blank line
   in a recorder that does not add the one-past-EOL position -- since only the
   file's total size must be non-zero.)
