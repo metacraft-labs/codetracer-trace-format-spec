@@ -204,6 +204,27 @@ Requirements:
   state a layout its own first record is not in. A writer MUST refuse
   that — at the opt-in, or at close if the opt-in has no way to fail —
   rather than finalize the container.
+* **Every Layout A record carries a non-empty table, and a file's table is
+  fixed by its first registration.** A writer MUST refuse, naming the path, a
+  column-aware registration whose table is empty (the file would have
+  `file_size` 0, `trace-events.md` §"Per-File Contiguous Integer Ranges"), and
+  a registration that names an already-interned path with a table different
+  from the one recorded -- including a table offered for a path first interned
+  without one. Returning the existing id silently, as both writers did, hid a
+  recorder that interned a file through a step or a call before registering
+  its table: the file was recorded with no table, and every later position in
+  it resolved into the next file. (The Python recorder did exactly this from
+  2026-09-30 until `e573455`.)
+* **A file whose source the recorder cannot read** -- a frozen module, code
+  compiled from a string -- is registered with the conventional table:
+  `100000` lines of `1024` positions each, the column-aware counterpart of the
+  line-count table's `100000` ceiling (§"`paths.dat` line-count table"). A step
+  on such a file whose column exceeds `1024` is recorded at column `1024` of
+  its line, as a line `0` is recorded as line `1` (§"Global Line Index"); a step
+  whose line exceeds `100000` is refused, as under bit 14. The cost is address
+  space: such a file occupies about 10^8 positions, so files registered after it
+  get longer absolute positions. A recorder SHOULD therefore register a file it
+  can read whenever it can, and use the fallback only where no source exists.
 * **Readers MUST decode a Layout A record whole.** The record's length
   is known from `paths.off`, so `path_len`, the path, `line_count` and
   exactly `line_count` line lengths MUST consume it with nothing left
