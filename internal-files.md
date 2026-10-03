@@ -721,15 +721,12 @@ Implementations: `codetracer-native-recorder/ct_recorder/src/ct_recorder/snapsho
 > producer in the workspace writes `cp.dat` / `cp.off`; the design below is
 > unimplemented.  The MCR recorder's periodic checkpoints are FULL snapshots in
 > five member kinds: `cpidx.idx` (`count: u32`, then `id: u32` per checkpoint),
-> `cpidx_full.idx` (`count: u32`, then `(id: u32, geid: u64)` per checkpoint),
+> `cpidxall.idx` (`count: u32`, then `(id: u32, geid: u64)` per checkpoint),
 > `cpdata.bin` (concatenated `(id: u32, geid: u64, n: u32, (tid: u32, tick: u64)[n])`
 > records, raw, no page data), `cpN.mem` (the memory, as a compressed snapshot
 > payload — above) and `cpN.regs` (`(tid: u32, len: u32, bytes[len])*`).  There
 > is no incremental chain and no delta encoding.  `Multi-Core-Recorder.md`
-> §12.3-§12.4 states the same.  (`cpidx_full.idx` is 14 characters and `_` is not
-> in the base40 alphabet, so its 12-character key decodes as `cpidx<NUL>full.i`;
-> readers that look members up by encoded key find it, readers that compare
-> decoded names do not.)
+> §12.3-§12.4 states the same.
 
 MCR checkpoints are packed as a variable-size record table. Each checkpoint record contains register state, thread ticks, and page data (full pages or byte-level deltas against the parent checkpoint).
 
