@@ -460,7 +460,11 @@ size, no checksum, no dictionary. A trace with no steps carries the 26-byte head
 **Reading.** A reader that wants the whole map -- the db-backend builds `(path, line) -> ids` at
 open -- inflates the chunks in order and decodes the records. A reader that wants one line
 binary-searches the chunk table for the last chunk whose first key is not above the target,
-inflates that chunk alone and scans it. A reader MUST refuse, by name, a step map whose decoded
+inflates that chunk alone and scans it. **A lookup of line `0` is a lookup of line `1`.** A step
+registered at line `0` is keyed under line `1` (below), so the steps a caller asking for line `0`
+means are filed there; a reader answers `(path_id, 0)` with line 1's ids, as the address resolver
+answers line 1 for those steps, and never with an empty answer that a key no writer stores would
+give. A reader MUST refuse, by name, a step map whose decoded
 counts disagree with the header, a chunk whose first record's key is not its table key, keys that
 do not ascend strictly, a `count`, `gap` or `repeat` of `0`, runs whose repeats overshoot `count`,
 or a frame that does not decode to its declared size: each is a map that would answer some
@@ -1420,7 +1424,8 @@ line `0` as line `1` of the same file, in **every** member that carries the loca
 `global_position_index` of `steps.dat` (line-only and column-aware alike), `funcs.dat`'s
 `global_line_index`, and the key of `step-map.ns`, whose `line` is the line *as recorded*, so `1`.
 A reader that resolves the address and a reader that looks the line up in `step-map.ns` then
-agree. Until 2026-10 the step stream recorded `1` while `step-map.ns` keyed the raw `0`, so a
+agree, and a `step-map.ns` lookup of line `0` is answered as line `1` (§"`step-map.ns`",
+"Reading"). Until 2026-10 the step stream recorded `1` while `step-map.ns` keyed the raw `0`, so a
 breakpoint on line 1 missed those steps and one on line 0 found steps the step stream placed on
 line 1. No line-only recording in the measurement corpus (288 step maps from 14 recorders) has a
 step at line 0, so the rule changes no measured trace; it settles what the writers already did in
