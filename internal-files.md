@@ -631,7 +631,7 @@ The payload classes, by LOGICAL name:
 | `cp.<kind>.cas` | that boundary's page-CAS hash stream (`MCR-Memory-Page-CAS.md` §3.3) |
 | `cppages.ns` | the trace's page-CAS page store (§5.1) |
 | `cp0.mem`, `cpN.mem` | a full memory snapshot, `(addr: u64, size: u64, bytes[size])*` — the initial one, or periodic checkpoint `N` |
-| `t_start.mem` | the macOS recording-start snapshot (same framing as `cp0.mem`) |
+| `tstart.mem` | the macOS recording-start snapshot (same framing as `cp0.mem`) |
 
 Each is stored as a record-size-**1** table: every record is one byte, so
 `chunk_size` is the number of payload BYTES per chunk (the recorder uses
