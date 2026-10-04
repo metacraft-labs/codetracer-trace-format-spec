@@ -409,6 +409,9 @@ the last holds exactly `chunk_size` records. The smaller value and call chunks k
 The interning tables and `meta.dat` are stored uncompressed. `step-map.ns` compresses its own
 lists (§"`step-map.ns`").
 
+In a compact container (`ctfs-container.md` §1d) these chunks, and `step-map.ns`'s, are stored as
+their decompressed content, the index offsets locating the content (`ctfs-container.md` §1f).
+
 ### `step-map.ns`
 
 The `(path_id, line)` to step-id index a reader answers a line breakpoint, a "run to line" or a
@@ -1761,3 +1764,4 @@ the git history of `codetracer-trace-format-spec`.
 |---|---|
 | 2026-09-30 | **Snapshot payloads: a payload that fits in one block is stored raw** (`MCR-Memory-Page-CAS.milestones.org` CAS-D1).  "Snapshot payloads (MCR recorder)" gains a normative writer rule: a snapshot payload of at most `block_size` bytes (4096) is stored in the raw form under its logical name, one of more than `block_size` in the compressed form; the threshold is on the uncompressed length, so the choice needs no trial compression.  A compressed form costs at least four blocks (data and index members, each with a block-map block) and two root entries where a one-block raw member costs two blocks and one entry, so compression cannot shrink such a payload.  No reader change: the raw form is the legacy form every reader already resolves, told apart by which members exist.  Measured cause: on a Windows `fx_small` page-CAS trace the boundary-A `cp.prein.cas` (1 228 bytes compressed) occupied four blocks for a ~1.5 KB payload, the two blocks that tied a page-CAS trace with the compressed legacy trace it replaces. |
 | 2026-10-01 | **Format-efficiency revision** (`measurements/2026-10-format-efficiency.md`). `meta.dat` version 6: no path list, `paths.dat` is the only list of source paths, and `flags_ext` is always present. `step-map.ns` version 2: keys delta-coded, step-id gaps run-length-coded, zstd chunks of about 64 KiB behind an uncompressed chunk table; 81 times smaller than version 1 on the corpus. Together with container version 5 (`ctfs-container.md` §2), the normative step-encoding rule and the exact `EventLogKind` in `events.dat` (`trace-events.md`). |
+| 2026-10-04 | **Framed members in a compact container** (`ctfs-container.md` §1f). A chunked compressed table, `step-map.ns` and a seekable-zstd stream keep their format in a compact container with every frame replaced by its decompressed content and every offset that located a frame locating that content; nothing else in the member changes, so a compact container is a function of the full container of the same recording. A writer may write the full profile throughout and convert at close, its threshold measured on the compact members' lengths (§1e). |
