@@ -63,3 +63,31 @@ expressions and locks require fresh identity qualification. Required platform
 CI remains mandatory; Unix construction does not prove native Windows hook or
 compiler support. Preserve all existing CI platforms, tests, flags, timing
 thresholds and producer pins.
+
+## Native installer import and Bash authority
+
+At owning `68d32331d1b017ac5c2ab873d952c42b72558553` plus the reviewed thirteen
+postimages, the final owning exported shell environment causes the explicitly
+selected pre-commit 4.5.1 wrapper to report 4.3.0. Clearing inherited
+`PYTHONPATH`, `PYTHONHOME` and `NIX_PYTHONPATH` for the same executable reports
+4.5.1. The original owning install-positive control failed its exact native
+body census, and rollback correctly refused unknown produced bodies. This
+version-only contrast establishes an import-authority mismatch, not runtime
+qualification of the proposed fix.
+
+Confine those three import variables only for the genuine native installer
+child. Preserve caller environment for guards, managed reconciliation and all
+original tests. The native factory and installer must use the same declared
+owning Git and Bash principals when generating complete hook bodies, including
+the Bash shebang; add owning Bash to the real factory closure and prefix the
+installer child with the passed exact Git/Bash executable directories. Do not
+change the upstream installer bytes, configuration, arguments or body checks.
+
+Retain failed transactions and their unsafe rollback receipts. Any recovery
+must first qualify every actual produced hook, configuration, source and index
+against genuine constructors and the saved snapshot, then restore only fully
+known postimages. Unknown additions, modes or bodies prevent restoration.
+Requalify the original owning install-positive and both foreign no-write
+oracles plus fresh/reentry/linked/refusal/rollback controls at the final source
+identity before owning adoption. This amendment grants no native Darwin or
+monitor-complete acceptance.
