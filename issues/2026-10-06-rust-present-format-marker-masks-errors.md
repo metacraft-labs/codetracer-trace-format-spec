@@ -13,7 +13,7 @@ codetracer_trace_reader::ctfs_reader::detect_format converts read_file errors to
 
 ## Expected
 
-[internal-files.md](../internal-files.md) declares events.fmt authority. Genuine marker absence can retain the legacy selection; a present invalid marker is not evidence of absence.
+Not specified explicitly for events.fmt in the current published format documents. Proposed: [rust-checked-finalized-reader-seam.md](../rust-checked-finalized-reader-seam.md) distinguishes genuine marker absence from present invalid marker data. Preserve legacy selection for actual absence and report malformed present markers; this proposal does not claim an existing normative marker rule.
 
 ## Evidence
 
