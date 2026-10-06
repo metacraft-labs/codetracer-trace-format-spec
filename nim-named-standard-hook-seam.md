@@ -91,3 +91,44 @@ Requalify the original owning install-positive and both foreign no-write
 oracles plus fresh/reentry/linked/refusal/rollback controls at the final source
 identity before owning adoption. This amendment grants no native Darwin or
 monitor-complete acceptance.
+
+# TraceNim canonical text storage preserves strong fixture oracles
+
+At owning68d32331 plus approved root-layout/reader/native-hook source,
+actual canonical full-file gate36366 failed and changed fixture formatting.
+The original Godot readers require40/63 physical lines; canonical EOF removal
+changed them to39/62. The JSON golden is an exact byte oracle for Nim's
+`pretty(..., indent=2)` renderer. Prettier compact arrays and EOF additions
+preserve decoded JSON but change the genuine bytes, so semantic JSON equality
+cannot qualify that original assertion. Preserve the failed formatter log and
+all pre/postimages. Do not normalize the test comparison or regenerate an
+expectation from changed production output.
+
+Append one shared final Godot comment to the two formatted fixtures. Preserve
+all preceding code lines, function locations and original40/63 counts, all23
+inserted block lines and original LCS/source-view assertions. The final comment
+is a truthful fixture-source change, not a historical byteidentity claim.
+
+Store the exact original5acf0adb94c4f8332ee455f6be936a4115152146a5dffc8387805b93d26c34fb
+JSON golden bytes in canonical text hex at `ct_print_full.json.hex`. Prove its
+full decoded byte equality against actual original68d committed golden before
+adoption. Remove the original JSON storage file and change only golden I/O to
+encode/decode that text. Preserve the original `actual != expected` comparison,
+all document assertions, actual renderer, explicit write mode and existing
+first-run creation behavior. Malformed hex must fail loudly. The default test
+must read the committed decoded oracle; no parsed-JSON normalization, fake
+expected output, formatter exclusions or source compiler substitutions.
+
+Qualify the full named set on the final source, actual exact-golden positive
+and genuine changed-byte malformed/unequal controls, original Godot/LCS/source
+view gates and full unchanged original native corpus including FFI/TLS/no-lock,
+original lint/shipping and final typed actions/monitor/quota/current-platform
+CI. Existing monitor incompleteness remains explicit; source formatting alone
+is not native or monitor acceptance. Preserve source-dependent fingerprint and
+complete native tool principals and source guards.
+
+
+The preserved Godot predecessor above is the reviewed formatted fixture,
+including the already-qualified tab-to-two-space indentation repair. It is
+not a claim of byte identity with the committed68d Godot files. Complete
+private strong-oracle controls precede owning adoption of this amendment.
