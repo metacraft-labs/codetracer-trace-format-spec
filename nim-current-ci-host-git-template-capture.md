@@ -1,0 +1,5 @@
+# Current Trace host Git template capture authority
+
+At Trace b402841, Linux x64 and ARM CI use /usr/bin Git while the current helper admits only immutable Nix Git and refuses before source capture. The exact source-qualified read-only host capability already present in Adapters is composed into Trace with its own preimage and controls. The host executable must be exactly /usr/bin/git, its resolved executable/exec-path and complete template source captured before the initialization probe and revalidated afterward. Every initialized hook body/mode, source/index/config and ordinary checkout identity remains guarded. Unknown inventory, hidden entries, body/mode/config/source mutations and hooksPath still refuse without owning writes. No hook body is admitted or migrated by this diagnostic.
+
+Private Trace clone controls must exercise the final entire helper under its selected real Nix Git, with initial source timestamps and actual refusals and lifecycle guards. Such controls do not claim native /usr/bin execution where absent. New exact-head hosted CI must establish actual host Git/template images before any owning migration authority.
