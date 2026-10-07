@@ -1,0 +1,7 @@
+# Native Windows typed ct-print cannot read C headers
+
+At producer ae0781373070db05c4ac6386fde3885f34ac7479, PR21 Windows x64 job112989555211 has passed complete locked Nim dependency acquisition and original module imports, but original ct-print GCC compilation exits1: crossing_state.c lines18/19 report codetracer_crossing_state.h and string.h Invalid argument; generated Nim C similarly reports nimbase.h Invalid argument. Raw trace-ae078-windows-x64-job.log lines684–690 retains exact commands including original project/Nim include prefixes.
+
+The approved [native compiler/header diagnostic contract](../nim-native-windows-compiler-header-io-diagnostics.md) preserves the original build and qualifies actual files/images through real failure-only probes. The current failure is distinct from the resolved missing-results source input and relative caller authority failures. It does not establish absent headers, wrong compiler image, permissions, monitoring cause or a defect in the adjacent Linux766 engine. Released Windows binary/source correspondence and actual typed-versus-SDK image remain explicit gaps. Original full native Windows qualification is blocked; no stub, skip, profile alias or monitor opt-out is accepted.
+
+Specification latest b5abb045ec6d9e95769573abc51dcca18b351c5c was synchronized; current open records and deleted issue history/commit subjects were searched. Existing constructor issue only mentions old Windows GCC symptoms without this measured current compilation boundary.
