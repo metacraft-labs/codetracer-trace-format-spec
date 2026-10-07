@@ -1,0 +1,21 @@
+# Explicit owning Zstd inputs for typed Nim compilation
+
+At published Trace ea955f, macOS job112812394332 successfully acquires the constructor and invokes its declared Clang, then refuses compilation because zstd.h is missing. The scoped action has the repository include path, but the existing locked Zstd development output is not a compiler input. This proposal preserves all existing pins and original source/assertions.
+
+The owning Nix shell exports CT_ZSTD_INCLUDE_DIR and CT_ZSTD_LIB_DIR from the already selected pkgs.zstd.dev/out. On Unix, the owning typed recipe requires absolute values and passes them explicitly to both ct-print/shared producer helpers and every original unittest compilation. Helpers retain default empty parameters for existing consumers; they do not discover environment or change Windows paths. Declared headers/library directory become extraInputs, while public CLI arguments carry -I, -L and the existing Unix linker -Wl,-rpath mechanism. The binding still supplies its original -lzstd. Original PCRE flags remain appended independently. Every original unittest compile also receives the already declared platform backend identity (Clang on Darwin, GCC on Linux), matching the producer helpers.
+
+Before adoption, qualify full lowered argument ordering against frozen766 publicCliCall and original ct-test extraPassC/extraPassL APIs; verify all original flags and actions remain, exact locked Zstd derivation/output/header/library identities are observed, and existing compiler/tool principals stay unchanged. Genuine missing-header/library negatives must fail, while declared-prefix originals compile/link and execute. Linux controls are component evidence only. Actual Darwin current-head CI must exercise native Clang and Zstd linkage; no Linux-to-Darwin acceptance transfer. Windows provisioning remains unchanged and independently incomplete.
+
+No ambient NIX_CFLAGS_COMPILE/LDFLAGS, header fallback, compiler alias, new package pin, monitor/quota bypass, golden regeneration or test exclusion is permitted. Scope is a private source proposal until review and genuine qualification; the owning source remains ea955f unchanged.
+
+## Superseding reviewed component status
+
+The preceding proposal was substantively reviewed before exact owning implementation and qualified on Linux with original full native/lint/typed collections and genuine compiler refusal controls. The component is normally published as ac06faf4719d8c995ae4c3bab43765d2e1b1b947; this durable normative file is published subsequently and does not claim an earlier specs-mainline receipt. Darwin/platform qualification remains incomplete. The prior proposal scope is historical, not a statement that owning source is still ea955f.
+
+## Provider bootstrap export contract
+
+Actual ac06 Mac startup refuses missing absolute Zstd paths before compiling ct-print. The owning locked flake already exports CT_ZSTD_INCLUDE_DIR/CT_ZSTD_LIB_DIR. The existing workflow starts that genuine owning shell to expose its declared non-SIP Bash, then starts setup-dev-env/repro exec in a later step. Expose the two existing declared inputs from that SAME owning-shell step through GITHUB_ENV before provider graph construction. Preserve the strict recipe assertion, complete compiler arguments/input declaration, actual selected platform compiler and locked Zstd derivations. No ambient header/lib fallback, pin advance or provider changes.
+
+The source change only adds validation and export of the two known owning-shell variables. Validate immutable store prefixes, real header/library directory, no newline/path injection, and bind actual selected header/library hashes in private controls. Missing/relative outputs must fail before provider/action execution. Preserve all current selectors/actions/non-Windows/native/monitor/quota and constructor/guard diagnostic limits; no broad shell environment or stderr uploaded.
+
+Private same-source owning-shell exported-input and provider graph/ct-print/original full gate qualification is required. Linux proof does not qualify Darwin. New current Darwin CI must execute the actual selected owning compiler and Zstd header/link inputs. Existing healthy jobs must drain before any source push.
