@@ -792,8 +792,9 @@ Before the split streams, a container carried the whole recording as one stream 
 format:
 
 - A writer MUST NOT write `events.log` or `events.fmt`.
-- A reader MUST refuse a container that carries either member, naming it, and MUST NOT read the
-  rest of such a container as if the member were absent. A container written that way is a legacy
+- A reader MUST refuse a container whose root directory has an entry for either member, whatever its
+  size, naming it, before it reads any stream; it MUST NOT read the rest of such a container as if
+  the member were absent. A container written that way is a legacy
   recording, and a reader that half-read it would show a trace with its steps missing.
 
 The refusal is the whole of a reader's obligation: no reader decodes the old stream, and there is no

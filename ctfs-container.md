@@ -700,6 +700,31 @@ following covers every reader that exists today. A future consumer that genuinel
 needs a single cross-stream frontier value from the `.ct` would motivate a
 deliberate, versioned in-container addition — not a sidecar.
 
+**Following a container (normative for a reader that offers it).** A reader that follows a
+container being written refreshes it; a refresh:
+
+1. Re-reads the root directory: every entry's `Size`, then its `MapBlock`. A member that has
+   appeared since the last refresh is readable from now on -- a stream created lazily, `calls.dat`
+   and the close-time members (`step-map.ns`, `spantype.ns`, `linehits.tc`, `corrmark.ns`) once the
+   writer has closed.
+2. Extends each chunked stream it has opened by the index entries published since: the readable
+   records are those of the chunks the index publishes. Every published chunk but the last ends at
+   the next entry's offset; the last ends at the end of its Zstandard frame (in a compact container,
+   at the end of the member), never at the data member's `Size`, because a writer may already have
+   written part of the next chunk (§7, "Writer Protocol").
+3. Picks up the growth of the interning tables, whose records the newly published chunks may refer
+   to (§"Durability" rule 2 publishes them first).
+
+After a refresh, the reader answers exactly what a fresh open of the container at that moment
+would. A refresh SHOULD NOT decode again a chunk it has already decoded, and SHOULD NOT read
+again the members it has already read beyond their new bytes; what a refresh costs should grow with
+what is new, not with the recording.
+
+A refresh MUST refuse, naming the member, and keep answering from its previous state, when the
+container has changed in a way no writer produces: a member's `Size` that decreased; a root entry
+whose name changed; a stream whose `chunk_size` changed; a published index entry that changed or
+disappeared; offsets that decrease; or a last offset past the data member's `Size`.
+
 **Stream presence is structural, not flag-gated.** The same principle governs
 *whether* a stream exists, not only how much of it is readable. Whether a trace
 carries `steps.dat` / `spans.dat` / any optional stream is answered by

@@ -4,50 +4,44 @@ Binary `.ct` fixture files for validating trace format implementations against t
 
 ## minimal_trace.ct
 
-A small but representative CTFS container produced by the Nim `TraceWriter` API (`codetracer-trace-format-nim`). It uses split-binary encoding with seekable Zstd compression.
+A small but representative split-stream container, written by the Nim split-stream writer
+(`codetracer-trace-format-nim`, `multi_stream_writer.nim`). It reproduces byte for byte: the
+recording id is fixed.
 
-### Events contained (in order)
+### What it records
 
-| # | Event kind | Details |
-|---|-----------|---------|
-| 0 | Path | `/src/main.nim` (pathId 0) |
-| 1 | Path | `/src/math_utils.nim` (pathId 1) |
-| 2 | Function | `main` at pathId 0, line 1 (functionId 0) |
-| 3 | Step | pathId 0, line 1 |
-| 4 | Call | functionId 0, no args |
-| 5 | Step | pathId 0, line 3 |
-| 6 | Step | pathId 0, line 4 |
-| 7 | Value | variableId 1, Int(42) typeId 7 |
-| 8 | Step | pathId 1, line 10 |
-| 9 | Value | variableId 2, String("hello") typeId 9 |
-| 10 | Return | None value |
+- Paths: `/src/main.nim` (path 0), `/src/math_utils.nim` (path 1).
+- Types: `int` (type 0), `string` (type 1). Variable names: `x` (0), `msg` (1).
+- Function `main` at `/src/main.nim:1` (function 0).
+- A call of `main`, then four steps: `/src/main.nim` lines 1, 3 and 4, and `/src/math_utils.nim`
+  line 10. Step 2 carries `x = 42` (int), step 3 carries `msg = "hello"` (string).
+- A return with no value.
 
 ### Metadata
 
-- **recording_id**: UUIDv7 minted at fixture generation time (M-REC-1).
-  Pre-1.0 the value is not stable across regenerations; M-REC-12 will
-  freeze a well-known constant.
+- **recording_id**: `0192f8a0-0000-7000-8000-000000000001`
 - **program**: `factorial`
 - **args**: `["5"]`
 - **workdir**: `/home/user/demo`
 
 ### Internal CTFS files
 
-Container version 5 (`ctfs-container.md` §1); every member here fits one block,
-so each `MapBlock` is its data block with the direct tag (§2).
+Container version 5 (`ctfs-container.md` §1); every member here fits one block, so each `MapBlock`
+is its data block with the direct tag (§2).
 
-- `events.log` -- legacy unified event stream, compressed with seekable Zstd
-- `events.fmt` -- legacy stream format marker, the string `split-binary`
-- `meta.dat` -- version 6 (`internal-files.md` §"Metadata (meta.dat)"): recording id, program, args, workdir; no path list
-- `paths.dat` / `paths.off` -- the two source paths, in id order
+- `paths.dat`/`.off`, `funcs.dat`/`.off`, `types.dat`/`.off`, `varnames.dat`/`.off` -- the interning
+  tables (`internal-files.md` §"Interning Tables")
+- `steps.dat`/`.idx`, `values.dat`/`.idx`, `calls.dat`/`.idx`, `events.dat`/`.idx` -- the runtime
+  streams (`trace-events.md`); `events.dat` is empty
+- `meta.dat` -- version 6: recording id, program, args, workdir
+- `step-map.ns` -- the breakpoint index, written at close
 
-This fixture predates the split-stream CTFS layout. Current materialized traces store execution records in `steps.dat`, values in `values.dat`, call records in `calls.dat`, and event-log records in `events.dat`, each with the corresponding companion index where the stream is chunked.
+It has no `events.log` or `events.fmt`: those members are not part of the format, and a reader
+refuses a container that carries them (`trace-events.md` §"Removed members").
 
 ### How it was generated
 
 ```
 cd codetracer-trace-format-nim
-nim c -r tests/generate_spec_fixture.nim fixtures/minimal_trace.ct
+nim c -r -p:src tests/generate_spec_fixture.nim fixtures/minimal_trace.ct
 ```
-
-The generator source is at `codetracer-trace-format-nim/tests/generate_spec_fixture.nim`. It uses `newTraceWriter` with `chunkThreshold = 64` (all events fit in a single chunk).
