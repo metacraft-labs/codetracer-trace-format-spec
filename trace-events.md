@@ -148,6 +148,12 @@ value is its streaming CBOR. A writer whose API spells "no value" as a none
 value (the Rust `TraceWriter`'s `ValueRecord::None`) writes the marker for it,
 so the same call reads back the same way from either writer.
 
+**A call that exits by an exception** carries the exception value, as streaming CBOR, in
+`raised_exception`, and the VoidReturn marker as its `return_value`: it returned nothing. A writer
+records it with an operation of its own (`register_return_exception`), which closes the innermost
+open call exactly as a return does and is refused when no call is open. Every other call has a
+zero-length `raised_exception`.
+
 **`call_key` is not stored in the record.** It is the record's position in
 `calls.dat`, which is what makes the stream addressable by it.
 

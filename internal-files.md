@@ -595,9 +595,16 @@ metadata:           (key: string, value: string) x metadata_count, in emission o
 ```
 
 A reader MUST refuse a record that is truncated, has bytes left over after its last field, sets an
-unknown `flags` or `structural` bit, has a `status` above 2, has `span_id` 0, or is open with a
-nonzero `end_wall_ns` or `end_step`. A writer MUST refuse to write those, and also a record that is
+unknown `flags` or `structural` bit, has a `status` above 2, has `span_id` 0, is open with a
+nonzero `end_wall_ns` or `end_step`, or carries a string that is not valid UTF-8 (the same holds for
+the names in `spantype.ns`). A writer MUST refuse to write those, and also a record that is
 not external but carries external strings, since they would be lost.
+
+**When the members are created.** `spans.dat` and then `spans.idx` are added to the container when
+the first span is registered, after `meta.dat` (which is written before the first record), so their
+place among the members is fixed by when that first span arrives. `spantype.ns` is added at close,
+after the last chunk is sealed and before `step-map.ns`. Neither writer stamps `meta.dat` bit 13: the
+members are found by presence.
 
 **Append-only, last record wins.** A writer appends an open record (flags.open) when a span starts
 and a record with the same `span_id` when it ends; nothing is rewritten. The settled view of the
@@ -634,15 +641,16 @@ member.
 A host that runs an embedded VM records each entry into the VM as a span of type the host names
 (e.g. `native-vm`), so that `[start_step, end_step]` bound the steps executed inside the VM frame
 (`nested-trace-correlation.md` §1). Writers mint the crossing's `span_id` themselves — 1, 2, 3, …
-per container, from a counter separate from the ids recorders give `register_span` — so a recorder
-must not mix the two in one container.
+per container, from a counter separate from the ids recorders give `register_span`. The two would
+collide under last-record-wins, so a recording that opens crossings MUST NOT also register spans of
+its own; a writer is not required to detect the mix.
 
 `begin_crossing(span_type)` appends, and immediately flushes, an open record: `span_id` the next
 minted id, `parent_span_id` 0, flags open, status unknown, every wall time, `process_ord` and
-`thread_id` 0, `start_step` the number of steps recorded so far (the id of the first step inside
-the crossing), `end_step` 0, `label` empty, structural bits 0 and 1 set, no metadata.
+`thread_id` 0, `start_step` the number of exec records written so far, after the writer has written any step it
+was holding back (so the id of the first step inside the crossing), `end_step` 0, `label` empty, structural bits 0 and 1 set, no metadata.
 `end_crossing(span_id)` appends, and flushes, the settled record: the same fields with flags 0,
-status ok, and `end_step` the last step recorded (the step count minus one, or 0 when there is
+status ok, and `end_step` the last exec record written (their count minus one, or 0 when there is
 none). Crossings nest and close innermost first: `end_crossing` of anything but the innermost open
 crossing is an error, and writes nothing. A crossing still open at close stays open in the stream.
 
