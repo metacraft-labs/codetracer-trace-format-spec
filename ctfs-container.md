@@ -750,7 +750,7 @@ Concretely:
 2. **When a chunk of a Chunked Compressed Table seals** (§7: it reaches `chunk_size` records), the
    writer writes, before the append that sealed it returns: the chunk's bytes to their data blocks,
    every mapping slot or block that changed, the chunk's offset in the companion `.idx`, every
-   interning record registered so far (`paths`, `funcs`, `types`, `varnames`, `markers` and their
+   interning record registered so far (appended when it was registered: "Block placement" below) (`paths`, `funcs`, `types`, `varnames`, `markers` and their
    offset tables -- so that whatever the chunk refers to is readable), and then the root entries (`Size`,
    `MapBlock`) of every member it grew -- in that order, data before the entry that publishes it
    (§6, "Writer Protocol").
@@ -776,6 +776,49 @@ total; publishing at every seal as above, with no attempt to coalesce writes, to
 more for 202 MB and 5.6 million exec records, about 0.5 µs per exec record or 69 µs per seal, on a
 btrfs NVMe file system. Adding an `fdatasync` at every seal took 110 s, which is why rule 5 does not
 require one.
+
+### Block placement: the container is a function of the recording
+
+Two writers given the same recording write the same container file, byte for byte, block placement
+included. A writer claims a block only by appending to a member (§5), and each append claims blocks
+as §2 and §4 lay them out -- a member's first block direct, then on growth its level-1 mapping block
+before the new data blocks, then chained levels -- so the file is determined by the sequence of
+appends. A split-stream writer appends exactly as follows, and in no other order:
+
+1. **At open**, before any record: the root region; the members `paths.dat`, `paths.off`,
+   `funcs.dat`, `funcs.off`, `types.dat`, `types.off`, `varnames.dat`, `varnames.off`, `steps.dat`,
+   `steps.idx`, `values.dat`, `values.idx`, `calls.dat`, `calls.idx`, `events.dat`, `events.idx`, in
+   that order (creating a member claims nothing); record 0's offset, eight zero bytes, appended to
+   `paths.off`, `funcs.off`, `types.off` and `varnames.off`, in that order; then the index header
+   appended to `steps.idx`, `values.idx`, `calls.idx` and `events.idx`, in that order.
+2. **When a value is interned** (a path, a type, a variable name, a correlation-marker label): its
+   record is appended to the table's `.dat` (nothing for an empty record), then its end offset to the
+   `.off`. `markers.dat` and `markers.off` are created at the first label, and `markers.off` gets its
+   record-0 offset then.
+3. **A function record** is appended as soon as it and every function with a lower id have a
+   registered declaration path: at its registration when its path is registered, otherwise right
+   after the record of the path that registers it, in id order.
+4. **`meta.dat`** is created and written at the recording's first record (anything other than an
+   interning registration).
+5. **A chunk**: when a chunk seals, its bytes are appended to its `.dat`, then its index entry to its
+   `.idx`. An exec record and its value record are appended when the step is complete, exec record
+   first, so a step that seals both streams appends the `steps.dat` chunk and entry, then the
+   `values.dat` chunk and entry. A call record is appended when it and every call with a lower key
+   have returned; an I/O event record when it is registered; a span chunk seals at its record limit
+   or at a flush (`internal-files.md` §"`spans.dat` / `spans.idx` / `spantype.ns`").
+6. **At close**, in this order: `meta.dat`, if no record was made; the remaining function records,
+   each registering its declaration path as in 3; the trailing partial chunks of `calls.dat`,
+   `steps.dat`, `values.dat` and `events.dat`, in that order, each followed by its index entry; the
+   span stream's last chunk, then `spantype.ns`; `srcviews.dat` / `srcviews.off`; `step-map.ns`;
+   `linehits.tc`; `corrmark.ns`.
+
+A writer in memory appends in the same order, and its container is the same bytes as the file the
+same recording gives.
+
+When a writer hands bytes to the operating system, and when it stores root entries, does not change
+where the bytes go: rule 3 of "Durability" (buffering within a chunk) and "A writer MAY write more
+often" stand. What is fixed is the order of appends, not the timing of I/O. The partial last block
+of a member is zero beyond its `Size`.
 
 ### Background Compression Writer
 

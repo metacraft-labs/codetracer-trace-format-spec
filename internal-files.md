@@ -52,6 +52,13 @@ Deduplicated records using the variable-size record table pattern. A `.dat` file
 | Types | `types.dat` | `types.off` | kind: u8, lang_type_len: varint, lang_type: bytes, specific_info: binary |
 | Functions | `funcs.dat` | `funcs.off` | global_line_index: varint, name_len: varint, name: bytes |
 
+**A function record is written as soon as it can be.** It needs its declaration path's id, so it is
+appended once it and every function with a lower id have a registered declaration path -- at
+registration, or right after the path record that registers it -- and the rest at close
+(`ctfs-container.md` §6, "Block placement", rules 3 and 6). Writing every function at close, as one
+writer did, left a recording killed mid-run with call records that named functions absent from
+`funcs.dat`.
+
 **A function's `global_line_index` is a LINE address, in every trace, including a column-aware one.**
 The column extension re-interprets the address carried by *step* records -- `trace-events.md`
 §"Source Location Addressing" scopes it to step events throughout, and §"Pre-extension traces" talks
