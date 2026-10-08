@@ -1309,6 +1309,12 @@ Fields (varint-prefixed):
 
 The flag-gated blocks of §"Extended Fields (flags bitmask)" follow `recorder_id`.
 
+**Every text field of `meta.dat` is UTF-8**, here and in the flag-gated blocks. A writer MUST refuse
+text that is not -- a program, argument or working directory that the host's operating system
+handed over as arbitrary bytes included -- rather than store it, and a reader MUST refuse a
+`meta.dat` that carries such text. The interning tables (`paths.dat`, `funcs.dat`, `types.dat`,
+`varnames.dat`, `markers.dat`) are different: they hold the bytes they were given.
+
 **`meta.dat` carries no path list (version 6).** A trace's source paths are the
 records of `paths.dat` (+ `paths.off`, §"Interning Tables"), in id order, and
 nothing else. Versions 3 to 5 also wrote every path into `meta.dat`, after
