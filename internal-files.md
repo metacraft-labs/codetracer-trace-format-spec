@@ -662,8 +662,10 @@ location address -- the `global_position_index` the step record carries -- with 
 distinct address. The entry's payload is the ids of the steps recorded at that address, ascending,
 each a varint, back to back. Every exec record that is a step records a hit, with its exec-record
 index as its id (§"`step-map.ns`"). A reader resolves a key to its descriptor and decodes the
-varints in `[payload_offset, payload_offset + payload_len)`; a payload outside the member, or one
-that does not decode to whole varints, is refused. `step-map.ns` answers the same question for
+varints in `[payload_offset, payload_offset + payload_len)`; a payload outside the member, a varint
+longer than 10 bytes, or a payload that does not decode to whole varints, is refused. Every step
+record -- absolute, delta and column delta -- records a hit at the address it decodes to. The member
+is written at close, after `step-map.ns`, and covers the steps recorded after it was enabled. `step-map.ns` answers the same question for
 line-only traces and is the member a reader should prefer; `linehits.tc` also serves column-aware
 traces.
 
@@ -1642,11 +1644,8 @@ by every writer that observes a marker.
 the 16 big-endian bytes of the trace id followed by the 8 big-endian bytes of
 the span id, i.e. wire order, **not** a hex rendering.
 
-**Leaf type B**, `[payload_offset: u64][payload_len: u64]` descriptors into an
-appended payload region, as `memwrites.tc` is actually built (see
-`memwrites_builder.nim`; note the Leaf-Type-A attribution in
-ctfs-container.md § 8 predates that implementation). Type B is required here
-regardless: a collision bucket is variable-length.
+An `NSB1` image (ctfs-container.md §8a), Type B, `[payload_offset: u64][payload_len: u64]`
+descriptors into the payload region. Type B is required: a collision bucket is variable-length.
 
 **Key, per kind.** `kind = 0` (distributed-trace span) hashes
 `trace_id_be || span_id_be`. `kind = 1` (boundary crossing) hashes
@@ -1675,7 +1674,38 @@ bucket:
                                   bits 1..15 reserved
 ```
 
-60 bytes per entry. Entries are sorted by `(trace_id, span_id, geid)`.
+60 bytes per entry. Within a bucket, entries are sorted by their 24 identity bytes, then `geid`,
+and entries equal in both keep the order they were declared in; buckets follow their keys' order,
+and the descriptor spans its bucket exactly. A `kind = 1` entry's two times and `thread_id` are 0,
+and its `flags` bit 0 is set when the declared direction is `recv` or `receive`.
+
+**Fingerprint.** `key_fingerprint` is `XXH64(seed = 2654435761, key_value)`.
+
+**When it is written.** At close, after `linehits.tc`, and only when the recording declared at
+least one marker or span coverage: a recording that declared none has no `corrmark.ns`, which reads
+as "not indexed". `markers.dat` / `markers.off` are added when the first label is interned: after
+the stream members, and before `meta.dat` when no record has been written yet. Neither reference
+writer sets `meta.dat` bit 15.
+
+**The event a boundary marker writes.** A `kind = 1` marker is also an I/O event in `events.dat`
+(the debugger's marker list reads it there): `kind` 0, empty content, `step_id` the marker's step,
+and as metadata the JSON object
+
+```
+{"marker_id":N,"boundary_id":"<label>","direction":"<send|recv>","key_text":"<key_text>","key_value":"<key_value>"
+ then, when show_text or show_value is non-empty:  ,"show_text":"<show_text>","show_value":"<show_value>"
+ then, when description is non-empty:              ,"description":"<description>"
+}
+```
+
+on one line, with no spaces, `key_text` defaulting to `key` and `show_text` to `show`. Strings escape
+`"` and `\` with a backslash, newline, carriage return and tab as `\n`, `\r`, `\t`, any other byte
+below `0x20` as `\u00` and two lowercase hex digits, and copy every other byte as it is. A
+`kind = 0` span-coverage marker writes no event.
+
+**The step a marker belongs to.** One value is both the event's `step_id` and the entry's `geid`:
+the step the caller names, or by default the last exec record written (0 before the first). No step
+is written for a marker.
 
 **A B-tree hit is a hash hit, not a match, and a reader MUST confirm it.**
 
@@ -1725,10 +1755,11 @@ event streams.
 
 | Piece | Where |
 |---|---|
-| Encoder, reader, bulk load | `codetracer-trace-format-nim/src/codetracer_trace_writer/corrmark_builder.nim` |
+| Encoder, reader, bulk load | Nim `codetracer_trace_writer/corrmark_builder.nim`; Rust `codetracer_trace_writer::corrmark` |
 | Writer API (`registerSpanCoverage`, `registerCorrelationMarker*`, `ensureMarkerId`) | `.../codetracer_trace_writer/multi_stream_writer.nim` |
 | C ABI (`trace_writer_mark_span_coverage[_hex]`, `trace_writer_mark_correlation[_by_id]`, `trace_writer_ensure_marker_id`) | `.../codetracer_trace_writer_ffi.nim`, declared in `include/codetracer_trace_writer.h` |
 | Rust binding | `codetracer-trace-format/codetracer_trace_writer_nim` (`TraceWriter` trait + `NimTraceWriter`) |
+| Rust writer and reader | `codetracer_trace_writer::corrmark`, `CtfsTraceWriter` (`ensure_marker_id`, `register_correlation_marker[_by_id]`, `register_span_coverage[_hex]`), `codetracer_trace_reader::correlation_reader` |
 | MCR writer | `codetracer-native-recorder/ct_recorder/src/ct_recorder/trace_writer.nim` |
 | Consumer | `codetracer-ci/apps/Monolith/Monolith.TraceStorage/CtfsCorrelationIndex.cs` |
 

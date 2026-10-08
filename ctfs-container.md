@@ -987,10 +987,16 @@ The payload region begins at the end of the B-tree pages, and each key's payload
 previous key's, in key order, with no padding between them; the member ends with zeros to the next
 multiple of 4096 bytes.
 
-A reader MUST refuse, naming the member: a member shorter than the header or not a multiple of 4096
-bytes; another magic; a page number at or beyond the member's page count or 0 below the root; a node
-kind other than 0 or 1; a `count` whose keys and descriptors or children do not fit in the page;
-and a descriptor whose payload does not lie inside the member.
+A reader MUST refuse, naming the member: a member shorter than one page or not a multiple of 4096
+bytes; another magic; a flag bit other than bits 0 and 1, or a leaf type other than the member's; a
+`page_count` of 0 or beyond the member's pages; a committed slot whose root is 0; a page number
+outside `[1, page_count)`, or a page reached twice; a node kind other than 0 or 1, a node with no
+keys, a `count` whose keys and descriptors or children do not fit in the page, or nonzero reserved
+node bytes; keys that do not ascend strictly within a node or fall outside the range their parent
+gives them; leaves at different depths; and a descriptor whose payload does not lie inside the
+member. Each of these, read on, either loops or answers a lookup with bytes no writer stored.
+
+A lookup that finds a key equal to an internal node's `keys[i]` continues in child `i + 1`.
 
 ---
 
