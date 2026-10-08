@@ -33,7 +33,7 @@ Block 0 begins with the container header. Through version 5 it is 16 bytes. Vers
 | 5 | 1 | Version | `5`, or `6` for a container carrying the fields below |
 | 6 | 1 | Encryption | `0` = none, `1` = AES-256-GCM |
 | 7 | 1 | MaxShards | Maximum shard count (`0` = no sharding) |
-| 8--11 | 4 | BlockSize | Block size in bytes (u32 LE, default 4096) |
+| 8--11 | 4 | BlockSize | Block size in bytes (u32 LE, default 4096): 1024, 2048 or 4096 |
 | 12--15 | 4 | MaxRootEntries | Maximum file entries (u32 LE, `0` = auto-fill block 0) |
 | 16 | 1 | Profile | **v6 only.** `0` = full, `1` = compact. Closed set |
 | 17 | 1 | Compression | **v6 only.** Whole-file scheme: `0` = none, `1` = zstd. Closed set |
@@ -1112,6 +1112,11 @@ Storage nodes resolve queries server-side (B-tree walks, chunk decompression) in
 | Chunk threshold | 4096 events | Balance compression ratio vs seek granularity |
 
 ### Block Size Trade-offs
+
+A full container's `BlockSize` is one of the three below (a compact container's is 0, §1d). A writer
+MUST refuse to create a container with any other, and a reader MUST refuse one that declares any
+other, naming the value: the mapping arithmetic of §4 assumes `BlockSize / 8` slots per mapping block,
+and the sizes outside this table are untested by every implementation.
 
 | BlockSize | N | usable | Max L5 file size |
 |-----------|---|--------|------------------|
