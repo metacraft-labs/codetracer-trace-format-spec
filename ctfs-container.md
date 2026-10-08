@@ -85,7 +85,7 @@ different claim even where it is not yet a different layout.
 > `steps.idx`, the MCR thread streams `tNNN` + `iNNN`, the MCR snapshot payloads
 > `<stem>.<x>zd` + `<stem>.<x>zi` of [internal-files.md](internal-files.md)) keeps
 > independent zstd frames in its data member and their offsets in its index
-> member, and so does a seekable-zstd stream such as the non-MCR writer's `events.log`
+> member, and so does a seekable-zstd stream such as an MCR per-file thread stream
 > ([seekable-zstd.md](seekable-zstd.md)); a member whose format is not one of
 > those is stored exactly as written.  No current writer compresses the
 > container as a whole — the MCR recorder's buffered mode, which did, has been
@@ -802,9 +802,13 @@ Two u64 reads + one compressed chunk read. Index typically fits in 1-2 blocks.
 2. When buffer reaches `chunk_size` records:
    a. Encode records
    b. Compress with Zstd
-   c. Append u64 byte offset to `foo.idx`
-   d. Write compressed data to `foo.dat`
-   e. Sync both file entry sizes for concurrent readers
+   c. Write compressed data to `foo.dat` and publish its file entry (`Size`, `MapBlock`)
+   d. Append the chunk's u64 byte offset to `foo.idx` and publish its file entry
+
+The data comes first: an index entry is what tells a reader a chunk exists, so it is published only
+once the chunk it names is (§6, "Durability"). An earlier revision listed the index append before
+the data write, which would let a following reader see an offset for bytes not yet written; no
+writer did that.
 
 The index is always up to date during active recording.
 
@@ -863,7 +867,7 @@ No entry count -- the B-tree is the source of truth.
 
 #### Leaf Type A -- Small Entries (8-byte descriptor)
 
-Used by namespaces with many keys and small values (`memwrites.tc`, `linehits.tc`, `memreads.tc`).
+Used by namespaces with many keys and small values (`memreads.tc`).
 
 ```
 Entry descriptor (8 bytes = u64 LE, bit-packed):
@@ -923,12 +927,70 @@ Sub-block support is optional -- `skip_sub_blocks` flag causes full-block alloca
 
 | Namespace | Leaf Type | Key | Purpose |
 |-----------|-----------|-----|---------|
-| `linehits.tc` | A | global line index | Source line hit time coordinates |
-| `memwrites.tc` | A | memory address | Memory write time coordinates |
+| `linehits.tc` | `NSB1` (§8a) | location address | Step ids at each source location |
+| `memwrites.tc` | `NSB1` (§8a) | memory address | Memory write time coordinates (MCR only) |
+| `corrmark.ns` | `NSB1` (§8a) | XXH64 of the correlation key | Correlation markers |
 | `memreads.tc` | A | memory address | Memory read time coordinates |
 | `threads.ns` | B | thread_id | Per-thread event streams |
 | `slc-mwr.ns` | B | slice_id | Per-thread-slice write address sets |
 | `slc-mrd.ns` | B | slice_id | Per-thread-slice read address sets |
+
+
+### 8a. The `NSB1` namespace image (normative)
+
+`linehits.tc`, `corrmark.ns` and `memwrites.tc` are not built from the sub-block pools above. Each is
+one member holding an `NSB1` image: a B-tree of 64-bit keys in 4096-byte pages, followed by a payload
+region that the B-tree's descriptors point into. Writers build it once, at close, over a known set of
+keys ("bulk load"); the double root slot lets an incremental writer commit copy-on-write, but no
+runtime member needs that, and a bulk-loaded image is fully determined by its entries, which is what
+lets two writers produce the same bytes.
+
+```
+Page 0, the header (the rest of the page is zero):
+  [0..4)    magic "NSB1"
+  [4..12)   root_block[0]: u64 LE     -- page number of the B-tree root, 0 = none
+  [12..20)  root_block[1]: u64 LE
+  [20..28)  commit_id[0]: u64 LE      -- 0 = slot empty
+  [28..36)  commit_id[1]: u64 LE
+  [36]      flags: u8                 -- bit 0 leaf type (0 = A, 8-byte descriptors;
+                                         1 = B, 16-byte), bit 1 skip_sub_blocks
+  [37..45)  free_list_head: u64 LE    -- 0 in a bulk-loaded image
+  [45..53)  next_free_page: u64 LE    -- first page number never allocated
+  [53..61)  page_count: u64 LE        -- pages in the B-tree image, header included
+Pages 1..page_count-1, B-tree nodes:
+  [0]       node_kind: u8             -- 0 internal, 1 leaf
+  [1]       0
+  [2..4)    count: u16 LE             -- keys in the node
+  [4..8)    0
+  leaf:     keys[count] u64 LE, then descriptors[count]
+  internal: keys[count] u64 LE, then children[count + 1] u64 LE page numbers
+  the rest of the page is zero
+Then the payload region, up to the end of the member, zero-padded to a multiple of 4096.
+```
+
+The committed root is the root of the slot with the larger nonzero `commit_id`; with both zero the
+namespace is empty. A key `k` is found by descending from the root: in an internal node, child `i`
+holds the keys in `[keys[i-1], keys[i])` (child 0 below `keys[0]`, the last child from the last key
+up). The members here use **Type B** with `skip_sub_blocks` set (`flags = 3`), and every descriptor
+is `[payload_offset: u64 LE][payload_len: u64 LE]`, an offset from the start of the member.
+
+**Bulk load (normative, so that two writers produce the same bytes).** The entries are sorted by
+key, keys distinct. The fan-out is `order = (4096 - 8) / (8 + descriptor size)` keys per node -- 170
+for Type B. The leaves take the entries in runs of `order`, the last run holding the remainder, and
+are allocated pages 1, 2, … in that order. Each level above groups the nodes below it in runs of
+`order + 1`, allocating their pages after every page of the level below; an internal node's keys
+are the smallest keys under its 2nd, 3rd, … children. The level with one node is the root, published
+in slot 0 with `commit_id[0] = 1`; slot 1 stays zero. `next_free_page` and `page_count` are the page
+count; `free_list_head` is 0. With no entries the image is the header page alone, with no root.
+
+The payload region begins at the end of the B-tree pages, and each key's payload follows the
+previous key's, in key order, with no padding between them; the member ends with zeros to the next
+multiple of 4096 bytes.
+
+A reader MUST refuse, naming the member: a member shorter than the header or not a multiple of 4096
+bytes; another magic; a page number at or beyond the member's page count or 0 below the root; a node
+kind other than 0 or 1; a `count` whose keys and descriptors or children do not fit in the page;
+and a descriptor whose payload does not lie inside the member.
 
 ---
 

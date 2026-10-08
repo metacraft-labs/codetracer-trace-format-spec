@@ -370,8 +370,15 @@ A materialized trace `.ct` from runtime recorders (Python, Ruby, JavaScript, Bas
 | `varnames.dat` | Var-size record | Interned variable names |
 | `varnames.off` | Offset index | Variable name offset index |
 | `step-map.ns` | Step-map blob | `(path_id, line)` to step ids; line-only traces (see below) |
-| `linehits.tc` | Namespace (Type A) | Source line to step ID mapping |
-| `memwrites.tc` | Namespace (Type A) | Variable/place to change history |
+| `spans.dat` | Chunked compressed | Optional: span records (§"Optional runtime members") |
+| `spans.idx` | Span index | Optional: chunk offsets and cumulative record counts for `spans.dat` |
+| `spantype.ns` | Span-type index | Optional: span ids by span type |
+| `markers.dat` | Var-size record | Optional: interned correlation-marker labels |
+| `markers.off` | Offset index | Optional: marker label offset index |
+| `corrmark.ns` | `NSB1` namespace | Optional: correlation index (§"Correlation Index (`corrmark.ns`)") |
+| `linehits.tc` | `NSB1` namespace | Optional: location address to step ids (§"Optional runtime members") |
+
+A runtime trace has no `memwrites.tc` (§"Memory writes are not part of a runtime trace").
 
 ### Stream Descriptions
 
@@ -509,6 +516,158 @@ was registered at (the `paths.dat` id and the line as registered, truncated to 3
 global line index -- except that a step registered at line `0` is keyed under line `1`, as it is
 recorded everywhere else (§"Global Line Index", "Line 0 is line 1, everywhere").
 
+
+### Optional runtime members
+
+A runtime writer creates these members only when the recording asks for them, on the first record of
+their kind (§"Stream-presence flags are a hint, not a gate"): a recording that uses none of them is
+byte-identical to one written by a writer that does not implement them. Both reference writers
+implement all of them, and both readers read all of them.
+
+#### `spans.dat` / `spans.idx` / `spantype.ns` — the span stream
+
+A span is a bounded, labeled interval of execution named by the coordinate *(process_ord,
+thread_id, step range)*: an HTTP request, a process, a test, or a native↔VM crossing (below). The
+product contract (what a span is for, the request panel, live sessions) is
+`codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md`; this section is the byte layout, which
+is normative.
+
+**`spans.dat`** is a Chunked Compressed Table of span records. A chunk's content is the
+concatenation of length-framed records, `(record_len: varint, record)*`, as in `calls.dat`. Each
+chunk is one Zstandard frame at level 3, compressed in one shot (content size declared, no checksum,
+no dictionary). In a compact container (`ctfs-container.md` §1d) a chunk is stored as its content.
+
+**A span chunk may be short anywhere in the stream.** The writer seals the buffered records as a
+chunk when there are 64 of them, and also whenever the recorder flushes the stream (a live
+recorder flushes so that an in-flight span is visible at once). A chunk is never empty: a flush
+with nothing buffered writes nothing. `chunk_size` is therefore an upper bound, and "record `N` is in
+chunk `N / chunk_size`" (`ctfs-container.md` §7) does **not** hold for this stream; the index says
+where every record is.
+
+**`spans.idx`** is not the §7 index. It is:
+
+```
+Header (8 bytes):
+  chunk_size: u32 LE       -- the seal-at threshold, 64; an upper bound, not a locator
+  index_version: u16 LE    -- 2
+  reserved: u16 LE         -- 0
+Entries, 16 bytes each, entry i at 8 + 16*i:
+  offset: u64 LE           -- chunk i's first byte in spans.dat
+  cumulative: u64 LE       -- span records in chunks 0..i together
+```
+
+The record count is the last entry's `cumulative` (0 with no entry); chunk `i` holds
+`cumulative[i] - cumulative[i-1]` records; the chunk holding record `N` is the first whose
+`cumulative` exceeds `N`, found by binary search. Chunk `i` spans `[offset[i], offset[i+1])`; the
+last chunk is the single Zstandard frame at its offset (in a compact container: to the end of the
+member). Opening the stream decompresses nothing; reading a record decompresses its chunk.
+
+The writer appends a chunk to `spans.dat` **before** the index entry that publishes it, so an
+entry always names a complete chunk.
+
+A reader MUST refuse, naming `spans.idx`: a member shorter than its header; `chunk_size` 0; an
+`index_version` other than 2 (version 1, offsets only, never shipped); a nonzero `reserved`; an entry
+region that is not a whole number of entries; an offset past the end of `spans.dat`; offsets or
+cumulative counts that decrease from one entry to the next. A chunk whose frame does not decode, or
+whose content does not split into whole framed records, is refused naming `spans.dat`.
+
+**Record** (all integers varints unless noted; strings are `varint length + UTF-8 bytes`):
+
+```
+span_id:            varint   1-based; 0 is refused
+parent_span_id:     varint   0 = none
+flags:              u8       bit 0 open, bit 1 external; other bits refused
+status:             u8       0 unknown | 1 ok | 2 error; other values refused
+start_wall_ns:      varint   UNIX epoch nanoseconds
+end_wall_ns:        varint   0 when open
+process_ord:        varint   0 = primary process
+thread_id:          varint
+start_step:         varint   first step id in the span
+end_step:           varint   last step id; 0 when open
+external_recording: string   only when flags.external: the other container's recording_id
+external_path:      string   only when flags.external: its path relative to this container
+span_type:          string   "web-request" | "process" | "test" | "native-vm" | ...
+label:              string
+structural:         u8       bit 0 contiguous on one thread, bit 1 shares timeline,
+                             bit 2 concurrent with siblings; other bits refused
+metadata_count:     varint
+metadata:           (key: string, value: string) x metadata_count, in emission order
+```
+
+A reader MUST refuse a record that is truncated, has bytes left over after its last field, sets an
+unknown `flags` or `structural` bit, has a `status` above 2, has `span_id` 0, or is open with a
+nonzero `end_wall_ns` or `end_step`. A writer MUST refuse to write those, and also a record that is
+not external but carries external strings, since they would be lost.
+
+**Append-only, last record wins.** A writer appends an open record (flags.open) when a span starts
+and a record with the same `span_id` when it ends; nothing is rewritten. The settled view of the
+stream is, per `span_id`, the last record carrying it, in ascending `span_id`; a raw read returns
+the records in append order. Metadata order is part of the record.
+
+**Following.** A reader that follows the container (`ctfs-container.md` §6) sees new spans as new
+index entries; a consumer that remembers how many entries it has read decodes only the chunks
+published since.
+
+**`spantype.ns`** is written once, at close, when the stream exists. It indexes span ids by type:
+
+```
+Header (18 bytes):
+  magic: u32 LE = 0x53505459   -- the bytes "YTPS" on disk
+  version: u16 LE = 1
+  type_count: u32 LE
+  type_table_offset: u64 LE   -- 18
+Type table, type_count x 28 bytes, in type-id order:
+  span_type_id: u32 LE        -- 0-based, first-appearance order of span_type in the stream
+  name_len: u32 LE
+  name_offset: u64 LE
+  span_count: u32 LE
+  spans_offset: u64 LE
+Then every type's name bytes, in type-id order; then every type's span ids, u64 LE, ascending and
+distinct (an open record and its completion contribute their span_id once).
+```
+
+A reader MUST refuse a bad magic, another version, or any name or list that lies outside the
+member.
+
+#### Native↔VM crossings
+
+A host that runs an embedded VM records each entry into the VM as a span of type the host names
+(e.g. `native-vm`), so that `[start_step, end_step]` bound the steps executed inside the VM frame
+(`nested-trace-correlation.md` §1). Writers mint the crossing's `span_id` themselves — 1, 2, 3, …
+per container, from a counter separate from the ids recorders give `register_span` — so a recorder
+must not mix the two in one container.
+
+`begin_crossing(span_type)` appends, and immediately flushes, an open record: `span_id` the next
+minted id, `parent_span_id` 0, flags open, status unknown, every wall time, `process_ord` and
+`thread_id` 0, `start_step` the number of steps recorded so far (the id of the first step inside
+the crossing), `end_step` 0, `label` empty, structural bits 0 and 1 set, no metadata.
+`end_crossing(span_id)` appends, and flushes, the settled record: the same fields with flags 0,
+status ok, and `end_step` the last step recorded (the step count minus one, or 0 when there is
+none). Crossings nest and close innermost first: `end_crossing` of anything but the innermost open
+crossing is an error, and writes nothing. A crossing still open at close stays open in the stream.
+
+#### `linehits.tc` — line hits
+
+An optional line-to-steps index, written at close when the recorder enabled it before its first
+step. It is an `NSB1` namespace image (`ctfs-container.md` §8a), Type B, keyed by the step's
+location address -- the `global_position_index` the step record carries -- with one entry per
+distinct address. The entry's payload is the ids of the steps recorded at that address, ascending,
+each a varint, back to back. Every exec record that is a step records a hit, with its exec-record
+index as its id (§"`step-map.ns`"). A reader resolves a key to its descriptor and decodes the
+varints in `[payload_offset, payload_offset + payload_len)`; a payload outside the member, or one
+that does not decode to whole varints, is refused. `step-map.ns` answers the same question for
+line-only traces and is the member a reader should prefer; `linehits.tc` also serves column-aware
+traces.
+
+#### Memory writes are not part of a runtime trace
+
+A runtime recorder observes variables and their values, never machine addresses; a change to a
+variable is the value the next step records in `values.dat`. A runtime writer therefore records no
+memory writes and MUST NOT write `memwrites.tc` (or `memreads.tc`), and a runtime trace reader has no
+memory-write stream to read. `memwrites.tc` is a member of MCR traces (§"Multi-Core Recorder (MCR)
+Traces"), written by the native recorder's omniscient preparation and read by its replay backend;
+its layout is given there.
+
 ---
 
 ## Multi-Core Recorder (MCR) Traces
@@ -526,8 +685,8 @@ recorded everywhere else (§"Global Line Index", "Line 0 is line 1, everywhere")
 | `cp0.fsbase` | Raw binary | Initial `fsbase`/`gsbase` (16 bytes; x86-64 Linux only) |
 | `cp0.maps` | Raw text | Verbatim `/proc/self/maps` text at cp0 capture time |
 | `debug.dat` | Raw binary | Full ELF of the recorded binary, including `.debug_*` sections |
-| `memwrites.tc` | Namespace (Type A) | Address to write history (omniscient queries) |
-| `linehits.tc` | Namespace (Type A) | Source line to GEID lists (line hit queries) |
+| `memwrites.tc` | `NSB1` namespace | Address to write history (omniscient queries); layout below |
+| `linehits.tc` | `NSB1` namespace | Source line to GEID lists (line hit queries) |
 
 All files are append-only during recording.
 
@@ -546,6 +705,23 @@ All files are append-only during recording.
   Periodic snapshots written during recording so the replay engine
   can seek to an arbitrary tick without re-emulating from cp0. Also
   MCR-only.
+
+#### `memwrites.tc` (MCR)
+
+An `NSB1` image (`ctfs-container.md` §8a), Type B, keyed by the written address. A key's payload is
+its write records, 40 bytes each, sorted by `(interval_id, tick)`:
+
+```
+interval_id: u32 LE
+tick: u64 LE
+pc: u64 LE
+size: u32 LE          -- bytes written
+old_value: u64 LE
+new_value: u64 LE
+```
+
+It is written by the native recorder's omniscient preparation and read by the replay backend; the
+runtime trace writers do not write it (§"Memory writes are not part of a runtime trace").
 
 #### Cross-OS portability
 
@@ -961,7 +1137,7 @@ also keeps a single, audit-friendly artifact in the trace.
 
 ## Metadata (meta.dat)
 
-A single binary metadata file using split-binary encoding.
+A single binary metadata file.
 
 ### Layout
 
@@ -1092,7 +1268,7 @@ authoritative answer to "does this trace carry stream X?" is the
   still running. Gating on structure (file presence + `Size`) is the only
   streaming-correct rule; the bit MUST NOT be a precondition.
 - These bits are **additive**: a reader that does not understand a stream
-  ignores its file (and its bit) and reads the rest correctly. Bit 14
+  ignores its file (and its bit) and reads the rest correctly. Bit 15
   (`corrmark.ns`) is additive on the same terms. No bit is reserved for
   reject-on-unknown in version 4.
 - **Version 6: a stream-presence bit is set exactly for the streams a writer

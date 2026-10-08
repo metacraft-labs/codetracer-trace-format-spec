@@ -778,49 +778,21 @@ These must be fixed as part of the byte fidelity audit:
 | Ruby | `to_s` may transcode strings | Use `bytes` method to get raw encoding |
 | All | CBOR text string (type 3) for values | Switch to byte string (type 2) |
 
-## Split-Binary Encoding (default)
+## Removed members: `events.log` and `events.fmt`
 
-The split-binary format uses compact binary encoding for event envelopes (fixed-size fields) and falls back to CBOR only for dynamic payloads (ValueRecord, TypeRecord, AssignmentRecord). This gives better compression ratios and faster decoding than pure CBOR.
+Before the split streams, a container carried the whole recording as one stream of
+`TraceLowLevelEvent`s in `events.log` -- CBOR, or later a "split-binary" envelope encoding -- with
+`events.fmt` naming which. The split streams above replace it entirely, and it is not part of the
+format:
 
-### Wire format per event
+- A writer MUST NOT write `events.log` or `events.fmt`.
+- A reader MUST refuse a container that carries either member, naming it, and MUST NOT read the
+  rest of such a container as if the member were absent. A container written that way is a legacy
+  recording, and a reader that half-read it would show a trace with its steps missing.
 
-Each event is encoded as a concatenation of:
-
-1. **Tag byte** (1 byte): variant index 0-23
-2. **Fixed fields**: little-endian integers at their natural width
-3. **Strings**: 4-byte LE length prefix + UTF-8 bytes
-4. **Dynamic payloads**: 4-byte LE CBOR length prefix + CBOR bytes
-
-### Per-variant encoding
-
-| Tag | Variant | Encoding | Total size |
-|-----|---------|----------|------------|
-| 0 | Step | `tag(1) + path_id(u64 LE) + line(i64 LE)` | 17 bytes |
-| 1 | Path | `tag(1) + str` | 5 + len |
-| 2 | VariableName | `tag(1) + str` | 5 + len |
-| 3 | Variable | `tag(1) + str` | 5 + len |
-| 4 | Type | `tag(1) + cbor(TypeRecord)` | 5 + cbor_len |
-| 5 | Value | `tag(1) + variable_id(u64 LE) + cbor(ValueRecord)` | 13 + cbor_len |
-| 6 | Function | `tag(1) + path_id(u64 LE) + line(i64 LE) + str(name)` | 21 + name_len |
-| 7 | Call | `tag(1) + function_id(u64 LE) + cbor(args)` | 13 + cbor_len |
-| 8 | Return | `tag(1) + cbor(ValueRecord)` | 5 + cbor_len |
-| 9 | Event | `tag(1) + kind(u8) + str(metadata) + str(content)` | 10 + meta_len + content_len |
-| 10 | Asm | `tag(1) + count(u32 LE) + [str]*count` | 5 + sum(4 + line_len) |
-| 11 | BindVariable | `tag(1) + variable_id(u64 LE) + place(i64 LE)` | 17 bytes |
-| 12 | Assignment | `tag(1) + cbor(AssignmentRecord)` | 5 + cbor_len |
-| 13 | DropVariables | `tag(1) + count(u32 LE) + [variable_id(u64 LE)]*count` | 5 + 8*count |
-| 14 | CompoundValue | `tag(1) + place(i64 LE) + cbor(ValueRecord)` | 13 + cbor_len |
-| 15 | CellValue | `tag(1) + place(i64 LE) + cbor(ValueRecord)` | 13 + cbor_len |
-| 16 | AssignCompoundItem | `tag(1) + place(i64 LE) + index(u64 LE) + item_place(i64 LE)` | 25 bytes |
-| 17 | AssignCell | `tag(1) + place(i64 LE) + cbor(ValueRecord)` | 13 + cbor_len |
-| 18 | VariableCell | `tag(1) + variable_id(u64 LE) + place(i64 LE)` | 17 bytes |
-| 19 | DropVariable | `tag(1) + variable_id(u64 LE)` | 9 bytes |
-| 20 | ThreadStart | `tag(1) + thread_id(u64 LE)` | 9 bytes |
-| 21 | ThreadExit | `tag(1) + thread_id(u64 LE)` | 9 bytes |
-| 22 | ThreadSwitch | `tag(1) + thread_id(u64 LE)` | 9 bytes |
-| 23 | DropLastStep | `tag(1)` | 1 byte |
-
-Where `str` means: `length(u32 LE) + utf8_bytes`, and `cbor(T)` means: `cbor_length(u32 LE) + cbor_bytes`.
+The refusal is the whole of a reader's obligation: no reader decodes the old stream, and there is no
+conversion path in the format. The `TraceLowLevelEvent` tags in §"Removed Events" survive only as
+the names the split streams' records were derived from.
 
 ## Source Location Addressing
 

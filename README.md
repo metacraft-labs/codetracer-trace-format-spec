@@ -7,7 +7,7 @@ This repository is the source-of-truth specification for the CodeTracer trace fo
 | Document | Contents |
 |---|---|
 | [ctfs-container.md](ctfs-container.md) | CTFS binary container format: magic, headers, file entries, block mapping, Base40 encoding |
-| [trace-events.md](trace-events.md) | `TraceLowLevelEvent` enum, split-binary encoding, CBOR legacy encoding |
+| [trace-events.md](trace-events.md) | The split streams (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`), value encoding, recorder integration rules; the removed `events.log` |
 | [seekable-zstd.md](seekable-zstd.md) | Zstd seekable compression format as used by CodeTracer |
 | [internal-files.md](internal-files.md) | Conventions for files stored inside a CTFS container |
 | [Trace-Filters.md](Trace-Filters.md) | Cross-language trace filter contract: schema, hot-path requirement, provenance |
