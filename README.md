@@ -10,6 +10,7 @@ This repository is the source-of-truth specification for the CodeTracer trace fo
 | [trace-events.md](trace-events.md) | The split streams (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`), value encoding, recorder integration rules; the removed `events.log` |
 | [seekable-zstd.md](seekable-zstd.md) | Zstd seekable compression format as used by CodeTracer |
 | [internal-files.md](internal-files.md) | Conventions for files stored inside a CTFS container |
+| [recorded-entry-identity.md](recorded-entry-identity.md) | Optional checked program-entry call identity; legacy entry selection stays unchanged when absent |
 | [Trace-Filters.md](Trace-Filters.md) | Cross-language trace filter contract: schema, hot-path requirement, provenance |
 | [conformance-testing.md](conformance-testing.md) | How to test an implementation, and how such tests fail to fail — written from the defects that got through |
 | [measurements/2026-10-format-efficiency.md](measurements/2026-10-format-efficiency.md) | The measurements behind the 2026-10 revision: step encoding, `step-map.ns`, `meta.dat`'s path list, small and empty members, `events.dat` kinds |
