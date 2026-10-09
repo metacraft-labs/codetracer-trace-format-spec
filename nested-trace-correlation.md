@@ -13,6 +13,13 @@ The consumer UX (the native↔VM **language switch**) is owned by
 `codetracer-specs/Planned-Features/Mixed-Trace-Debugging.md`; this document is the
 format-side contract it rests on.
 
+> **Scope (2026-10-07).** This document stays here because its subject is the materialized trace:
+> what a materialized writer records (crossing spans in the span stream, and no per-event
+> correlation record) when it runs inside a process MCR records. Its descriptions of how MCR derives
+> the association at replay (§1.1 to §1.5) explain why the format records nothing more; they are not
+> a specification of MCR. MCR's own behaviour, and the members an MCR recording carries, are
+> specified in `codetracer-specs` (see the scope note in [README.md](README.md)).
+
 ## 0. What a nested trace is
 
 A **nested trace** is a materialized CTFS trace produced *inside* a process that

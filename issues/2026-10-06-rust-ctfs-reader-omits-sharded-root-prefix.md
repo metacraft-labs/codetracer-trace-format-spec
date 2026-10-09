@@ -7,3 +7,12 @@ Measured source: `codetracer-trace-format` at `f39e71016715b4ba67b626f4c971acfd6
 The existing unsharded Rust writer does not exercise this nonzero-shard reader boundary. The private immutable-snapshot seam currently retains the same initial directory assumption and cannot claim complete header-derived bounds until it is corrected and qualified.
 
 Required repair: derive checked version-5 directory start and effective count from the actual parsed header, preserve explicit version refusal and existing unsharded bytes, validate prefix/directory arithmetic and complete physical bounds before entry allocation or reads. Genuine nonzero-shard, auto-fill, explicit small-count, root-overflow, truncated-prefix and misplaced-entry controls must preserve reserved roots and reject corruption. This does not introduce container-version6 support, change frozen consumer pins, or qualify the private successor.
+
+## Decision (2026-10-08): there is no sharded root prefix
+
+The free list root area is removed (`ctfs-container.md` §1, "The free list root area is removed").
+Entries begin right after the header whatever `max_shards` is, so the reader's entry start is
+correct and this issue's first half is withdrawn. Its second half stands: a reader that reads zero
+entries for an auto-fill declaration is wrong (`ctfs-container.md` §1, "Auto-fill": a reader MUST
+apply the rule to a header carrying `0`). Scheduled in `codetracer-specs`
+`milestones/CTFS-Keyed-Families.milestones.org` CKF-4R.

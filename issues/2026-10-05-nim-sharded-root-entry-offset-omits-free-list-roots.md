@@ -28,3 +28,18 @@ Make writer root-entry packing agree with its header and reserved region, with g
 ## Related
 
 Open and deleted issue history were searched after syncing this specification repo to `latest` at d67a578; there was no existing `issues/` record or matching historical entry.
+
+## Decision (2026-10-08): the free list root area is removed
+
+`ctfs-container.md` §1, "The free list root area is removed", records why: the area was designed on
+2026-04-22 for a container-global, per-shard sub-block allocator; the allocator that was built keeps
+its free lists inside each namespace, nothing reads or writes free-list state in block 0, and every
+writer already places entries at the end of the header. `R` is `0` for every `max_shards`. Measured
+against that text this defect inverts: `fileEntryOffset` (entries at 16) is correct, and
+`rootBlockCount`, which still reserves `R`, over-reserves; so does `compact.nim`'s full-container
+reader, which skips `R` (7 classes) before the entries. The repair is to drop `R` from both, not to
+move the entries. The plan `nim-ctfs-sharded-root-layout-repair.md` needs restating on that basis;
+its other requirements (one entry-start calculation for every path, refusal of malformed layouts,
+"retain the explicit refusal for unsupported overflow") stand, and the last is now the rule
+(`ctfs-container.md` §1, "The root directory is fixed at creation"). Scheduled in
+`codetracer-specs` `milestones/CTFS-Keyed-Families.milestones.org` CKF-4N.

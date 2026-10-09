@@ -2,24 +2,47 @@
 
 CTFS (CodeTracer File System) is a block-based container format that stores multiple named files in a single `.ct` file. It provides a flat file system optimized for streaming writes, concurrent multi-producer access, and multiple simultaneous readers. All integers are **little-endian**.
 
-## Properties
+> **Scope.** This specification defines the structure of the CTFS container format, and the records
+> used by the open-source recorders that produce materialized traces. It does not describe how the
+> Multi-Core Recorder (MCR) uses CTFS: which members an MCR recording writes, their layout, and its
+> per-thread, checkpoint and page streams. Those are specified in `codetracer-specs`
+> (`spec/Trace-Files/CTFS-Binary-Format.md`), and they are subject to change in each release. The
+> boundary between the two repositories, and how a change that spans both is landed, is stated in
+> `codetracer-specs/spec/Trace-Files/README.md`. Where this document names an MCR member, it uses it
+> as an example of a container mechanism, not as that member's definition.
 
-| # | Property | Description |
-|---|----------|-------------|
-| 1 | Compressed storage | Per-member Zstd via chunked compressed tables, transparent to the container layer; and, from v6, an optional whole-file scheme declared in the header (§1a, §1b) because a scheme that covers `meta.dat` cannot be declared inside it. The compact profile uses neither chunked tables nor seekable zstd (§1d). |
-| 2 | Random-access seeking | O(log n) block mapping (at most 5 reads); O(1) chunk seek via companion index. Full profile only: the compact profile is resident before its first query and seeks in memory (§1d). |
-| 3 | Low-contention concurrent writes | Single atomic `NextFreeBlock` counter; per-file single writer; no locks. |
-| 4 | Multiple concurrent readers | Readers see consistent file sizes updated atomically by writers. |
-| 5 | Network-efficient | Block-aligned layout maps to HTTP range requests; one 4 KB fetch reveals full structure. Full profile only, and deliberately so: §1d has no alignment because a one-shot load issues no ranged read. |
-| 6 | Self-contained | All metadata in binary format within the container; no external files or JSON. |
-| 7 | Streaming-compatible | Companion index available during recording; no finalization needed. |
-| 8 | Encryption-aware | Container-level encryption flag; all content opaque without the key. |
-| 9 | Append-only | All writes are appends; no in-place updates except atomic size counters. |
-| 10 | Lock-free | Only atomic fetch-and-add and atomic stores required. |
+## Goals And Properties
+
+These are the properties the format keeps. Every change to the container, and every member format
+built on it, is checked against them; [ctfs-keyed-families.md](ctfs-keyed-families.md) §1 restates
+them as obligations on the members that hold growing families. Until 2026-10-08 this table was a
+list of ten properties; the goals added then (G4's torn-read rule, G5, G6, G10, G12, G13, G15) were
+stated elsewhere in this document or followed from it, and are named here so that a design can be
+measured against them.
+
+| # | Goal | Description |
+|---|------|-------------|
+| G1 | Self-contained, no sidecars | All metadata in binary format within the container; no external files or JSON. Progress and every index live in members (§6, "Live progress"). The live coordination page (§6) is shared memory that exists only while the container is written and holds nothing the closed file lacks; it is not a sidecar. |
+| G2 | Append-mostly, and nothing moves | Data is appended and never rewritten. The only in-place updates are the ones §6 "What is mutated in place" lists: an entry's words, a keyed member's record words (§7a), a member's partial last block, an unfilled mapping slot, and a namespace's root slots (§8). No block is ever relocated: a block number, once published, names the same block for the life of the container (§1, "The root directory is fixed at creation"). |
+| G3 | Single writer per member, lock-free | Each member has one writer. The only shared mutable state is block allocation (`NextFreeBlock`) and, under a multi-process writer architecture, the root state (§6, "Writer architectures"). Only atomic fetch-and-add and atomic stores; no locks, mutexes or CAS retry loops. |
+| G4 | Live out-of-process readers | Readers in other processes follow a container while it is written. A reader on the writer's machine attaches to the live coordination page and sees each published value whole; a reader that cannot attach follows seal-published state under a stated torn-read rule; a closed file is static (§6, "In-place record publication"). No block is relocated. |
+| G5 | Crash durability at seal granularity | A writer whose process dies leaves a container that reads correctly through its last sealed chunk (§6, "Durability"). |
+| G6 | Bounded per-operation work | No operation a writer performs inside the recorded program, or on a path that can stall it, takes time proportional to a member's or the container's size: no global rehash, rebuild, directory doubling, compaction or root growth ([ctfs-keyed-families.md](ctfs-keyed-families.md) §3, P9). |
+| G7 | Random access with few block reads | O(log n) block mapping (at most 5 reads, none with a warm cache of mapping blocks); O(1) chunk seek via companion index; a keyed lookup at a stated read count ([ctfs-keyed-families.md](ctfs-keyed-families.md) §2). Block-aligned layout maps to HTTP range requests. Full profile only: the compact profile is resident before its first query and seeks in memory (§1d). |
+| G8 | A fixed root one fetch reveals | One fetch of the root region (one 4 KB block unless the writer declared more, §1) reveals the full structure, and the region never grows. Full profile only, and deliberately so: §1d has no alignment because a one-shot load issues no ranged read. |
+| G9 | Streaming-compatible | Companion index available during recording; no finalization needed. |
+| G10 | Compact-profile compatibility | Every member format has a defined compact form (§1d-§1f) or is refused by name by a writer converting to the compact profile. |
+| G11 | Encryption-aware | Container-level encryption flag; all content opaque without the key. |
+| G12 | Deterministic where claimed | Where this document says two writers given the same input produce the same bytes (§1f, §5), layout is a function of the input, not of timing. |
+| G13 | Implementable everywhere it is read | Writers in Nim and Rust; readers in Nim, Rust, Go, C#, TypeScript and Python. Every rule is stated so that each can follow it and refuse by name. |
+| G14 | Compressed storage | Per-member Zstd via chunked compressed tables, transparent to the container layer; and, from v6, an optional whole-file scheme declared in the header (§1a, §1b) because a scheme that covers `meta.dat` cannot be declared inside it. The compact profile uses neither chunked tables nor seekable zstd (§1d). |
+| G15 | Bounded dead space | Blocks no pointer reaches any more are bounded per member family and removed by repacking, never reused in place (§6, "Dead space"). |
 
 ### Non-Goals
 
-No directories (flat namespace only), no file deletion or truncation, no file attributes, no built-in checksums, no redundancy. Designed for 10--200 files per container.
+No directories (flat namespace only), no file deletion or truncation, no file attributes, no built-in checksums, no redundancy.
+
+**The root directory is bounded.** Its size is fixed when the container is created (§1), and no operation enlarges it. A container holds a closed set of named members in its root, typically 10 to 200. A family of members whose count grows with the recording (one per thread, one per checkpoint, one per bundled file) does not belong in the root. It belongs in a keyed member (§7a): one root member, or a small fixed set of them, that maps `u64` keys to records, values and streams, in one of the families of [ctfs-keyed-families.md](ctfs-keyed-families.md).
 
 ---
 
@@ -34,7 +57,7 @@ Block 0 begins with the container header. Through version 5 it is 16 bytes. Vers
 | 6 | 1 | Encryption | `0` = none, `1` = AES-256-GCM |
 | 7 | 1 | MaxShards | Maximum shard count (`0` = no sharding) |
 | 8--11 | 4 | BlockSize | Block size in bytes (u32 LE, default 4096): 1024, 2048 or 4096 |
-| 12--15 | 4 | MaxRootEntries | Maximum file entries (u32 LE, `0` = auto-fill block 0) |
+| 12--15 | 4 | MaxRootEntries | Maximum file entries (u32 LE, `0` = auto-fill block 0). Fixed when the container is created and never changed (§1) |
 | 16 | 1 | Profile | **v6 only.** `0` = full, `1` = compact. Closed set |
 | 17 | 1 | Compression | **v6 only.** Whole-file scheme: `0` = none, `1` = zstd. Closed set |
 | 18--23 | 6 | Reserved | **v6 only.** MUST be zero; a non-zero byte is a refusal |
@@ -62,7 +85,7 @@ struct ContainerHeaderV6 {      // version 6
 };
 ```
 
-**Why the header grew by 8 bytes rather than 2.** `Profile` and `Compression` are one byte each, so 18 would carry them. The six reserved bytes buy one property, stated exactly because the general claim would be false: in an UNSHARDED container -- `max_shards = 0`, so the free list root area is empty and `R = 0` -- the `FileEntry` array starts at the header's own size, and its three `u64` fields with their 24-byte stride are 8-byte aligned at 24 and misaligned at 18. Unsharded is the default and it is the only thing the compact profile permits (§1a), so that is the case worth aligning. It is NOT a claim about sharded containers: there `R = 7 * max_shards * 6 = 42 * max_shards` already decides the alignment and already breaks it at odd shard counts, exactly as it does in the 16-byte header, and this version does not change that.
+**Why the header grew by 8 bytes rather than 2.** `Profile` and `Compression` are one byte each, so 18 would carry them. The six reserved bytes buy one property: the `FileEntry` array starts at the header's own size, and its three `u64` fields with their 24-byte stride are 8-byte aligned at 24 and misaligned at 18. When version 6 was written this was stated for UNSHARDED containers only, because a free list root area of `R = 7 * max_shards * 6` bytes then sat between the header and the entries and broke the alignment at odd shard counts. That area was removed on 2026-10-08 (*Block 0 Layout* below), so the property holds for every full-profile container.
 
 The reserved bytes are not a growth area. A reader MUST refuse a non-zero value in them, because "ignored" and "unknown" are the same byte, and §1c says what ignoring an unknown byte has already cost this format. The only way to spend them is another version bump, which is the intended cost.
 
@@ -82,11 +105,12 @@ different claim even where it is not yet a different layout.
 > identity, paths and the MCR fields — see `codetracer_trace_writer/meta_dat.nim`),
 > and no reader looks for one.  A member's compression is a property of its
 > **format, fixed by its name**: a Chunked Compressed Table (§7; `steps.dat` +
-> `steps.idx`, the MCR thread streams `tNNN` + `iNNN`, the MCR snapshot payloads
-> `<stem>.<x>zd` + `<stem>.<x>zi` of [internal-files.md](internal-files.md)) keeps
+> `steps.idx`, and the chunked members other producers define, such as the MCR
+> recorder's thread streams and snapshot payloads, which `codetracer-specs`
+> specifies) keeps
 > independent zstd frames in its data member and their offsets in its index
-> member, and so does a seekable-zstd stream such as an MCR per-file thread stream
-> ([seekable-zstd.md](seekable-zstd.md)); a member whose format is not one of
+> member, and so does a seekable-zstd stream ([seekable-zstd.md](seekable-zstd.md); the
+> materialized writers' `events.log`, which used it, is removed); a member whose format is not one of
 > those is stored exactly as written.  No current writer compresses the
 > container as a whole — the MCR recorder's buffered mode, which did, has been
 > removed.
@@ -99,74 +123,193 @@ different claim even where it is not yet a different layout.
 
 ### Block 0 Layout
 
-Block 0 contains the header, free list roots, and file entries. The offsets below are the versions 2--5 layout; for version 6 substitute the 24-byte header and the `24 + R` offsets given in §1a. The compact profile has no block 0 at all.
+Block 0 contains the header and the file entries. The offsets below are the versions 2--5 layout; for version 6 substitute the 24-byte header given in §1a. The compact profile has no block 0 at all.
 
 ```
 Block 0 (versions 2 .. 5):
   [0..15]                       ContainerHeader (16 bytes)
-  [16..16+R-1]                  Free list roots (R bytes, fixed area)
-  [16+R .. BlockSize-1]         FileEntry array (remaining space)
+  [16 .. BlockSize-1]           FileEntry array (remaining space)
 ```
 
-**Free list root area size:** `R = 7 * max_shards * 6` bytes (7 pool sizes, 6 bytes per root entry). Each root entry is `(block_num: u32, slot_index: u16)` = 6 bytes. Roots are laid out as `roots[shard_id][pool_class]` in row-major order. With `max_shards = 16`: `R = 672` bytes.
+The entry array starts immediately after the header, whatever `MaxShards` says. Entry `i` is at
+`16 + 24 * i` (version 6: `24 + 24 * i`), so every word of every entry is 8-byte aligned and lies
+within one block.
 
 **Auto-fill:** When `MaxRootEntries` is 0, file entries fill the remainder of block 0:
 
 ```
-auto_entries = (BlockSize - 16 - R) / 24
+auto_entries = (BlockSize - 16) / 24
 ```
 
-For BlockSize=4096, max_shards=16: `auto_entries = (4096 - 16 - 672) / 24 = 142` (this line said 141 until 2026-09-29; 3408 / 24 is exactly 142).
+For BlockSize=4096: `auto_entries = (4096 - 16) / 24 = 170`. A reader MUST apply this rule to a
+header carrying `0`. A reader that reads `0` as "no entries" reads an empty container and reports
+success.
 
-For BlockSize=4096, max_shards=0 (R=0): `auto_entries = (4096 - 16) / 24 = 170`.
-
-If `MaxRootEntries * 24 + 16 + R > BlockSize`, file entries overflow into contiguous blocks after block 0:
+If `MaxRootEntries * 24 + 16 > BlockSize`, file entries overflow into contiguous blocks after block 0:
 
 ```
-root_blocks = ceil((16 + R + MaxRootEntries * 24) / BlockSize)
+root_blocks = ceil((16 + MaxRootEntries * 24) / BlockSize)
 ```
 
-Data block allocation begins at block number `root_blocks`.
+Data block allocation begins at block number `root_blocks`. The blocks `[0, root_blocks)` are the
+**root region**. They hold the header and the entry array, they are never data or mapping blocks,
+and a writer pads the region to whole blocks.
 
-> **Implementation status (2026-09-29, `MCR-Memory-Page-CAS.milestones.org`
-> CAS-Z0).**  The overflow is implemented by the Nim writer and by every reader
-> of MCR recordings:
+#### The free list root area is removed (2026-10-08)
+
+Until 2026-10-08 this section placed a **free list root area** of `R = 7 * max_shards * 6` bytes
+between the header and the entry array. It is removed: `R` is `0` for every value of `MaxShards`.
+The owner's rule was to remove it only if nothing needs it; the evidence below is that argument.
+A writer MUST NOT reserve bytes between the header and the entries, and a reader MUST NOT skip any.
+
+**Why it was invented.** The area was added on 2026-04-21/22, before any implementation existed
+(`codetracer-specs` ae9bb8021, "namespaces use B-tree (not hash table), global free lists", and
+bf8011e1e, "free list roots in block 0 before file entries, max_shards in header"). The design then
+was a **container-global sub-block allocator**: the 32 B to 2048 B pools of §8 shared by *every*
+namespace in the container, so that a slot released when one namespace promoted a value could be
+reused by another, with one free list per pool class *per shard* (the home shard of a key, §9). Its
+heads moved from a member (`pool-state.dat`, then `pools.dat`) into block 0 so that they were "always
+available in a single block read". It was never meant for whole-block reuse of copy-on-write B-tree
+pages; that design came later and put its free chain inside the namespace.
+
+**Why nothing needs it (the certainty argument).** Read on 2026-10-08 at the tips named:
+
+1. **No implementation of the design it served keeps state there.** The sub-block pools that were
+   built (`codetracer-trace-format-nim` `ff17c78`, `sub_block_pool.nim`, milestone
+   `CTFS-Format-Evolution` M8) are per namespace: a slot's `blockIdx` is "block index within the
+   pool's buffer (not CTFS block num)", and the heads are serialized into the namespace's own image
+   (`namespace.nim`, the `"NS"` v2 blob's `freeListHead` per pool). M8's deliverable "heads in
+   block 0" was checked off for code that does not do it. The sharded variant (M10,
+   `shard_writer.nim`) records "Per-shard free list management inside each ShardWriter (not in main
+   file)". The copy-on-write B-tree (`cow_btree.nim`, milestone `CTFS-Lazy-Seekable-Coverage` M3)
+   reclaims superseded pages through a chain rooted in its own header's `free_list_head`, "no
+   separate B-tree free-list". Promotion, the only operation that ever freed a sub-block, is reached
+   only from tests (`shard_writer.promoteSlot`).
+2. **No writer writes the area.** Every writer places entry `i` at `16 + 24 * i`
+   (`codetracer_ctfs` `fileEntryOffset`; the Rust `CtfsWriter`; the db-backend's writers; the
+   native backend's `ctfs_meta_writer.rs`, which writes `max_shards = 0`); no producer writes
+   `max_shards != 0` (the only container that does is the test `test_container.nim`'s
+   `createCtfs(maxShards = 4)`, whose entries are at 16 as well).
+3. **Every reader that mentions it only skips it, and none agree.** Readers that add `R` before
+   the entries: `cas_dedup/ctfs.py` (8 classes), the wasm recorder's Go reader `container.go` (8),
+   the recorder's test helper `cas_d1_support.nim` (8), the Nim compact converter `compact.nim` (7).
+   `rootBlockCount` (Nim, 7) and `mcr_enrichment.nim` (7) reserve it in the block count only. None
+   interprets the bytes. The db-backend overlay's `read_free_list_roots` / `write_free_list_roots`
+   (`block_overlay.rs`, added with its M2 in 0232fd138, 2026-06-22, for "the M3 free-list/B-tree
+   work") have no caller at `codetracer` `35b08e67e`; M3 then put the free chain in the namespace.
+4. **The one byte-level witness disagreed with the old text.** This repository's
+   `fixtures/minimal_trace.ct` declared `max_shards = 1` with its entries at 16 until it was
+   regenerated by the split-stream writer on 2026-10-08 (94b7dcc); it now declares `max_shards = 0`
+   (read at 4fc5486), so no container in the workspace declares a shard count at all.
+
+So: no implementation keeps or reads free-list state in block 0, no writer reserves it as specified,
+and the design it served was built differently. That is why it is removed rather than repaired. The
+readers that skip it follow in the rollout (`codetracer-specs`
+`milestones/CTFS-Keyed-Families.milestones.org` CKF-4 and CKF-6); none of their outputs changes for
+any container a producer writes, since all have `max_shards = 0`. The removal also makes every entry
+word 8-byte aligned at every shard count.
+
+**What the area was for, and where that need is met now.** Space no longer used on disk is the
+concern it served. Under this specification nothing reuses a block while a container may be read
+(§1, rule 2; §6, "What is mutated in place"), so dead space is not reclaimed by a container-level
+free list at all: it is bounded per member family and reclaimed by repacking
+(§6, "Dead space"). Allocation state that a future sharded allocator needs lives with the shard
+(§9) or in the live coordination page while the container is written (§6), never in block 0.
+
+### The Root Directory Is Fixed At Creation (normative)
+
+`MaxRootEntries`, and so `root_blocks`, is chosen by the writer when it creates the container. It is
+written with the first publication of block 0 and never changes afterwards.
+
+1. **The header is written once.** After its first publication, a writer never changes bytes 0..15
+   of block 0 (0..23 at version 6). A writer that rewrites block 0 as a whole writes the same
+   header bytes back.
+2. **Growing the root directory is not an operation.** No writer, appender, exporter, slicer or
+   other tool increases `MaxRootEntries` of an existing container, moves an allocated block to
+   another block number, or rewrites pointers so that a block may be reused for anything else. A
+   container that needs a larger directory is a different container: it is produced by copying
+   members into a new one, as an export does.
+3. **A full directory is a refusal.** Creating a member when no empty slot remains MUST fail,
+   naming the member, the occupancy (`N of N entries used`) and `root_blocks`. The writer MUST NOT
+   drop the member and continue. A recording that cannot store a member it needs fails the
+   recording, naming the member, rather than closing a container that lacks it.
+4. **The producer declares the count it needs.** A producer sizes the directory for the closed set
+   of members it writes. A family whose count grows with the recording goes into a keyed member
+   (§7a), never into the root. The RECOMMENDED declaration is `0`, one block (170 entries at the
+   default block size), unless the producer's closed set needs more.
+
+**What a reader may rely on.** Because the root region never grows and no block ever moves, a reader
+MAY read `MaxRootEntries` and `root_blocks` once, when it opens the container, and keep them for the
+container's whole life, including while the container is still being written. A block number it has
+resolved keeps naming the same block. A block number in `[1, root_blocks)` is never a data block or
+a mapping block, and a reader MUST refuse it wherever it resolves one, exactly as it refuses `0`
+(§4, "Null block pointers on the read path").
+
+**Why this is the rule, and the alternative that was tried.** In October 2026 the Nim library grew a
+full directory in place (`codetracer-trace-format-nim` 7ccbb8b, b253090; the MCR recorder adb8608ef).
+It doubled the root region, copied the data blocks it took over to the end of the container, and
+rewrote the pointers it knew about. No specification described it, and it broke four things this
+document relies on:
+
+- §6's reader protocol re-reads `Size` and `MapBlock` but not the header. Eight live and following
+  readers in the workspace froze `MaxRootEntries` at open, which was correct while it was immutable.
+  After a growth they missed every new entry. A reader that held a `MapBlock` or a mapping block from
+  before the growth resolved it into the new root region and read entry bytes as data.
+- Any member that stores a container block number (a namespace as §8 specified it until 2026-10-07;
+  a keyed member in address form (b), [ctfs-keyed-families.md](ctfs-keyed-families.md) §2.3) would
+  hold numbers a growth did not rewrite.
+- A closed-container append that grew rewrote every byte from the new root to the old end of file.
+  It could no longer claim that an interrupted append damages no existing stream.
+- The root region was published as one write, header first. A torn write or a concurrent reader
+  could pair the new `MaxRootEntries` with the old bytes behind it.
+
+The owner chose a bounded root on 2026-10-07: unbounded families move into keyed members, and
+growth is retired. Recorded in
+`codetracer-specs/issues/2026-10-07-ctfs-root-directory-growth-landed-without-a-spec-change.md`.
+Which structure each family uses is chosen by benchmark ([ctfs-keyed-families.md](ctfs-keyed-families.md)
+§7). The rollout is `codetracer-specs/milestones/CTFS-Keyed-Families.milestones.org`.
+
+> **Implementation status (2026-10-08).**  Measured by the CTFS member census of 2026-10-06
+> (codetracer-trace-format-nim `bb7376e`, codetracer-native-recorder `851dd4d73`).
 >
-> - `codetracer_ctfs` (`codetracer-trace-format-nim`): `createCtfs` reserves
->   `root_blocks` blocks and starts data at block `root_blocks`
->   (`rootBlockCount`); the streaming publishes (`addFile`,
->   `truncateFileContent`, `syncRootBlock`, `syncAllEntries`) write the whole
->   root region; `writeToFile` refuses a mapping or data block inside it.
->   `readInternalFile` / `hasInternalFile` read the whole file and need no
->   change.  Pinned by `tests/test_root_directory_overflow.nim`.
-> - The MCR recorder declares `root_blocks = 16` (2730 entries) for a
->   recording that takes periodic checkpoints (three members each) and block 0
->   alone (170) for every other recording.  Its disk root reader
->   (`ctfs_disk.readCtfsRootBlock`, under the replay-worker's and debugserver's
->   streaming loader) reads the whole region; `export --portable` and `slice`
->   size their output past block 0 when they must.
-> - `ct upload`'s enrichment check (`codetracer`,
->   `mcr_enrichment.readCtfsRootDir`) reads the whole region instead of
->   clamping the count to block 0.
+> - **Conforming: a root declared at creation.** `codetracer_ctfs`
+>   (`codetracer-trace-format-nim`, since c212173) reserves `root_blocks` blocks
+>   at `createCtfs` and allocates data from block `root_blocks`; `writeToFile`
+>   refuses a mapping or data block inside the region. Pinned by
+>   `tests/test_root_directory_overflow.nim`.
+> - **Not conforming, retired by `CTFS-Keyed-Families` CKF-8: growth.**
+>   `codetracer_ctfs` 7ccbb8b and b253090 grow a full directory
+>   (`container.nim` `growRootDirectory`; `container_append.nim`), and the MCR
+>   recorder relies on it (adb8608ef; the recorder at `c5d7fc33f` pins
+>   `ff17c78`, which contains it). Until CKF-8 removes it, a container
+>   written through those revisions can carry a `MaxRootEntries` larger than the
+>   one it was created with, and blocks that moved.
+> - **Not conforming: readers and a library that still account for the removed
+>   free list root area.** `codetracer_ctfs`'s `rootBlockCount` reserves `R`
+>   (7 classes) and its compact converter skips it; `cas_dedup/ctfs.py`, the
+>   wasm recorder's Go reader and a recorder test helper skip `R` computed with
+>   8 classes. No producer shards, so no recording is read differently; they
+>   follow in `CTFS-Keyed-Families` CKF-4 and CKF-6.
+> - **Not conforming: rewriting or truncating a published member.**
+>   `codetracer_ctfs` offers `truncateFileContent` and `rewriteFileContent`, and
+>   the MCR recorder uses them to republish its live `corrmark.ns` on every span
+>   marker (`codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md` §2.8): a
+>   same-size image is rewritten in place (a multi-block overwrite a live reader
+>   can see torn, not one of §6's in-place classes) and a size change truncates,
+>   then appends (a moment of `Size = 0`, and an abandoned image per size change).
+>   A completed recording loses nothing. `span_emit` uses `truncateFileContent`
+>   to replace `spantype.ns` in a closed recording, which §5 forbids ("replacing
+>   a member is not an operation"). Both are replaced in `CTFS-Keyed-Families` CKF-5.
+> - **Block 0 only.** The Rust `codetracer_ctfs` writers (`writer.rs`,
+>   `concurrent_writer.rs`) allocate from block 1, so they MUST NOT be given a
+>   count past block 0 until CKF-4R makes them honour `root_blocks`. The Go reader in
+>   `codetracer-wasm-recorder` refuses a root past block 0, and the db-backend's
+>   `block_overlay.rs` reads block 0 only
+>   (`codetracer-specs/issues/2026-09-29-db-backend-block-overlay-reads-root-directory-from-block-0-only.md`).
 >
-> Still block 0 only, and not handed an MCR recording today:
-> `codetracer_ctfs`'s `container_append` (refuses a count past block 0, by
-> name); the Rust `codetracer_ctfs` writers (`writer.rs`,
-> `concurrent_writer.rs`: one root block, allocation from block 1, so they
-> MUST NOT be given a count past block 0); the Go reader in
-> `codetracer-wasm-recorder` (refuses).  Still block 0 only and ON an MCR
-> recording's path, though dormant: `db-backend`'s `block_overlay.rs`, which
-> the materialization cache opens over the session's `.ct` to persist into it
-> (reached only once a replay worker answers `MaterializeInterval`, which
-> `ct-native-replay` refuses today); on a recording past 170 entries it would
-> report the directory full.  Filed as
-> `codetracer-specs/issues/2026-09-29-db-backend-block-overlay-reads-root-directory-from-block-0-only.md`.  The other readers surveyed
-> on 2026-09-29 -- the Rust `CtfsReader` / `concurrent_reader.rs`,
-> `db-backend`'s `ctfs_container.rs`, `backend-manager`'s `meta_dat.rs`,
-> `codetracer-native-backend`'s `mcr_ctfs_read_file_from_data`,
-> `cas_dedup/ctfs.py` -- index the entry array from the start of the file by
-> the header's count, so they read an overflowed directory unchanged.  That is
-> established by reading their code, not by a test of each.
+> How the MCR recorder sizes its root, and the note this one replaces (its
+> 2026-09-29 MCR-specific parts), are in `codetracer-specs`
+> `spec/Trace-Files/CTFS-Binary-Format.md`.
 
 ### 1a. Profile and Whole-File Compression (version 6)
 
@@ -176,23 +319,22 @@ Version 6 is version 5's body plus eight header bytes. Everything §2 says about
 
 | Value | Name | Body |
 |-------|------|------|
-| `0` | full | Block 0, free list roots, `FileEntry` array, block map -- everything from *Block 0 Layout* above and §2 onward |
+| `0` | full | Block 0, `FileEntry` array, block map -- everything from *Block 0 Layout* above and §2 onward |
 | `1` | compact | A directory of `(name, offset, length)` and the members concatenated raw, with no block map and no mapping blocks -- §1d, which is normative for every offset. A reader that does not implement it MUST refuse it rather than attempt the full body. Which profile a WRITER produces, and what a mid-recording switchover between them must preserve, is §1e |
 
 The set is CLOSED: `0` and `1` are the only defined values and every other value is a refusal.
 
 A compact container MUST write `max_shards = 0`. Block sharding (§9) partitions a block-number space, and the compact profile has no blocks, so "one shard" and "no sharding" would again be two spellings of one state -- the defect the `max_shards` note above was written for.
 
-In a version-6 **full** container the free list root area and the `FileEntry` array start 8 bytes later, because the header is 8 bytes longer. Every other offset in this document is relative to those and so is unchanged:
+In a version-6 **full** container the `FileEntry` array starts 8 bytes later, because the header is 8 bytes longer. Every other offset in this document is relative to it and so is unchanged:
 
 ```
 Block 0 (version 6, profile = full):
   [0..23]                       ContainerHeaderV6 (24 bytes)
-  [24..24+R-1]                  Free list roots (R bytes, fixed area)
-  [24+R .. BlockSize-1]         FileEntry array (remaining space)
+  [24 .. BlockSize-1]           FileEntry array (remaining space)
 
-auto_entries = (BlockSize - 24 - R) / 24
-root_blocks  = ceil((24 + R + MaxRootEntries * 24) / BlockSize)
+auto_entries = (BlockSize - 24) / 24
+root_blocks  = ceil((24 + MaxRootEntries * 24) / BlockSize)
 ```
 
 `Compression` says whether the container body is stored under a whole-file scheme. The field covers **the container image from offset 24 to the end of the stored object**; the 24-byte header is always stored as plaintext, since it is what declares the scheme. A reader reconstructs the image as `header || decompress(rest)` and then every offset in this document holds unchanged, including block numbering -- block 0 is still the first `BlockSize` bytes of the reconstructed image and its first 24 bytes are still the header.
@@ -277,9 +419,9 @@ and a container whose length is not that value is refused. That identity is the 
 
 **Why contiguity and the total, and not merely a bounds check.** A reader that checked only `Offset + Length <= Size` would accept a directory one of whose offsets had been perturbed and would then serve a member that is SHIFTED, or one of whose lengths had been perturbed and serve a member that is SHORT -- in both cases successfully, with no indication. Checks 2, 3 and 4 make a single perturbed `Offset` or `Length` field unrepresentable: either it breaks contiguity with its neighbour or it breaks the total, and there is no value it can take that does neither while leaving the member it describes wrong. This is the same argument as §1c's, one level down -- a structure that admits a wrong value a reader cannot distinguish from a right one is not a specification of that structure. It is not a checksum and does not claim to be: a flipped bit in a `Name` yields a different, well-formed name, and what the checks guarantee is that it cannot yield a wrong member's bytes under a right name.
 
-**The directory is not a block map, and that is the design rather than a simplification.** A block map answers *which block holds byte N of this member*, which is what random access into a large member needs and what property 2 and design goal 5 are about. A directory answers *where does this member start and how long is it*, which is what a one-shot load needs. The second costs one `(u64, u64)` per member against a 4 KB mapping block per member, and it is sufficient precisely because the whole file is resident before the first query is asked. The compact profile is therefore not a cheaper encoding of the full profile's structure; it answers a different question, and it is the right profile only for a container small enough that the answer to the first question is always "all of it".
+**The directory is not a block map, and that is the design rather than a simplification.** A block map answers *which block holds byte N of this member*, which is what random access into a large member needs and what goals G7 and G8 are about ("Goals and properties"; property 2 and design goal 5 before 2026-10-08). A directory answers *where does this member start and how long is it*, which is what a one-shot load needs. The second costs one `(u64, u64)` per member against a 4 KB mapping block per member, and it is sufficient precisely because the whole file is resident before the first query is asked. The compact profile is therefore not a cheaper encoding of the full profile's structure; it answers a different question, and it is the right profile only for a container small enough that the answer to the first question is always "all of it".
 
-**There is NO alignment requirement, and that is a statement about what alignment is for.** Nothing in a compact container is padded to a block, a page or a word: the directory begins at 28, a member begins wherever its predecessor ended, and a 12-byte member occupies 12 bytes. Design goal 5 -- "block-aligned layout maps to HTTP range requests; one 4 KB fetch reveals full structure" -- is what alignment serves, and it is correct for the full profile. A compact container is fetched whole and issues no ranged read, so there is nothing for alignment to serve and a reader MUST NOT round any offset or length to a boundary. A writer that aligned anyway would reintroduce exactly the cost the profile exists to remove, and because of check 4 it would also produce a container every conforming reader refuses.
+**There is NO alignment requirement, and that is a statement about what alignment is for.** Nothing in a compact container is padded to a block, a page or a word: the directory begins at 28, a member begins wherever its predecessor ended, and a 12-byte member occupies 12 bytes. Goals G7 and G8 -- "block-aligned layout maps to HTTP range requests; one 4 KB fetch reveals full structure", formerly design goal 5 -- are what alignment serves, and it is correct for the full profile. A compact container is fetched whole and issues no ranged read, so there is nothing for alignment to serve and a reader MUST NOT round any offset or length to a boundary. A writer that aligned anyway would reintroduce exactly the cost the profile exists to remove, and because of check 4 it would also produce a container every conforming reader refuses.
 
 **Measured effect.** See [`measurements/2026-10-compact-profile.md`](measurements/2026-10-compact-profile.md). On a 17-member, 20,000-step version-5 container the compact layout is 38,481 bytes against 110,592, a 65.2% reduction, and its structural overhead is 436 bytes (1.1%) against 72,547 (65.5%); on the five-member `fixtures/minimal_trace.ct` it is 474 against 24,576, 98.0%. Both predictions -- `28 + 24*N + sum(length)` for the compact size and an independent block model for the version-5 size -- reproduce the measured containers to the byte. The saving is one data block per member plus block 0, and NOT mapping blocks: fifteen of the seventeen members are direct at version 5 and the two mapped ones own 8,192 bytes between them. The same document records a finding that the compact profile's *compressed*-size advantage is compressor-dependent and does not reproduce under `gzip` on that container.
 
@@ -307,7 +449,7 @@ What is deliberately NOT claimed here is that raw members also make the stored o
 
 ### 1f. A Framed Member In A Compact Container (normative)
 
-§1d says a compact container's members carry no per-member compression, and §1e says it of the output. Some member formats ARE a sequence of independently compressed frames located by offsets: the chunked compressed tables of §7 (`steps.dat` with `steps.idx`, and likewise `values`, `calls`, `events`, `spans` and the MCR snapshot payloads), `step-map.ns` ([internal-files.md](internal-files.md) §"`step-map.ns`"), and the seekable-zstd streams of [seekable-zstd.md](seekable-zstd.md). This section is how such a member is stored in a compact container, so that two writers store it alike and every reader reads it.
+§1d says a compact container's members carry no per-member compression, and §1e says it of the output. Some member formats ARE a sequence of independently compressed frames located by offsets: the chunked compressed tables of §7 (`steps.dat` with `steps.idx`, and likewise `values`, `calls`, `events`, `spans`, and producer-defined chunked members such as the MCR recorder's), `step-map.ns` ([internal-files.md](internal-files.md) §"`step-map.ns`"), and the seekable-zstd streams of [seekable-zstd.md](seekable-zstd.md). This section is how such a member is stored in a compact container, so that two writers store it alike and every reader reads it.
 
 **Each frame is replaced by its decompressed content, and each offset that located a frame locates that content: in the same units, from the same origin.** Nothing else in the member changes. The records inside a chunk, the number of chunks, which records each chunk holds, the index member's header, its length and its other columns, and the step map's header and chunk-table keys are byte for byte what the full container of the same recording carries. Concretely:
 
@@ -325,18 +467,33 @@ A **reader** of a compact container takes a chunk's bytes as its content. It MUS
 
 | Version | Description |
 |---------|-------------|
-| 6 | 24-byte header with `Profile` and whole-file `Compression` (§1a, §1b) and six reserved bytes that MUST be zero. At `Profile = 0` the body is version 5's, so §2's `MapBlock` forms are unchanged; at `Profile = 1` the body is the compact layout of §1d -- a directory and the members concatenated, with no block 0, no mapping block and no alignment. NOT backward compatible, deliberately: the `FileEntry` array moves to `24 + R`, and a reader predating this version refuses the container at the version check rather than reading entries out of the reserved area (§1c). A writer emits 6 only for a container that uses one of the new fields, and §1e says which profile it chooses and what a mid-recording switchover must preserve. |
+| 6 | 24-byte header with `Profile` and whole-file `Compression` (§1a, §1b) and six reserved bytes that MUST be zero. At `Profile = 0` the body is version 5's, so §2's `MapBlock` forms are unchanged; at `Profile = 1` the body is the compact layout of §1d -- a directory and the members concatenated, with no block 0, no mapping block and no alignment. NOT backward compatible, deliberately: the `FileEntry` array moves to `24`, and a reader predating this version refuses the container at the version check rather than reading entries out of the reserved area (§1c). A writer emits 6 only for a container that uses one of the new fields, and §1e says which profile it chooses and what a mid-recording switchover must preserve. |
 | 5 | A member of at most one block is stored without a mapping block, its `MapBlock` carrying the direct-block tag (§2, "Members of at most one block"); an empty member has `MapBlock = 0`. Readers MUST accept 5 -- and 6, which is 5's body behind the extended header -- and MUST refuse every version they do not implement, naming it (§2, "Older versions are refused"; §1c). Writers MUST write 5 unless the container uses a version-6 field. |
 | 4 | Query protocol, network reader, replication, RAM cache, cached trace reader. Backward compatible: v4 readers accept v3 and v2 containers. |
 | 3 | 16-byte header with encryption; binary metadata; BlockSize 4096; MaxRootEntries 0 auto-fill; small file optimization; namespaces |
 | 2 | Extended header with BlockSize and MaxRootEntries |
 | 1 | Initial format |
 
+**The keyed-families revision (2026-10-08) changes no version.** It makes `MaxRootEntries` immutable and growth a
+non-operation (§1), states the goals the format keeps ("Goals and properties"), adds the in-place
+record publication rule and the writer architectures (§6) and keyed members (§7a), and makes
+namespaces member-relative with a live publication protocol (§8). It removes the free list root
+area (§1), adds the live coordination page (§6) and bounds dead space (§6), and states how the
+block-placement rule of the same date composes with them (§6). No container any producer has written
+changes meaning: no producer has written a sharded container, a keyed member, or an
+in-container namespace holding container block numbers, and the live coordination page changes no
+byte on disk. Each keyed family's byte layout is added by the benchmark decision
+([ctfs-keyed-families.md](ctfs-keyed-families.md) §8), and may bump a member's version, not the
+container's. A
+container that a growing writer enlarged (codetracer-trace-format-nim 7ccbb8b to its retirement) is
+still read correctly by a reader of a closed container. It is not conforming, and is re-recorded
+rather than kept: pre-1.0 there is no compatibility path (§2, "Older versions are refused").
+
 ---
 
 ## 2. File Entry (24 bytes)
 
-An array of file entries follows the free list roots in block 0.
+An array of file entries follows the header in block 0, and continues through the root region (§1).
 
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
@@ -421,8 +578,9 @@ bytes into the container, past any file a 64-bit offset can address. A
 reader that predates version 5 refuses the container by its version byte; one that ignored the
 version would meet a block number beyond its bound check and refuse it there, not misread it.
 
-The small-member layout applies to `FileEntry.MapBlock` only. Namespace descriptors (§8) and the
-chain and child pointers inside a mapping (§4) are unchanged.
+The small-member layout applies to `FileEntry.MapBlock` and to the `map_block` of every stream
+record of a keyed member (§7a), which has the same three forms. Namespace descriptors (§8), which are
+member-relative, and the chain and child pointers inside a mapping (§4) are unchanged.
 
 **Older versions are refused.** A reader MUST refuse a container whose version byte is not one it
 implements, naming the version it found and the ones it reads, before it resolves any member.
@@ -519,7 +677,7 @@ while value > 0:
 ### Properties
 
 - **Numeric sort order:** Zero-padded numeric names sort numerically as u64 values.
-- **Maximum length:** 12 characters. Accommodates all CTFS internal names: `meta.dat` (8), `steps.dat` (9), `threads.ns` (10), `syncord.log` (11), `linehits.tc` (11), `memwrites.tc` (12).
+- **Maximum length:** 12 characters. Accommodates the internal names this specification defines, for example `meta.dat` (8), `steps.dat` (9), `linehits.tc` (11), `step-map.ns` (11), `memwrites.tc` (12). A family of members that would need more distinguishing characters than that (one name per thread, per checkpoint) is a sign the family belongs in a keyed member (§7a), keyed by a `u64`.
 
 ---
 
@@ -562,6 +720,27 @@ Given byte offset `pos`:
 1. If `MapBlock` is `0`, the member is empty (§2). If it carries `CTFS_DIRECT`, the data block is `MapBlock & ~CTFS_DIRECT` and `pos` is below `BlockSize` (§2). Neither case reads a mapping block.
 2. Otherwise, compute `block_index = pos / BlockSize`. Determine the mapping level, follow chain pointers to that level, navigate down through mapping entries (dividing by powers of `usable`) to reach the data block. At most 5 block reads.
 
+**The levels are cumulative (normative).** Level 1 addresses data blocks `[0, usable)`, level 2
+addresses `[usable, usable + usable^2)`, and so on. The level-2 block does not re-parent the level-1
+root, so its slot `[0]` does not cover data blocks `0 .. usable-1` a second time. The index is rebased
+by each level's capacity as the chain is walked up:
+
+```
+idx = block_index; level = 1; node = MapBlock
+while idx >= usable^level:
+    idx  -= usable^level
+    level += 1
+    node   = node[usable]        # chain pointer; allocate on write
+# then descend: at level k, entry idx / usable^(k-1) selects the child, the remainder recurses
+```
+
+The cumulative capacity of an `L`-level member is therefore `usable + usable^2 + ... + usable^L`,
+slightly more than the per-level figures in the table above. The two readings produce different
+bytes for every member larger than `usable` data blocks, about 2 MB at the default block size, and
+a reader using the wrong one returns the wrong data blocks without failing. Every writer in the
+workspace (`codetracer_ctfs`'s `block_mapping.nim`, the Rust `CtfsWriter`) lays members out this way.
+This rule was stated only in `codetracer-specs`' `CTFS-Binary-Format.md` §4 until 2026-10-07.
+
 ### Block Allocation
 
 - **Claim block:** `atomic_fetch_add(NextFreeBlock, 1)` -- the only shared mutable state.
@@ -574,7 +753,7 @@ A refusal must be all-or-nothing: a writer that claims its data block before wal
 
 This binds *writers*. A **reader** meeting the same null has no index question to ask -- it simply cannot resolve the block -- and its own rule follows.
 
-**Null block pointers on the read path (normative).** A reader resolving a stream **MUST** refuse that stream, by name, when any block number it resolves is `0`: the entry's mapping root, a chain pointer, a level-`k` child pointer, or a data-block pointer. Block 0 is the container's header and root directory, and `0` is the "unallocated" sentinel, so no stream may name it. This is **independent of, and additional to**, the whole-block bound a reader applies to a container whose length is not a block multiple: a null passes that bound trivially, since `0` is below every non-empty container's block count. A reader that omits it does not merely fail to detect damage -- it walks *into* block 0 and reads the container's own header and root directory as the stream's mapping table, so entry fields decode as block pointers and unrelated blocks are returned as the stream's content.
+**Null block pointers on the read path (normative).** A reader resolving a stream **MUST** refuse that stream, by name, when any block number it resolves is `0`, or lies in the rest of the root region, `[1, root_blocks)` (§1): the entry's mapping root, a chain pointer, a level-`k` child pointer, or a data-block pointer. The root region holds no data and no mapping, so a pointer into it is damage of the same kind as a null. Block 0 is the container's header and root directory, and `0` is the "unallocated" sentinel, so no stream may name it. This is **independent of, and additional to**, the whole-block bound a reader applies to a container whose length is not a block multiple: a null passes that bound trivially, since `0` is below every non-empty container's block count. A reader that omits it does not merely fail to detect damage -- it walks *into* block 0 and reads the container's own header and root directory as the stream's mapping table, so entry fields decode as block pointers and unrelated blocks are returned as the stream's content.
 
 Three consequences bind with it:
 
@@ -582,7 +761,7 @@ Three consequences bind with it:
 - **A null is not a truncation.** The refusal **MUST NOT** blame a truncated or interrupted tail write. A container carrying a null pointer is typically a whole number of blocks and otherwise intact, and a message naming truncation sends an operator or a repair tool after damage that is not there.
 - **A caller-visible failure, not a crash.** The block number comes out of the container, so on a damaged one it is corruption-controlled. It **MUST** be refused before it is multiplied by `BlockSize`; computing the offset first can overflow and abort the process instead of returning an error.
 
-See `CTFS-Binary-Format.md` section 4, "Null pointers during allocation", and section 5d, "Null block pointers on the read path", for the full statement and the measurements behind both halves.
+The measurements behind both halves, and the workspace-wide reader sweeps that found them, are recorded in `codetracer-specs` `spec/Trace-Files/CTFS-Container-Notes.md` (moved there from `CTFS-Binary-Format.md` §4 and §5d on 2026-10-07).
 
 ### Diagram
 
@@ -614,9 +793,12 @@ FileEntry
 
 ### Creating a File
 
-1. Find an empty slot in the file entry array (all 24 bytes zero).
+1. Find an empty slot in the file entry array (all 24 bytes zero). Any empty slot in the root region may be used, so a reader cannot assume members appear in slot order (§6).
 2. Encode the filename using base40 and write to the `Name` field. Leave `Size` and `MapBlock` as zero. Claim no block: a member that is never written stays `(0, 0)` (§2).
-3. Sync block 0 for concurrent readers.
+3. Publish the entry for concurrent readers (§6, "Root publication").
+
+If no empty slot remains, the creation fails, naming the member and the occupancy (§1, "The root
+directory is fixed at creation", rule 3). There is no fallback.
 
 ### Appending Data
 
@@ -634,6 +816,87 @@ After writing: atomically update `FileEntry.Size` (makes data visible to readers
 - Return EOF if `offset >= file_entry.size`.
 - Clamp read length to file size boundary.
 - For each spanned block: resolve it as §4 says -- the tagged block directly, otherwise through the mapping hierarchy -- and read its bytes.
+
+### Adding Members To A Closed Container (normative)
+
+The algorithms above describe a writer that is still building its container. A second operation adds
+members to a container that has already been closed: the file is complete, no writer holds it open,
+and a producer of derived data (computed from a finished trace, and specified to live inside the same
+`.ct`) adds its members. Without this operation such a producer would write a sidecar file or
+re-implement the container layout, and both are wrong.
+
+**Reopening.** The appender recovers the writer's state from the bytes:
+
+- `BlockSize`, `MaxRootEntries` (a `0` means auto-fill, §1) and so `root_blocks` come from the
+  header. The root may be any number of blocks the writer declared.
+- `NextFreeBlock` is not stored. It is recovered as `file_length / BlockSize`. That is sound only
+  because every allocated block is materialised on disk, so a closed container is a whole number of
+  blocks. A file length that is not a block multiple means the container is truncated or still being
+  written, and the appender MUST refuse it rather than round: a wrong `NextFreeBlock` overwrites live
+  data. A **reader** MUST accept the same file, computing `floor(file_length / BlockSize)` and ignoring
+  the partial tail, because a crash inside an appender's tail write leaves exactly that shape (below).
+
+The append then runs "Creating a File" and "Appending Data" unchanged. It MUST additionally:
+
+- **Refuse a name that already exists.** Replacing a member is not an operation; a half-replaced
+  member is a silent wrong-bytes failure.
+- **Refuse an encrypted container,** whose mapping is opaque without the key.
+- **Refuse a batch the directory cannot hold whole.** If the root region has fewer empty slots than
+  the batch has members, the append fails before it writes anything, naming the first member that
+  does not fit and the occupancy. It does not grow the directory (§1, rule 2) and it does not attach
+  part of the batch.
+- **Validate every name against the base40 alphabet first.** §3's encoder maps an out-of-alphabet
+  character to the padding index, so an unvalidated `"snap!pages"` is stored as `"snap"`.
+
+**Write ordering.** Every new data and mapping block is written first, from the previous end of file.
+The entries are written last, and they are the only bytes of the root region the append writes: the
+header is not rewritten (§1, rule 1). A crash in between leaves unreferenced trailing blocks, which
+waste space but leave the container readable, rather than an entry pointing at absent data. **Nothing
+in `[root_blocks, previous end of file)` is ever rewritten,** so an interrupted append cannot damage an
+existing member. (This held before October 2026, stopped holding when a growing append rewrote
+everything from the new root to the old end of file, and holds again because growth is retired.)
+
+**Batching.** A set of related members is appended in one call, and its entries are written by one
+write call covering the changed entry bytes. Within one process that write either happens or does
+not, so a crash never leaves part of the set attached. It does not make the set atomic to a reader
+that re-reads the directory while the write is in progress; such a reader can observe a prefix of
+the set. An implementation should not offer a one-member-at-a-time form of this operation.
+
+**A crash inside the tail write.** The tail can be megabytes written in one extending write, so a
+crash can land inside it and leave a file whose length is not a block multiple. The root region still
+holds the previous entries, each pointing below the previous end of file, and the trailing fragment is
+unreferenced. A reader accepts that file, as above. An appender refuses it, because it cannot tell a
+partial tail from a container still being written. Flooring is a bound and not only arithmetic: a
+reader applies `floor(file_length / BlockSize)` to every block number it resolves -- the mapping
+root, every mapping block it walks, and every data block -- because the last data block's read is
+clamped to `Size`, so a short read out of the partial region otherwise succeeds and returns wrong
+bytes.
+
+**The ordering is a durability claim, so test it as one.** Reversing the two phases leaves the final
+bytes identical, so a test that compares the container before and after an append cannot see the
+ordering. An implementation should be able to abandon an append between its phases and assert on the
+file that leaves: the entries unchanged, and the file already grown.
+
+The reference implementation is `codetracer-trace-format-nim`'s `codetracer_ctfs/container_append.nim`,
+exposed to C consumers as `ct_container_append_files`.
+
+### Extending A Member Of A Closed Container (normative)
+
+An appender may also add bytes to the end of a member that already exists in a closed container (a
+derived stream that grows by later passes). It reopens the container as above, refusing the same
+encrypted and non-block-multiple files, and recovers the member's write state from its entry:
+
+- The member's data block count is `ceil(Size / BlockSize)`. The last data block is **pending** if
+  `Size` is not a block multiple: the new bytes are written into its unused tail first, in place, and
+  then into new blocks. The bytes of that block past the old `Size` were never content, so no reader
+  has read them.
+- The walk that locates the last block and the mapping slots to extend applies §4's null-pointer
+  rules: a null that is not the first index its pointer covers is damage, and the append refuses it.
+- The new `MapBlock` (on a direct-to-mapped transition) is stored before the new `Size` (§5,
+  "Appending Data").
+
+A block cache over a container that may be extended this way MUST treat the extended member's last
+data block and its mapping blocks as changed (§6, "What is mutated in place").
 
 ---
 
@@ -661,19 +924,385 @@ No locks, mutexes, or CAS loops -- only atomic fetch-and-add and atomic stores.
 3. Update mapping block pointers (thread-local, no contention); on a direct-to-mapped transition, store the untagged `FileEntry.MapBlock` (one atomic 8-byte store)
 4. Write barrier
 5. Atomically store new `FileEntry.Size`
-6. Flush file entry for concurrent readers
+6. Publish the entry for concurrent readers (below)
 
-### Reader Protocol
+**Publishing a partial block does not consume its logical block index (normative).** Step 6 lets a
+reader see bytes that do not yet fill a block, and the writer normally keeps appending afterwards.
+Those later bytes belong to the same logical block, because a reader resolves byte `p` to logical
+block `p / BlockSize` and nothing in the entry records where a flush happened. So the partial block is
+**pending**: allocated once, linked into the mapping at its index, rewritten in place at each further
+flush, and counted only when the buffer fills it. A writer that instead allocates a fresh block for
+the partial content, and advances its block count, places every later byte one block too early: the
+reader serves the flushed block's padding as content and loses as many real bytes off the end. (The
+Rust `ConcurrentCtfsWriter::flush` did exactly that until it was fixed; the measurement is in
+`codetracer-specs` `spec/Trace-Files/CTFS-Container-Notes.md`.)
 
-1. Read block 0 for file entry array
-2. Read `FileEntry.Size` (re-read periodically for streaming), then `FileEntry.MapBlock`, each with one atomic load
-3. Read data up to `Size` via the form `MapBlock` has (§2). Across a direct-to-mapped transition, loading `Size` before `MapBlock` (acquire) rules out pairing a new `Size` with the old, tagged `MapBlock`, because the writer stored `MapBlock` first; the remaining mixed pairing, an old `Size` with the new mapping, reads correct bytes, because the mapping's slot 0 is the old data block
-4. For compressed streams: use companion index for chunk-level seeking
+### Root Publication
+
+An entry is published by writing its 24 bytes into the root region, or a root block that contains
+them, in the order of the writer protocol: a new entry's `Name` together with zero `Size` and
+`MapBlock`; after that, `MapBlock` (when it changes) before `Size`. Three rules follow from §1 and
+from the atomicity argument of §2:
+
+- **Every entry word is stored and loaded as one 8-byte unit, and lies within one block.** Entry
+  `i` starts at `16 + 24 * i` (`24 + 24 * i` at version 6), so each of its three words is 8-byte
+  aligned (§1). The pairing argument of §2 is stated per word. Whether a reader in another process
+  sees each word whole is the subject of "In-place record publication" below.
+- **A publication writes what changed, not the whole root region.** A writer SHOULD write only the
+  entries, or the root blocks, that changed since its last publication, and MUST NOT rewrite the
+  header (§1, rule 1). A writer that rewrote the whole region at every sealed chunk wrote 256 KiB per
+  seal for a 64-block root, against the 69 µs per seal measured below for a one-block root.
+- **One publisher per root block.** When several writers share a container, a write of a whole root
+  block carries every entry in that block, so it comes from the one publisher that holds the current
+  value of each of those entries. A writer that rewrote a root block from a stale copy would undo
+  another writer's newer `Size`. Under a multi-process writer architecture the root region is not
+  written from copies at all ("Writer architectures", below).
+
+### In-Place Record Publication: The Live Coordination Page (normative)
+
+Some words are stored in place while a reader may be reading them: a root entry's `Size` and
+`MapBlock`, a keyed member's record words (§7a), and the index words a keyed family's realization
+updates in place ([ctfs-keyed-families.md](ctfs-keyed-families.md) §4.3). This section is the rule
+for all of them. A mapping slot and a pending block's bytes past `Size` are not covered: the first
+changes once from `0` and is validated as a pointer (§4), the second is never content until a later
+`Size` covers it.
+
+**The gap.** The reader this format serves lives in another process and reads with
+`pread`/`ReadFile`, or through a read-only mapping. Until 2026-10-08, §2 and §6 argued correctness
+"per word", assuming that an aligned 8-byte store is observed whole by such a read. No operating
+system the format runs on promises that for a file: POSIX's `read`-against-`write` atomicity (XSH
+2.9.7) is stated for threads and Linux does not honour it for reads against writes; Windows makes no
+such promise for `ReadFile`; network file systems promise less. A torn `Size` can exceed both its old
+and its new value (`0x00FF` and `0x0100` tear to `0x01FF`) and send a reader past the data. It holds
+in practice for aligned words on local file systems, and that is all.
+
+**The rule: while a container is being written, its live state lives in shared memory.** Every
+container that is being written has a **live coordination page** (below, "the page"): a
+shared-memory region, one per container, that holds the container's live root state and the live
+copies of every word updated in place, each under a sequence counter. Writers publish there first;
+readers on the same machine attach to it and read consistent values with the ordinary memory
+atomics shared memory provides. The file receives the same words at each seal, for durability and
+for readers that cannot attach. When the container is closed the page is gone and the file is
+static, so no read of a closed container can tear.
+
+The file's footprint does not change: no sequence word is stored in the file, the root entry stays
+24 bytes, and no bit of `MapBlock` is used for this.
+
+> **Rejected: sequence counters on disk.** A draft of 2026-10-07/08 proposed a per-record sequence
+> word stored in the file (a seqlock on disk), with, for root entries, either a 32-byte entry or a
+> counter in `MapBlock` bits 48 to 62, and a checksum variant. The owner rejected all of them:
+> "I see more and more value in the idea of having a shared memory page for coordination between
+> multiple writers and multiple readers while the file is still being written. We can potentially
+> implement these safety mechanism in the shared memory without increasing the footprint of the
+> files." The protection is needed only while a file is being written, by readers on the writer's
+> machine, and the page gives it there without growing every container for its whole life.
+
+#### The page: naming and discovery
+
+- **Identity.** The page belongs to one container file, identified by the file's **identity**: on
+  Linux the device and inode numbers and, where the file system reports it, the birth time
+  (`statx` `stx_btime`); on macOS the device, inode and birth time (`st_birthtimespec`); on Windows
+  the volume serial number and the 128-bit file id (`GetFileInformationByHandleEx`, `FileIdInfo`).
+- **Name.** `ctfs.` followed by the first 24 lowercase hexadecimal digits of SHA-256 over the
+  identity's bytes (each field little-endian, in the order above). On Linux and macOS the object is
+  POSIX shared memory, `shm_open("/ctfs.<24 hex>")` -- 30 characters, inside macOS's 31-character
+  limit; on Windows a named, pagefile-backed section, `CreateFileMappingW(INVALID_HANDLE_VALUE, ...,
+  L"Local\\ctfs.<24 hex>")`. `Local\` scopes it to the logon session; a reader in another session
+  cannot attach (below).
+- **Discovery.** A reader that opens a container computes the identity from its own open handle
+  (`fstat`/`statx`, or the handle's file id), derives the name and tries to open the object
+  read-only. It **attaches** only if the object exists, its magic and version are ones it reads, the
+  identity stored in the page equals the identity of the file it opened, and the page's state is
+  `live`. Anything else -- no object, a mismatch, `closed`, `abandoned` -- means "not attached", and
+  the reader follows the file alone (below). The full identity in the page, not the hash in the
+  name, is what binds the page to the file; a name collision or a reused inode is caught there.
+
+#### The page: contents
+
+The page is a header and a set of mirror slots, all fields little-endian and 8-byte aligned:
+
+| Part | Holds |
+|---|---|
+| header | magic `CTLP`, version, the container identity, the page's capacity, `state` (`creating`, `live`, `closed`, `abandoned`), and `seal_epoch`, incremented after every seal's file writes complete |
+| writers | one slot per writer process: process id, process start time (to tell a reused pid apart), a heartbeat updated at least once per second while it writes, and the `seal_epoch` of its last completed seal |
+| allocation | `NextFreeBlock`; one counter per dense key family whose keys are assigned live (§7a); a bump counter for mirror slots |
+| root mirror | one slot per root entry: `seq`, `Size`, `MapBlock`, `Name` |
+| record mirror | slots for in-place-updated records of keyed members: a table of mirror extents `(member entry index, first record number, record count, first slot)`, and the slots themselves, each `seq` followed by the record's in-place words |
+
+The capacity is fixed at creation and RECOMMENDED to be generous (16 MiB virtual by default): POSIX
+shared memory and Windows pagefile-backed sections commit physical pages only when touched, and a
+macOS shared-memory object cannot be resized after its first `ftruncate`. A record whose mirror slot
+cannot be allocated because the page is full is followed by attached readers at seal granularity,
+as a reader that cannot attach follows it; the page records that it overflowed.
+
+#### Writing through the page
+
+*Per in-place update* (a root entry's `Size`/`MapBlock`, a record's words), by the word's one writer
+(§6, "Multi-producer block allocation"; §7a):
+
+1. Every byte the new value makes reachable -- data, mapping blocks, a new record -- is written to the
+   file first (`pwrite`/`WriteFile`, or through a mapping where that mapping is coherent with the
+   readers' reads, see "Writer architectures").
+2. In the page: store `seq + 1` (odd), with release ordering; store the payload words in the order
+   the record kind requires (for a stream reference, `MapBlock` before `Size`); store `seq + 2` (even),
+   with release ordering. These are ordinary aligned stores to shared memory, which every supported
+   processor makes atomic per word and orders by the stated barriers, across processes as across
+   threads.
+
+*Per seal* (§6, "Durability"; at least as often as the durability rule requires):
+
+3. Write the seal's changed root entries and records to the file, each a whole entry or record per
+   write call, data before the entry that publishes it, as today.
+4. Increment the writer's `seal_epoch` in its writer slot, then the page's `seal_epoch`.
+
+So the page may run ahead of the file between seals (an attached reader can see a partial-chunk
+flush the file does not yet publish), never behind it, and the file is exactly as durable as §6
+"Durability" requires whether or not the page survives. A new record is written whole into the file
+before it is reachable from the page or the file (§7a, rule 3).
+
+#### Reading
+
+**An attached reader** reads every word that can change in place from the page:
+
+1. Load `seq` as `s1`. If `s1` is `0`, the word was never published. If `s1` is odd, retry.
+2. Load the payload words.
+3. Load `seq` as `s2`. Accept the payload if and only if `s2 == s1`; otherwise retry.
+
+It retries a bounded number of times (8 is RECOMMENDED) and otherwise keeps the last value it
+accepted for this refresh. It reads data, mapping and record bytes from the file, which step 1 of the
+writer put there before the page published them. It re-checks the page's `state` at every refresh;
+on `closed` it re-reads the root from the file once more and is then reading a static file.
+
+**A reader that cannot attach** -- on another machine, through HTTP range requests, in a sandbox
+without access to the writer's shared memory, in another Windows logon session, or because the page
+overflowed for the record it follows -- follows only what the file publishes at seals, under this
+torn-read rule:
+
+- It reads each in-place word it depends on twice, the second read issued after the first completes,
+  and accepts a value only when both reads agree, the value is not below the last one it accepted
+  (`Size` never decreases), and every block number it resolves passes §4's checks.
+- Where the member's format can validate content it does: a chunk index's offsets are monotone and
+  below the data member's `Size`; a frame decodes to its declared size (§7, "Reading the last
+  chunk"); an offset table's last entry does not exceed its data member's `Size`.
+- Its results are **provisional until the container is closed**. A torn read that both reads agree on
+  is not excluded, only made improbable; after close the file is static and a re-read is exact. It
+  learns that the container is closed out of band (a server that attaches on the writer's machine
+  and says so, or the end of the recording reported by the tool that made it) or by quiescence: the
+  file's length and root region unchanged over an interval the reader states.
+- A server that serves a container being written to remote readers (an HTTP range source of a live
+  recording) SHOULD run on the writer's machine, attach to the page, and serve only state it read
+  consistently there, so that its clients are not subject to this rule.
+
+#### Lifetime, and writers that die
+
+- **Creation.** The process that creates the container creates the page (exclusively: an existing
+  object of the same name is opened and inspected first; if its writers are all dead it is removed and
+  recreated, otherwise creation fails, naming the container), sets the identity, registers itself as
+  a writer, sets `state = live`, and only then publishes the root region for the first time. A closed
+  container reopened for appending (§5) gets a page for the duration of the append, created the same
+  way.
+- **Close.** The last writer to finish performs the final seal (every in-place word written to the
+  file, every odd `seq` settled), sets `state = closed`, and removes the name (`shm_unlink`; on
+  Windows the section disappears when its last handle closes). Readers still mapping the old page see
+  `closed`.
+- **A writer that dies.** A writer is dead when its pid no longer names a process with its recorded
+  start time, or its heartbeat is older than 10 seconds. Its members stop growing; the file holds
+  them through that writer's last seal, by the durability rule, with nothing else needed. Under W2 a
+  surviving writer or the coordinator marks the slot dead, settles the dead writer's odd `seq` words
+  in the page to the last value whose payload the crash rule accepts (below), and carries on.
+- **Every writer dies.** The file is valid through each writer's last seal. On Windows the page
+  disappears with the last handle. On Linux and macOS the object outlives the processes; the next
+  process to open the container (a reader or a tool) finds every writer dead, sets
+  `state = abandoned` and removes the name. A **salvage** tool MAY, before removing it, copy page
+  values into the file's entries when the page shows a later `Size` than the file and every byte that
+  `Size` covers is in the file (writer step 1 put it there before the page published it); salvage is
+  an improvement, never a requirement of durability.
+- **The crash rule.** A writer that dies between the odd and even stores of an update leaves `seq`
+  odd. A record kind states whether every prefix of its payload stores is itself a valid record
+  (**prefix-valid**); a stream reference is (§2's `MapBlock`-before-`Size` order), and so is a
+  single-word value. For a prefix-valid record the settled value is the page's payload; otherwise it
+  is the last value the file holds. Nothing in the file ever depends on a `seq`.
+
+### Reader Protocol: Opening And Following A Container (normative)
+
+This is the one protocol for every reader. A reader of a closed container performs the open steps
+once. A reader that **follows** a container being written (a reader that offers following; none is
+required to) refreshes it, and a refresh is the same steps again. Whether the reader is attached to
+the live coordination page changes only where it reads the words that change in place (step 2): an
+attached reader reads them from the page under its sequence counters; a reader that cannot attach --
+the **file-only follower** -- reads them from the file under the torn-read rule (above). Everything
+else, data, mapping and record bytes and every refusal, is read from the file and is identical for
+both. (Following was first specified for the file-only follower, in 94b7dcc; this section is that
+rule with the attached reader added, not a second protocol.)
+
+**Opening.**
+
+1. **Read the header once.** Version, block size, `MaxRootEntries` (applying auto-fill, §1) and
+   `root_blocks` are fixed for the container's life (§1). A reader MAY keep them from the open. A
+   reader that may follow then tries to attach to the live coordination page (above).
+2. **Read every slot of the root directory.** A member can be created in any empty slot at any time,
+   so a reader reads all `MaxRootEntries` slots, not only those after the last one it saw. For each
+   slot it takes `Name`, then `Size`, then `MapBlock` (with acquire ordering) -- from the page's root
+   mirror when attached, from the file under the torn-read rule otherwise. A slot whose `Name` is zero
+   is empty.
+3. **Resolve each member as §2 and §4 say,** refusing a block number that is `0`, in
+   `[1, root_blocks)`, or past the container's whole blocks. Across a direct-to-mapped transition,
+   loading `Size` before `MapBlock` rules out pairing a new `Size` with the old, tagged `MapBlock`,
+   because the writer stored `MapBlock` first; the remaining mixed pairing, an old `Size` with the new
+   mapping, reads correct bytes, because the mapping's slot 0 is the old data block.
+4. **For a chunked stream, read its companion index** (§7). The readable records are those of the
+   chunks the index publishes. Every published chunk but the last ends at the next entry's offset; the
+   last ends at the end of its Zstandard frame (in a compact container, at the end of the member),
+   never at the data member's `Size`, because a writer may already have written part of the next
+   chunk (§7, "Writer Protocol").
+5. **Follow keyed members by their family's rules** (§7a;
+   [ctfs-keyed-families.md](ctfs-keyed-families.md) §5), reading their in-place words as step 2
+   reads entries, and a namespace through its root slots (§8, "Live and incremental publication").
+
+**A refresh** repeats step 2 and then:
+
+- takes a member that has appeared since the last refresh as readable from now on -- a stream created
+  lazily, `calls.dat`, and the close-time members (`step-map.ns`, `spantype.ns`, `linehits.tc`,
+  `corrmark.ns`, `entry.dat`) once the writer has closed;
+- extends each chunked stream it has opened by the index entries published since (step 4);
+- picks up the growth of the interning tables, whose records the newly published chunks may refer
+  to ("Durability" rule 2 publishes them first);
+- re-reads the keyed members it follows (step 5).
+
+After a refresh the reader answers exactly what a fresh open of the container at that moment would,
+by a reader of the same kind: a fresh file-only open, or a fresh attached open (an attached reader can
+see in-place words the page published ahead of the file's last seal; a file-only reader sees the
+file as of its last seal). A refresh SHOULD NOT decode again a chunk it has already decoded, and
+SHOULD NOT read again the members it has already read beyond their new bytes; what a refresh costs
+should grow with what is new, not with the recording.
+
+**A refresh MUST refuse, naming the member, and keep answering from its previous state**, when the
+container has changed in a way no writer produces: a member's `Size` that decreased, or a member that
+disappeared; a root entry whose name changed; a stream whose `chunk_size` changed; a published index
+entry that changed or disappeared; offsets that decrease; a last offset past the data member's `Size`;
+a keyed member's record that disappeared or whose key changed. It MUST NOT treat a shrunken `Size` as
+a truncation to tolerate.
+
+### What Is Mutated In Place, And What A Cache May Keep (normative)
+
+Nothing is ever relocated (§1), so a block number names the same block for the container's life. A
+block's **content** can still change in place, in exactly these cases:
+
+| What | Changes how | Written by |
+|---|---|---|
+| The root region | entry words: `Name` once at creation; `MapBlock` and `Size` as the member grows, at seals | the container's publisher (§6, "Root publication"; "Writer architectures") |
+| A member's last data block, while `Size` is not a block multiple | bytes past `Size` are filled in (the pending block above) | the member's writer; also a closed-container extension (§5) |
+| A mapping block | a slot that was `0` is set, once, in increasing index order; a set slot never changes | the member's writer |
+| A keyed member's record blocks | a record's in-place words, at seals (§7a) | the keyed member's writer |
+| A keyed member's index blocks | only the words its realization names as updated in place: fill-once slots, node words, root slots ([ctfs-keyed-families.md](ctfs-keyed-families.md) §4.3) | the keyed member's writer |
+| A namespace's page 0 | the root slots (§8) | the namespace's writer |
+
+Everything else is written once. So a cache keyed by block number:
+
+- MAY keep a data block of a member for good once that block lies wholly below an observed `Size` of
+  the member, except a block of the kinds in rows 4 to 6 of the table;
+- MAY keep a mapping block, but only its non-zero slots: a slot it holds as `0` must be re-read;
+- MAY keep a filled fill-once slot of a keyed member's index for good, by the same argument;
+- MUST re-read the root region, a member's last partial data block, the record and index blocks a
+  keyed member's realization updates in place, and a namespace's page 0 at every refresh.
+
+The same rules apply to a container that is closed but can still be appended to (§5). A remote or
+partial cache (`.ctp`, an HTTP block cache, a RAM cache) of such a container re-reads the root region
+when it revalidates, and drops the changeable blocks of every member whose `Size` changed.
+
+### Dead Space (normative)
+
+A block is **dead** when no published pointer reaches it: no entry, mapping block, record or index
+node of the current state names it. Because nothing moves and nothing is reused while a container may
+be read (§1, rule 2), dead blocks are never reclaimed in place. They are bounded instead, and removed
+by copying.
+
+**Where dead space comes from**, and the bound each source MUST state:
+
+| Source | Bound |
+|---|---|
+| A copy-on-write index (a namespace commit, §8; a replaced trie or hash node, [ctfs-keyed-families.md](ctfs-keyed-families.md) §4.3) | the realization states its dead bytes per operation (for a B+tree commit, one root-to-leaf path) and its total at close as a fraction of live index bytes |
+| A live index dropped or rebuilt at close (§5.6 of the families document) | the dropped structure's size, stated by the realization |
+| A member rewritten whole (a query-time cache persisted again, for instance) | the previous image, every time; a producer that rewrites whole MUST state how many images it can abandon over a container's life, or repack (below) |
+| Blocks allocated and never published (a writer that died, §6 "Writer architectures"; an append that failed) | the blocks in flight per writer at the moment of failure |
+| A partial last block | not dead: it is the member's pending block |
+
+**Reuse.** Block-level reuse inside a container that a reader may follow, or that a cache may hold,
+is not an operation: a reused block number would name different bytes over time. A namespace's
+in-member free chain (§8) is reused only where §8 allows (no other process can read the file). There
+is no container-level free list, and block 0 holds none (§1).
+
+**Reclamation is repacking.** A **repack** copies every live member of a closed container into a new
+container -- the same copy operation as an export or a compact conversion -- which has no dead blocks
+by construction. A producer whose dead fraction can exceed a stated threshold (RECOMMENDED: 25% of the
+container) repacks at close, or offers the repack as a tool; a reader is never asked to tolerate a
+dead block, because it never reaches one.
+
+### Writer Architectures (normative)
+
+A **container writer** is a process that allocates blocks of the container, writes member bytes, or
+publishes root entries. Two architectures, and a hybrid, are specified. In every one the live
+coordination page is the shared state; a producer uses W1 unless the benchmark decision of
+[ctfs-keyed-families.md](ctfs-keyed-families.md) §8 admits W2 or the hybrid for it.
+
+**W1: one container writer.** One process writes the container and hosts the page: it creates the
+page, is its only registered writer, and keeps `NextFreeBlock` and every family counter there (its
+threads update them with the same atomics they would use in private memory; readers use them to
+measure lag). Producers in other
+processes hand it their data by means of their own, which this format does not specify. Every rule
+above applies as written.
+
+**W2: several writer processes.** Each producing process writes its own members directly into the
+container file, at offsets, with `pwrite` or `WriteFile`, into blocks it allocated. The processes
+coordinate through the page. A container written under W2 obeys these additional rules:
+
+1. **Cross-process atomics.** Every writer maps the page read-write. Block allocation is an atomic
+   fetch-and-add on `NextFreeBlock` in the page (`__atomic_fetch_add`, `InterlockedExchangeAdd64`); an
+   entry slot, a family key and a mirror slot are claimed the same way. Only lock-free, address-free
+   atomics are used, so each is the same instruction it is between threads, and the processor's
+   ordering rules apply across processes unchanged (x86-64 gives release and acquire for aligned plain
+   stores and loads; arm64 needs `stlr`/`ldar` or explicit barriers). No lock and no CAS retry loop
+   (G3).
+2. **How root state reaches the file.** Each writer writes only its own members' entries and records
+   to the file, each as one write call of the whole entry or record, at its seals (writer step 3
+   above); no writer writes a whole root block. The header is written once, at creation (§1).
+3. **Data reaches the file before the page publishes it.** A writer writes data with
+   `pwrite`/`WriteFile`. If it writes through a file mapping instead, it does so only where the
+   mapping is coherent with the readers' reads: on Linux and macOS a `MAP_SHARED` mapping and `pread`
+   share the page cache on a local file system; Windows documents no coherence between a mapped view
+   and `ReadFile`, so a Windows writer that uses a view publishes nothing through the page until it
+   has written the same bytes with `WriteFile`.
+4. **Durability (G5) when any writer dies.** Each writer's members are readable through its last
+   seal, because data, mapping and record are written before the entry that publishes them, and the
+   page is never needed to read the file.
+5. **What a dead writer leaves, and what readers tolerate.** (a) **Holes:** blocks it allocated and
+   never wrote. They are unreferenced and dead ("Dead space"); inside the file they read as zeros (a
+   sparse region where the file system supports one), past the end of the file they do not exist. No
+   published pointer names one, so a reader never reaches one; a reader that does is reading damage and
+   refuses it by §4's rules. (b) **A partial chunk** in a pending block: bytes past the published
+   `Size`, never content. (c) **A word left mid-update** in the page: settled by the crash rule. The
+   survivors do not finish the dead writer's members. The last writer at close extends the file to a
+   whole number of blocks, so that §5's appender sees a block-multiple length.
+6. **Keys assigned by a shared counter depend on timing.** A reader or a replay takes such a key from
+   the container and never allocates it again ([ctfs-keyed-families.md](ctfs-keyed-families.md) §6.3).
+7. **One writer per member still holds (G3).** A member, and everything a keyed member owns, is
+   written by one process. A family whose elements several processes create is partitioned into
+   per-process members, or has records each owned by one process.
+8. **No byte-reproducibility.** Blocks are claimed in the order the processes reach the counter, so a
+   W2 container is not a function of the recording ("Block placement"): two runs place blocks
+   differently, though both read identically. A producer that claims block-placement determinism
+   cannot use W2 or the hybrid unless it serializes appends in recording order.
+
+**The hybrid** keeps the root region and every family key allocator with one coordinator process, and
+lets producers allocate blocks (through the page's counter) and write their own members' data and
+mapping blocks; a producer hands the coordinator `(member, MapBlock, Size)` to publish, in the page
+and at seals in the file. Rules 1 to 7 apply, with the coordinator as the only writer of the root
+region.
 
 ### Guarantees
 
-- **Writers:** Block allocation is atomic. Data fully written before mapping updated. Size updated only after data committed.
-- **Readers:** See previous or new Size (never partial). All data up to observed Size is valid. No locks required.
+- **Writers:** Block allocation is atomic. Data fully written before mapping updated. Size updated only after data committed. Every in-place update is published through the live coordination page and reaches the file at the next seal. No block is ever moved or reused, and the root region never grows.
+- **Readers:** An attached reader sees a previous or a new value of every published word, never a mixture. A reader that cannot attach sees seal-published state under the torn-read rule, provisional until close. After close the file is static. All data up to an accepted Size is valid. A block number a reader has resolved keeps naming the same block. No locks required.
 
 ### Live progress: per-stream following, no sidecar
 
@@ -686,7 +1315,7 @@ the **container itself**, per-stream, with no external artifact:
   incrementally as chunks seal (§7; a stream that seals partial chunks carries a
   cumulative record count in its index). No finalization step is required.
 
-This is the **only** progress mechanism. The format is self-contained (Property 6:
+This is the **only** progress mechanism. The format is self-contained (G1:
 "no external files or JSON"), so there is **no `.head.json` (or any) sidecar** and
 **no in-process RPC** on the recorder to answer progress queries — a recorder must
 not run an event loop to serve reads. When a live coordinator needs aggregate,
@@ -700,30 +1329,9 @@ following covers every reader that exists today. A future consumer that genuinel
 needs a single cross-stream frontier value from the `.ct` would motivate a
 deliberate, versioned in-container addition — not a sidecar.
 
-**Following a container (normative for a reader that offers it).** A reader that follows a
-container being written refreshes it; a refresh:
-
-1. Re-reads the root directory: every entry's `Size`, then its `MapBlock`. A member that has
-   appeared since the last refresh is readable from now on -- a stream created lazily, `calls.dat`
-   and the close-time members (`step-map.ns`, `spantype.ns`, `linehits.tc`, `corrmark.ns`) once the
-   writer has closed.
-2. Extends each chunked stream it has opened by the index entries published since: the readable
-   records are those of the chunks the index publishes. Every published chunk but the last ends at
-   the next entry's offset; the last ends at the end of its Zstandard frame (in a compact container,
-   at the end of the member), never at the data member's `Size`, because a writer may already have
-   written part of the next chunk (§7, "Writer Protocol").
-3. Picks up the growth of the interning tables, whose records the newly published chunks may refer
-   to (§"Durability" rule 2 publishes them first).
-
-After a refresh, the reader answers exactly what a fresh open of the container at that moment
-would. A refresh SHOULD NOT decode again a chunk it has already decoded, and SHOULD NOT read
-again the members it has already read beyond their new bytes; what a refresh costs should grow with
-what is new, not with the recording.
-
-A refresh MUST refuse, naming the member, and keep answering from its previous state, when the
-container has changed in a way no writer produces: a member's `Size` that decreased; a root entry
-whose name changed; a stream whose `chunk_size` changed; a published index entry that changed or
-disappeared; offsets that decrease; or a last offset past the data member's `Size`.
+**Following a container** -- what a refresh re-reads, where the last published chunk ends, what it
+must refuse, and that it answers as a fresh open would -- is §6, "Reader Protocol: opening and
+following a container", for attached and file-only readers alike.
 
 **Stream presence is structural, not flag-gated.** The same principle governs
 *whether* a stream exists, not only how much of it is readable. Whether a trace
@@ -744,16 +1352,22 @@ readable while it records, so that a recording whose process dies -- killed, cra
 memory -- leaves a container a reader opens and reads up to the last chunk it completed.
 Concretely:
 
-1. **At open** -- at the latest, before the recording's first record -- the writer writes block 0
-   and `meta.dat`, complete: `meta.dat` is never rewritten, so every field and flag in it is fixed at
-   open (`internal-files.md` §"Extended flags (`flags_ext`)").
+1. **At open** -- at the latest, before the recording's first record -- the writer writes the whole
+   root region, with its final header (§1), and `meta.dat`, complete: `meta.dat` is never rewritten,
+   so every field and flag in it is fixed at open (`internal-files.md` §"Extended flags
+   (`flags_ext`)"). A keyed member is created, with its header if its realization has one (§7a), no
+   later than its first record.
 2. **When a chunk of a Chunked Compressed Table seals** (§7: it reaches `chunk_size` records), the
    writer writes, before the append that sealed it returns: the chunk's bytes to their data blocks,
    every mapping slot or block that changed, the chunk's offset in the companion `.idx`, every
    interning record registered so far (appended when it was registered: "Block placement" below) (`paths`, `funcs`, `types`, `varnames`, `markers` and their
    offset tables -- so that whatever the chunk refers to is readable), and then the root entries (`Size`,
    `MapBlock`) of every member it grew -- in that order, data before the entry that publishes it
-   (§6, "Writer Protocol").
+   (§6, "Writer Protocol"). A chunk of a stream that a keyed member's record references (§7a) is
+   published the same way, one level down: the chunk, its mapping, the record's `MapBlock` and `Size`
+   by "In-place record publication", and then the keyed member's own entry if the member grew. The
+   entries written are those that changed
+   (§6, "Root publication"); a seal does not rewrite the root region.
 3. **Within a chunk, buffering is allowed.** The records of a chunk that has not sealed may live
    only in memory; a crash loses them, and nothing earlier.
 4. **Close-time members** -- `step-map.ns` and any other index built from the whole recording --
@@ -820,9 +1434,38 @@ where the bytes go: rule 3 of "Durability" (buffering within a chunk) and "A wri
 often" stand. What is fixed is the order of appends, not the timing of I/O. The partial last block
 of a member is zero beyond its `Size`.
 
+**How block placement composes with the rest of this section.**
+
+- **The fixed root** (§1) is what makes rule 1 possible: the root region is placed first and never
+  moves, so every later block number is a function of the appends. Root growth would have broken
+  the property; it is not an operation.
+- **The live coordination page** (above) changes no byte of the file, so it does not affect placement.
+  Neither does the attached reader.
+- **Dead space** ("Dead space" above) is deterministic for a deterministic writer: a superseded index
+  or a rewritten member is the same blocks in two runs of the same recording. A repack produces a new
+  container, which is itself a function of the source container.
+- **Keyed members** ([ctfs-keyed-families.md](ctfs-keyed-families.md)) placed by a materialized-trace
+  writer join this list when a family's realization is decided (§8 of that document): the decision
+  states where in rules 1-6 the family's appends go, and the realization MUST be a function of its
+  entries (G12), as §8a's bulk load is.
+- **Several appending threads or processes break the property.** Block placement determinism holds for
+  a writer whose appends happen in one order fixed by the recording, which is what the split-stream
+  writer does. A W1 writer whose threads append to different members concurrently, and every W2 or
+  hybrid writer (several processes claiming blocks from one counter, "Writer architectures" below),
+  claim blocks in an order set by timing, so two runs of the same recording place blocks differently,
+  although each container is valid and reads identically. Such a writer does not claim this property,
+  and MUST NOT be described as producing byte-identical containers. A producer that needs both
+  several writers and the property serializes its appends in recording order (for example, writers
+  hand finished chunks to one appender in a deterministic order), which costs the latency W2 exists to
+  save. A writer that drains several producers (rings of several threads) appends in the order it
+  happens to drain them, which also depends on timing even with one appending thread; the MCR
+  recorder is such a writer and does not claim the property. Whether MCR containers should be
+  byte-reproducible, and so whether W2 may ever be admitted for a producer that claims it, is an open
+  question for the owner ([ctfs-keyed-families.md](ctfs-keyed-families.md) §9).
+
 ### Background Compression Writer
 
-An alternative pattern: multiple producer threads write to per-thread buffers, a single background thread compresses and writes to CTFS. Since only one thread does block allocation, `NextFreeBlock` can be a plain local counter (no atomic overhead).
+An alternative pattern: multiple producer threads write to per-thread buffers, a single background thread compresses and writes to CTFS. Since only one thread does block allocation, `NextFreeBlock` can be a plain local counter (no atomic overhead). That thread is then also the one publisher of the root region and of every keyed member (§6, "Root publication"; §7a). This is W1 ("Writer architectures") with one writing thread.
 
 ---
 
@@ -880,22 +1523,110 @@ writer did that.
 
 The index is always up to date during active recording.
 
+**Reading the last chunk of a stream that is still being written.** A reader MUST NOT take
+`foo.dat`'s `Size` as the end of the last indexed chunk while the stream may still grow: the next
+chunk's leading bytes can already be published without its index entry, so the size overshoots and
+hands the decompressor bytes from two chunks. It derives the last frame's length from the frame
+itself instead (for zstd, `ZSTD_findFrameCompressedSize`).
+
+**Seeking assumes every chunk but the last is full.** A writer that seals a partial chunk mid-stream
+(to publish records in flight) breaks `chunk = N / chunk_size`, and the index format above has no
+per-chunk record count to recover from. Such a stream carries a cumulative record count in its index
+(as `spans.idx` does), or its reader derives each chunk's occupancy from the chunk's contents.
+
+---
+
+## 7a. Keyed Members (Unbounded Families)
+
+A **keyed member** is a root member, or one of a small fixed set of root members, that holds a family
+whose size grows with the recording: it maps `u64` keys to fixed-size **records**, and through a
+record to an inline value, to bytes in a value heap, or to a **keyed stream** -- a container stream
+exactly like a root member's, with a `Size` and a `MapBlock` of §2's three forms, resolved by §4's walk
+with §4's refusals, but referenced from a record instead of a root entry. The root's fixed size (§1)
+then bounds the number of families, not the length or width of a recording.
+
+Which structure maps keys to records is chosen per family, by benchmark, among the families and
+candidate realizations of [ctfs-keyed-families.md](ctfs-keyed-families.md). That document also gives
+the cost model (§2), the properties of the data (§3) and the decisions (§8). **Until a family's
+realization is decided and its byte layout added there, no writer emits a keyed member for it**, and
+the members a producer writes today stay as they are (the member catalogues say which:
+[internal-files.md](internal-files.md) §"Member Catalogue", and for MCR `codetracer-specs`
+`spec/Trace-Files/CTFS-Binary-Format.md` §2).
+
+The rules below hold for every keyed member, whatever its realization (normative):
+
+1. **Records are fixed-size, packed per block, and never straddle a block.** A member of records of
+   size `S` (a multiple of 8) holds `floor(BlockSize / S)` records per block; the rest of each block is
+   zero padding a reader ignores. Record `r`'s position is arithmetic on `r`.
+2. **Records never move and are never reused.** A record stays at its position for the container's
+   life; its key never changes; removing a key is an in-place state change (a tombstone), not the
+   reuse of the record for another key. An index structure that changes shape moves references to
+   records, never records ([ctfs-keyed-families.md](ctfs-keyed-families.md) §4.3).
+3. **A record is written before anything makes it reachable**: before the member's `Size` covers it,
+   before an index slot names it. A keyed stream's data and mapping are written before the record
+   that references them, exactly as a root member's are before its entry (§6, "Writer protocol"). A
+   record that refers into another member is published only after its target is durable, at a seal
+   at or before the record's own ([ctfs-keyed-families.md](ctfs-keyed-families.md) §4.1, rule 4).
+4. **In-place updates follow §6, "In-place record publication"**: published through the live
+   coordination page, written to the file at seals. A record kind states its store order and whether
+   it is prefix-valid. Records carry no sequence word on disk.
+5. **One writer per keyed member** (§6), under either writer architecture (§6, "Writer
+   architectures"). Every store into the member, a new record or a word of an existing one, is made by
+   that writer.
+6. **Stored container block numbers** (a keyed stream's `MapBlock` and mapping; an index reference in
+   absolute form, [ctfs-keyed-families.md](ctfs-keyed-families.md) §2.3) are validated as §4 validates
+   a mapping pointer, and are written only after the block they name. Every operation that copies the
+   member into another container rewrites them or refuses, as the realization states.
+7. **Durability.** When a chunk of a keyed stream seals, the chunk, its mapping and the record's words
+   are written before the append returns, and the keyed member's own entry too if the member grew
+   (§6, "Durability").
+8. **Readers** follow a keyed member as the reader protocol follows the root (§6): they re-read the
+   member's `Size` and the records and index words the realization updates in place at every refresh;
+   between refreshes a record never disappears, its key never changes, and a keyed stream's `size`
+   never decreases. A reader that observes any of these MUST refuse the member as damaged, naming the
+   member and the key.
+9. **Profiles.** A keyed member whose records hold container block numbers has no meaning in a
+   compact container (§1d), which has none. A writer converting a container that holds one into the
+   compact profile MUST either convert it by the compact form its realization defines or refuse,
+   naming the member.
+
+**What this replaced.** A draft circulated on 2026-10-07, and never landed, put a single layout here, the *stream directory*: an
+unsorted table of 24-byte `(size, map_block, key)` records in creation order, found by scanning. It
+is kept as one candidate realization of the dense family (F1, realization D4) and as the baseline
+the benchmarks measure every other candidate against; it is not the design.
+
 ---
 
 ## 8. Namespaces (Small Files Collection)
 
-A namespace maps 64-bit keys to append-only data sequences within a single CTFS internal file. Designed for millions of entries, most very small.
+A namespace maps 64-bit keys to values within a single CTFS member. It is designed for millions of
+entries, most of them very small (a few time coordinates or step ids), built during or after a
+recording and queried by key without reading the whole key set. Its values do not grow while a
+reader follows them: a value that must grow live is referenced from a keyed member (§7a). A namespace
+in this format (`NSB1`) is one realization of the sparse families of
+[ctfs-keyed-families.md](ctfs-keyed-families.md): a copy-on-write B+tree (F4, realization B2) or,
+bulk-loaded, a static index (F5, realization S2).
 
-### Operations
+### Positions inside a namespace are member-relative (normative)
 
-- **Create entry:** Implicitly on first append to a new key.
-- **Append to entry:** Append bytes to a key's data sequence.
+A namespace member is a self-describing image of 4096-byte **pages**: page `p` is the member's bytes
+`[p * 4096, (p + 1) * 4096)`, whatever the container's `BlockSize`. Every position a namespace stores
+is a page number or a byte offset within the namespace member: B-tree child pointers, descriptors,
+free chains and pool slots. **A namespace never stores a container block number.** A reader resolves
+a page through the namespace member's own mapping, like any other byte of a member.
+
+This is what every implementation already does (`codetracer_ctfs`'s `cow_btree.nim` and
+`sub_block_pool.nim`; the db-backend's `cow_namespace_reader.rs`; `step-map.ns` and `corrmark.ns`).
+Earlier revisions of this section put sub-block free list heads in container block 0 and described
+descriptors as holding "the root mapping block in main file"; no implementation did either, and the
+block 0 area is removed (§1).
 
 ### Sub-Block Allocation Pools
 
-Standard block allocation wastes space when millions of keys have 8--32 byte values. Namespaces subdivide blocks into sub-blocks with **global** free lists (shared across all namespaces).
+Standard block allocation wastes space when millions of keys have 8--32 byte values. A namespace
+subdivides its pages into sub-blocks:
 
-| Pool size | Sub-blocks per 4096-byte block |
+| Pool size | Sub-blocks per 4096-byte page |
 |-----------|-------------------------------|
 | 32 B | 128 |
 | 64 B | 64 |
@@ -907,75 +1638,109 @@ Standard block allocation wastes space when millions of keys have 8--32 byte val
 
 **Allocation lifecycle for a key:**
 
-1. First append: allocate 32B from global free list
+1. First append: allocate 32B from the namespace's 32B pool
 2. When data outgrows current slot: allocate next larger size, copy data, release old slot
 3. Continue doubling through 64B, 128B, 256B, 512B, 1024B, 2048B
-4. Beyond 2048B: promote to full CTFS block with normal mapping
-5. Beyond one block: standard multi-level mapping hierarchy
+4. Beyond 2048B: the value graduates to a run of whole pages (below)
 
-**Free list roots** are stored in block 0, in the area between the header and file entries (see Section 1). Each root is `(block_num: u32, slot_index: u16)` = 6 bytes. A free sub-block stores its next pointer in its data bytes (6 bytes, fits in smallest pool).
+Pools belong to the namespace, not to the container. A free sub-block stores its next pointer,
+`(page: u32, slot_index: u16)`, in its own first 6 bytes. A namespace that persists freed sub-blocks
+across commits keeps the pool heads in its own image, at a location its format defines. No generic
+location is assigned, because no implementation persists them: the Nim pool manager rebuilds them in
+memory.
 
 ### B-Tree Key Index
 
-Each namespace uses a B-tree on the 64-bit key. Each node occupies one CTFS block. Lookup requires O(depth) block reads -- typically 3-4 for millions of entries.
+A namespace must support efficient lookup of a single key without downloading the entire key set. Each namespace uses a **B+-tree** on the 64-bit key. Each node occupies one page of the namespace member, so a lookup reads O(depth) pages, typically 3-4 for millions of entries, and over a network that is 3-4 round trips.
 
-Leaf nodes contain sorted keys and **entry descriptors**. Each namespace declares a **leaf type** in its header.
+**Node layout.** Internal nodes contain sorted keys and child page pointers. Leaf nodes contain sorted keys and **entry descriptors**. Both kinds share one 8-byte node header and differ only in what follows the key array:
 
-#### Namespace Header (9 bytes)
-
-```c
-struct NamespaceHeader {
-    uint64_t root_block;  // B-tree root (0 = empty)
-    uint8_t  flags;       // bit 0: leaf_type (0=Type A, 1=Type B)
-                          // bit 1: skip_sub_blocks
+```
+struct NodePage {              // exactly one 4096-byte page
+    node_kind:  u8             // 0 = internal, 1 = leaf
+    reserved:   u8             // 0
+    count:      u16 LE         // number of KEYS in this node
+    reserved:   [u8; 4]        // 0
+    payload:    [u8; 4088]     // see below; trailing bytes are unspecified
 };
 ```
 
-No entry count -- the B-tree is the source of truth.
+Offsets (all integers little-endian): `node_kind [0]`, `reserved [1]`, `count [2..4)`, `reserved [4..8)`, `payload [8..4096)`.
 
-#### Leaf Type A -- Small Entries (8-byte descriptor)
-
-Used by namespaces with many keys and small values (`memreads.tc`).
+The payload is two adjacent arrays with **no padding or alignment between them**, both indexed from the start of the payload at byte 8:
 
 ```
-Entry descriptor (8 bytes = u64 LE, bit-packed):
+Leaf payload (node_kind == 1):
+    keys:        count      x u64 LE      at  8
+    descriptors: count      x D bytes     at  8 + count*8
 
+Internal payload (node_kind == 0):
+    keys:        count      x u64 LE      at  8
+    children:    count + 1  x u64 LE      at  8 + count*8
+```
+
+`D` is the namespace's **descriptor size**, fixed for the whole namespace by the `leaf_type` bit of the namespace header: 8 bytes for Leaf Type A, 16 bytes for Leaf Type B. Internal nodes carry no descriptors, so their child array is always `u64` whatever `D` is.
+
+A **child pointer is a page number** of the namespace member. Page 0 holds the `NamespaceHeader` and is never a node, so a valid child pointer is `>= 1` and `0` means "none". These are `u64` page numbers, **not** the `u32` breadth-first node indices of the older whole-tree serialization (the `"NS"`-magic blob with its embedded `BTR\0` tree, which this section does not specify and which is not wire-compatible with `NSB1`).
+
+Keys within a node are **sorted ascending and unique**. Both node kinds are searched with the same `lower_bound(key)` over the key array, and use the result differently:
+
+- **Leaf** (`node_kind == 1`): the key is present iff `i < count && keys[i] == key`, and its descriptor is `descriptors[i]`. Otherwise the key is absent.
+- **Internal** (`node_kind == 0`): descend into child `i + 1` when `i < count && keys[i] == key`, and into child `i` otherwise.
+
+That asymmetric rule follows from how separators are chosen: this is a **B+-tree with copy-up separators**. A split promotes the *first* key of the right-hand node, and that key stays in the right-hand node too. So for an internal node with keys `[s0 … s(count-1)]` and children `[c0 … c(count)]`, **`s_i` is the smallest key reachable through `c_(i+1)`**. A reader that treats a separator as an exclusive upper bound on its left subtree fails to find exactly the keys that are separators. Equivalently: every key `k` under `c_j` satisfies `s_(j-1) <= k < s_j`, with the bounds omitted at the ends.
+
+**Fanout** follows from the page size and the descriptor size, and a writer must not exceed it:
+
+```
+order = (4096 - 8) / (8 + D)
+```
+
+which is **255** keys per node for Leaf Type A (`D = 8`) and **170** for Leaf Type B (`D = 16`). A leaf holds at most `order` keys; an internal node at most `order` keys and `order + 1` children. A reader must tolerate any `count <= order`, including short nodes at the right edge of a bulk-loaded tree; there is no minimum occupancy on the wire.
+
+Bytes of the payload beyond the two arrays are **unspecified** and a reader must not depend on them.
+
+**Free page chain.** A page on the namespace's free chain stores the next free page number as a `u64 LE` in its first 8 bytes and is otherwise zero. The head is `free_list_head` in the namespace header, and `0` ends the chain.
+
+**Bulk load.** A writer that has all `(key, descriptor)` pairs sorted and duplicate-free may pack the tree bottom-up: consecutive runs of at most `order` keys, one leaf page each; then each internal level over the one below, grouping up to `order + 1` children per node with each child's **subtree minimum** as the separator before it; repeat until one node remains, and publish it as the root with `commit_id = 1` in root slot 0. The result reads identically to a tree built by insertion, though it is not byte-identical to one.
+
+### Entry Descriptors
+
+A descriptor is `D` bytes, and what they mean is decided by the namespace's format, which is named by
+the member. The B-tree treats a descriptor as opaque. This section defines the **pooled** descriptor
+scheme, which a namespace format uses unless it defines its own; `corrmark.ns`, for example, uses a
+Leaf Type B descriptor of `[payload_offset: u64][payload_len: u64]` into a payload region of its own
+member ([internal-files.md](internal-files.md) §"Correlation Index"). Every position in either scheme
+is member-relative.
+
+**Leaf Type A (8 bytes, pooled):**
+
+```
   Sub-block (bit 63 = 0):
-    bit 63:       0 (sub-block flag)
-    bits 62-15:   block_num (48 bits)
+    bits 62-15:   page (48 bits)       the pool page, a page number of the namespace member
     bits 14-12:   pool_class (3 bits: 0=32B, 1=64B, ..., 6=2048B)
     bits 11-0:    slot_and_used (12 bits)
 
   Graduated (bit 63 = 1):
-    bit 63:       1 (graduated flag)
-    bits 62-32:   map_block (31 bits)
-    bits 31-0:    data_size (32 bits, up to 4GB)
+    bits 62-32:   first_page (31 bits) the first page of a run of whole pages
+    bits 31-0:    data_size (32 bits)  the run is ceil(data_size / 4096) consecutive pages
 ```
 
-The 12-bit `slot_and_used` encodes both slot position and data size. Split depends on pool_class: `slot_index` uses `log2(4096/pool_size)` bits, `used_bytes` uses `log2(pool_size)` bits. Sum is always 12.
-
-Each leaf holds `(4096 - header) / 16` ~ 250 entries (8 bytes key + 8 bytes descriptor).
-
-#### Leaf Type B -- Large Entries (16-byte descriptor)
-
-Used by namespaces with fewer keys and large values (`threads.ns`, `slc-mwr.ns`, `slc-mrd.ns`).
+**Leaf Type B (16 bytes, pooled):**
 
 ```
-Entry descriptor (16 bytes):
+  Sub-block (first word == 0):
+    first u64:    0 (discriminator)
+    second u64:   bits 63-15 page (49 bits), bits 14-12 pool_class, bits 11-0 slot_and_used
 
-  Sub-block (map_block == 0):
-    first u64:    map_block = 0 (discriminator)
-    second u64 (bit-packed):
-      bits 63-15: block_num (49 bits)
-      bits 14-12: pool_class (3 bits)
-      bits 11-0:  slot_and_used (12 bits)
-
-  Graduated (map_block != 0):
-    map_block:    u64 LE (root mapping block)
-    data_size:    u64 LE (unlimited)
+  Graduated (first word != 0):
+    first u64:    first_page            the first page of a run of whole pages
+    second u64:   data_size             the run is ceil(data_size / 4096) consecutive pages
 ```
 
-`slot_and_used` bit split by pool_class:
+Page 0 is the namespace header and is never a pool page or part of a run, so a zero `first_page`
+discriminates the sub-block form unambiguously. The 12-bit `slot_and_used` encodes slot position and
+used bytes, split by pool class:
 
 | pool_class | pool_size | slot_index bits | used_bytes bits |
 |------------|-----------|-----------------|-----------------|
@@ -987,24 +1752,127 @@ Entry descriptor (16 bytes):
 | 5 | 1024B | 2 | 10 |
 | 6 | 2048B | 1 | 11 |
 
-Each leaf holds `(4096 - header) / 24` ~ 170 entries (8 bytes key + 16 bytes descriptor).
+Sub-block support is optional: the `skip_sub_blocks` flag makes every value a page run from its first
+byte.
 
-Sub-block support is optional -- `skip_sub_blocks` flag causes full-block allocation from the start.
+### Namespace Header
+
+The page store is **self-describing**: a reader reconstructs the tree (root selection, free chain,
+bump cursor) from page 0 alone.
+
+```
+struct NamespaceHeader {       // 61 bytes, at the start of page 0
+    magic:          [u8; 4]    // "NSB1" (namespace B-tree, format 1)
+    root_block[2]:  u64        // double-buffered B-tree root slots: page numbers (0 = empty)
+    commit_id[2]:   u64        // commit tag per root slot
+    flags:          u8         // bit 0: leaf_type (0 = Type A, 1 = Type B)
+                               // bit 1: skip_sub_blocks
+                               // bits 2-7: MUST be zero
+    free_list_head: u64        // head page of the whole-page free chain (0 = empty)
+    next_free_page: u64        // bump-allocation cursor (first never-used page number)
+    page_count:     u64        // total pages in the image
+};
+```
+
+Offsets (little-endian): `magic [0..4)`, `root_block[0] [4..12)`, `root_block[1] [12..20)`, `commit_id[0] [20..28)`, `commit_id[1] [28..36)`, `flags [36]`, `free_list_head [37..45)`, `next_free_page [45..53)`, `page_count [53..61)`. A reader refuses a flag bit it does not implement, naming it (§1c's rule).
+
+**Bytes `[61, 4096)` of page 0 are producer-private.** A reader must ignore them: it must not validate them and must not refuse an image for what it finds there. A producer may keep a self-describing record of its own there, with its own magic; the WASM snapshot page store keeps its `SnapshotFormatVersion` there, because `NSB1` carries no version field and version gating has to happen before any structural interpretation. The header will not grow into that space: a change that needs new header fields is a new magic (`NSB2`), not a longer `NSB1`.
+
+**No entry count** -- the B-tree is the source of truth for which keys exist.
+
+### Copy-On-Write And The Double-Buffered Root
+
+A namespace that is persisted more than once (built incrementally, or extended by a later pass)
+updates its tree **copy-on-write**, modelled on LMDB:
+
+1. **Path copying.** A page reachable from a committed root is never modified in place. To change a
+   node, the writer takes a fresh page (from the free chain when that is allowed, below, otherwise
+   from `next_free_page`), copies the node into it, applies the change, and copies each ancestor up
+   to a new root page the same way. The old spine remains a complete tree until the commit.
+2. **The commit** writes the new root's page number into the root slot **not** in use, and then that
+   slot's `commit_id`. The committed root is the valid slot with the higher `commit_id`; a slot with
+   `commit_id = 0` is empty, and an empty namespace has both slots `0`. A commit's id is the other
+   slot's id plus one, so the two valid ids of a namespace always differ by exactly 1.
+3. **Crash recovery is implicit.** A crash before the commit leaves the previous root intact in the
+   other slot. The pages of the abandoned spine are unreferenced and are recovered as free space.
+
+### Live And Incremental Publication (normative)
+
+A namespace in a container that a reader may follow, or that is extended after it was first
+published, is published in this order. The root slots are the only words a reader can see change.
+
+**Writer, per commit:**
+
+1. Write every new page (the copied spine, new pool pages, page runs) as appended bytes of the
+   namespace member, after its current end.
+2. Publish the namespace member's entry, `MapBlock` before `Size` (§6), so every new page lies below
+   the published `Size`.
+3. Store `next_free_page` and `page_count` in page 0.
+4. Barrier. Store the new root's page number in `root_block[s]`, where `s` is the slot with the lower
+   `commit_id`; barrier; store `commit_id[s] = commit_id[1-s] + 1`.
+
+**Reader:**
+
+1. Locate page 0 through the namespace member's entry. Page 0's blocks never move (§1), so any
+   `MapBlock` the reader has observed locates it.
+2. Read `commit_id[0]`, `commit_id[1]`, `root_block[0]`, `root_block[1]`, then both `commit_id`s
+   again. If either id changed, or the two non-zero ids do not differ by exactly 1, read again. The
+   root slot words are not 8-byte aligned (`root_block[0]` is at byte 4), so a reader cannot rely on
+   one load seeing a whole word; the double read and the "differ by exactly 1" rule are what reject a
+   torn value.
+3. Take the valid slot with the higher `commit_id`.
+4. Then load the member's `Size` (and `MapBlock`). Because the writer published `Size` before the
+   commit, every page reachable from that root lies below it. A page at or past `Size / 4096` is
+   damage, and the reader MUST refuse the namespace, naming it.
+5. Walk the tree. No page reachable from a committed root changes while the reader holds that root
+   (below).
+
+**Reclaiming superseded pages.** A page that a newer commit no longer reaches may be returned to the
+free chain only when no reader can still hold a root that reaches it. LMDB establishes that with a
+table of its readers' snapshots. A reader that follows a file from another process cannot register in
+any such table, so **a writer of a container file that another process may read reuses no
+superseded page**; it appends. An in-memory overlay that no other reader shares (`codetracer-specs`
+`CTFS-Binary-Format.md` §11.4) may reclaim, and the pages it then persists are written as a commit
+above.
+
+**Descriptors are never updated in place.** A committed leaf is immutable, so a namespace has no
+live-growing values. A family of values that grows while a reader follows it is a keyed member (§7a),
+whose realization is chosen among [ctfs-keyed-families.md](ctfs-keyed-families.md) §5's candidates.
 
 ### Namespace Files
 
 | Namespace | Leaf Type | Key | Purpose |
 |-----------|-----------|-----|---------|
-| `linehits.tc` | `NSB1` (§8a) | location address | Step ids at each source location |
-| `memwrites.tc` | `NSB1` (§8a) | memory address | Memory write time coordinates (MCR only) |
-| `corrmark.ns` | `NSB1` (§8a) | XXH64 of the correlation key | Correlation markers |
-| `memreads.tc` | A | memory address | Memory read time coordinates |
-| `threads.ns` | B | thread_id | Per-thread event streams |
-| `slc-mwr.ns` | B | slice_id | Per-thread-slice write address sets |
-| `slc-mrd.ns` | B | slice_id | Per-thread-slice read address sets |
+| `linehits.tc` | `NSB1` image (§8a), Type B | location address (a step's `global_position_index`) | Step ids at each source location |
+| `corrmark.ns` | `NSB1` image (§8a), Type B | XXH64 of the correlation key | Correlation markers ([internal-files.md](internal-files.md) §"Correlation Index") |
+| `memwrites.tc` | `NSB1` image (§8a), Type B | memory address | Write history; MCR only, its payload layout in `codetracer-specs` |
+| `memreads.tc` | A | memory address | Memory read time coordinates (no writer yet) |
+
+Every writer of the first three emits the §8a image: Leaf Type B with `skip_sub_blocks` set, and the
+16 bytes of a descriptor as `[payload_offset: u64][payload_len: u64]` into the payload region that
+follows the pages. This table listed `linehits.tc` and `memwrites.tc` as Type A until 2026-10-08; no
+writer ever produced that. Which keyed family each member belongs to, and the realization it is
+measured against, is [internal-files.md](internal-files.md) §"Member Catalogue" (and, for
+`memwrites.tc`, the MCR catalogue).
+
+`step-map.ns` is a single member and not a namespace, despite its suffix
+([internal-files.md](internal-files.md) §"`step-map.ns`"). The namespaces and keyed members the MCR
+recorder writes (`slc-mwr.ns`, `slc-mrd.ns`, its page store and others) are specified in
+`codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md`. Until 2026-10-07 this table listed
+`threads.ns`, `slc-mwr.ns` and `slc-mrd.ns`; they moved there with the scope note at the head of this
+document.
 
 
 ### 8a. The `NSB1` namespace image (normative)
+
+> **How §8a relates to §8.** §8 specifies the `NSB1` page format, its copy-on-write commit and its
+> live publication for any producer. §8a fixes, byte for byte, the bulk-loaded image of the three
+> members it names, so that two writers produce the same bytes ("Block placement", §6). Where §8a
+> is stricter it governs those members: their page 0 is zero past the header and their nodes and
+> payload padding are zero, where §8 leaves those bytes producer-private or unspecified for other
+> images (the MCR page store keeps a record of its own in page 0). In the families of
+> [ctfs-keyed-families.md](ctfs-keyed-families.md) an §8a image is realization S2, a static index
+> (F5) built at close.
 
 `linehits.tc`, `corrmark.ns` and `memwrites.tc` are not built from the sub-block pools above. Each is
 one member holding an `NSB1` image: a B-tree of 64-bit keys in 4096-byte pages, followed by a payload
@@ -1072,6 +1940,15 @@ A lookup that finds a key equal to an internal node's `keys[i]` continues in chi
 
 Blocks are sharded across multiple files to exploit higher aggregate I/O throughput.
 
+> **Status (2026-10-08).** No producer writes `MaxShards != 0`, and this section is a design, not a
+> layout any reader has been tested against. Two of its premises changed: the free list root area
+> in block 0 is removed (§1), and a namespace keeps its allocation state inside its own member
+> (§8). Before a producer shards, this section is restated so that a
+> namespace's pages and a keyed member's records and index stay in the main file, and so that a
+> stored block number in absolute form carries its shard
+> ([ctfs-keyed-families.md](ctfs-keyed-families.md) §2.3). Until then a writer MUST write
+> `MaxShards = 0` (§1).
+
 **Sharding scheme:** Block N is stored in file `N % num_shards`. Guarantees even distribution.
 
 **Manifest file (`manifest.dat`):**
@@ -1085,9 +1962,9 @@ for each shard:
 
 Reader resolves `block N` to `shard_file[N % shard_count]` at offset `(N / shard_count) * block_size`.
 
-**Separation of structure and data:** B-tree blocks, mapping hierarchy, companion indices, free list metadata, and `meta.dat` stay in the **main `.ct` file** -- never sharded. Only data blocks are distributed across shards.
+**Separation of structure and data:** the root region, mapping hierarchy, companion indices, namespace pages, keyed members' records and indexes, and `meta.dat` stay in the **main `.ct` file** -- never sharded. Only the data blocks of streams are distributed across shards.
 
-**Shard affinity per namespace key:** Home shard = `hash(key) % num_shards`. Sub-block phase allocations use the home shard's free lists. Multi-block growth uses round-robin across all shards.
+**Shard affinity per namespace key:** Home shard = `hash(key) % num_shards`. Sub-block phase allocations use the home shard's pools, whose state lives with the shard. Multi-block growth uses round-robin across all shards.
 
 **ShardWriter abstraction:** Each shard is managed by a ShardWriter. A single operation: `append(current_descriptor, data) -> new_descriptor`. For local multi-file, in-process calls. For network sharding, one RPC per operation.
 
@@ -1095,7 +1972,7 @@ Reader resolves `block N` to `shard_file[N % shard_count]` at offset `(N / shard
 
 ## 10. Split-by-Time (Temporal File Splitting)
 
-For long recordings, CTFS splits the trace into multiple files at full memory snapshot boundaries. Each split file is a self-contained `.ct` container with its own block numbering.
+For long recordings, a producer may split the trace into multiple files at points where each split can stand alone. Each split file is a self-contained `.ct` container with its own block numbering and its own root directory, so splitting also bounds how many members of a growing family any one container holds. Where a producer splits, and what each split carries to stand alone, is that producer's format; the MCR recorder's is in `codetracer-specs`.
 
 ### Trace Directory Layout
 
@@ -1109,9 +1986,9 @@ my-recording/
 
 Reader opens all `.ct` files in sorted order. Zero-padded indices ensure correct lexicographic sort.
 
-**Split points:** A new file begins each time MCR writes a full memory snapshot (as opposed to a delta snapshot). The frequency of full snapshots is configurable -- more frequent splits produce smaller individual files and increase exploitable parallelism (each split can be analyzed independently). However, more frequent splits increase total trace size because each split begins with a full memory snapshot that duplicates the entire address space at that point. The trade-off is between granularity (smaller files, more parallelism, finer-grained deletion) and space efficiency (fewer snapshots, less duplication).
+**Split points:** More frequent splits produce smaller individual files and increase exploitable parallelism (each split can be analyzed independently). They also increase total trace size when each split must repeat state, such as a memory snapshot, to stand alone. The trade-off is between granularity (smaller files, more parallelism, finer-grained deletion) and space efficiency.
 
-**Independent file deletion:** Any split file can be deleted; remaining files stay playable. Each split is self-contained with its own snapshot, block numbering, and namespace entries. The reader skips missing indices and continues with the next available file. This enables storage management policies such as retaining only segments around a known failure point.
+**Independent file deletion:** Any split file can be deleted; remaining files stay readable. Each split is self-contained with its own block numbering and namespace entries. The reader skips missing indices and continues with the next available file. This enables storage management policies such as retaining only segments around a known failure point.
 
 **Namespace queries across splits:** Query all split files, concatenate results. Split ordering preserves chronological order.
 
@@ -1127,7 +2004,7 @@ All data at block-aligned boundaries. Predictable read counts:
 
 | Operation | Reads | What |
 |-----------|-------|------|
-| Container discovery | 1 block | Block 0 (header + file entries) |
+| Container discovery | `root_blocks` blocks (1 by default) | The root region (header + file entries) |
 | Step lookup | 1-2 blocks | Companion index + one chunk |
 | Namespace lookup | 3-5 blocks | B-tree walk + data read |
 | Call lookup | 2-3 blocks | Companion index + one chunk |
@@ -1137,7 +2014,7 @@ HTTP range requests: block `b` = bytes `[b * BlockSize, (b+1) * BlockSize)`.
 
 ### Partial Trace Cache (.ctp)
 
-A `.ctp` file is a standard CTFS container holding only fetched blocks. Contains `presence.idx` (sorted array of remote block numbers) and `permanent.idx` (blocks not eligible for eviction). Blocks are fetched on demand and cached to disk, with an LRU RAM layer on top (default 256MB).
+A `.ctp` file is a standard CTFS container holding only fetched blocks. Contains `presence.idx` (sorted array of remote block numbers) and `permanent.idx` (blocks not eligible for eviction). Blocks are fetched on demand and cached to disk, with an LRU RAM layer on top (default 256MB). Remote block numbers are stable, because no block ever moves (§1). Which cached blocks stay valid when the remote container is still being written, or is appended to after it closed, is §6, "What is mutated in place, and what a cache may keep".
 
 ### Smart Query Protocol (Optional)
 
@@ -1150,7 +2027,7 @@ Storage nodes resolve queries server-side (B-tree walks, chunk decompression) in
 | Setting | Default | Rationale |
 |---------|---------|-----------|
 | BlockSize | 4096 | Matches OS page size and HTTP range granularity |
-| MaxRootEntries | 0 (auto) | Fills block 0; sufficient for most traces |
+| MaxRootEntries | 0 (auto) | Fills block 0 (170 entries); fixed at creation (§1). A producer whose closed set of members needs more declares more; a growing family goes into a keyed member (§7a), not into the root |
 | LRU cache | 16--64 blocks | Balances memory vs mapping re-reads |
 | Chunk threshold | 4096 events | Balance compression ratio vs seek granularity |
 

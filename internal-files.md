@@ -2,6 +2,66 @@
 
 A CTFS container (`.ct` file) stores several named internal files. This document describes the standard files and their data abstractions.
 
+> **Scope.** This specification defines the structure of the CTFS container format, and the records
+> used by the open-source recorders that produce materialized traces. It does not describe how the
+> Multi-Core Recorder (MCR) uses CTFS: which members an MCR recording writes, their layout, and its
+> per-thread, checkpoint and page streams. Those are specified in `codetracer-specs`
+> (`spec/Trace-Files/CTFS-Binary-Format.md`), and they are subject to change in each release. The
+> boundary between the two repositories is stated in `codetracer-specs/spec/Trace-Files/README.md`.
+> The MCR material this document carried until 2026-10-07 moved there; the sections below that name
+> it say where.
+
+## Member Catalogue
+
+Every member a materialized-trace writer produces, with the property that decides how it is stored
+and, for a member that holds a family keyed by a `u64`, the abstract family it belongs to
+([ctfs-keyed-families.md](ctfs-keyed-families.md) §5: F1 dense, F2 clustered, F3 sparse exact live,
+F4 sparse ordered live, F5 static index). "Today" is the realization every writer emits now; it stays
+until the benchmark decision of [ctfs-keyed-families.md](ctfs-keyed-families.md) §8 says otherwise.
+"Measured against" names the candidates the benchmark plan compares for that member.
+
+Members of an MCR recording, and members CodeTracer's own tools persist into a recording (the
+db-backend's `coverage.tc`, its persisted `memwrites.tc` and `linehits.tc`, the race detector's
+`slc-*`), are catalogued in `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md` §2. A runtime
+trace has no `memwrites.tc` (§"Memory writes are not part of a runtime trace").
+
+**Block placement.** A split-stream writer's members are placed in the order `ctfs-container.md` §6,
+"Block placement", fixes, so the container is a function of the recording. A realization chosen for
+any member below joins that order, and MUST itself be a function of its entries (G12).
+
+### Singletons (one root member each; no family)
+
+| Member | What it is | Written | Live readers | Notes |
+|---|---|---|---|---|
+| `meta.dat` | binary metadata | once, at open | yes | never rewritten (§"Extended flags") |
+| `steps.dat`, `values.dat`, `calls.dat`, `events.dat`, `spans.dat` | chunked compressed streams | live, append-only (P1); `calls.dat` in call-key order, so in practice at close | yes | monotonic streams; only `Size` and `MapBlock` change in place |
+| `entry.dat` | the recorded program entry ([recorded-entry-identity.md](recorded-entry-identity.md)) | once, at close, last | no | optional |
+
+`events.log` and `events.fmt`, a seekable-zstd stream, were removed (`trace-events.md`); a container
+carrying them is refused.
+
+### Keyed families
+
+| Member | Key, and its shape | Lookups | Value class | Written | Family | Today | Measured against |
+|---|---|---|---|---|---|---|---|
+| `steps.idx`, `values.idx`, `calls.idx`, `events.idx` | chunk number: dense, writer-assigned | exact (chunk `N / chunk_size`) | V0 (an offset) | live, append-only | F1 | D1 (an offset array after a `u32` header) | unchanged: no candidate beats arithmetic |
+| `spans.idx` | chunk number: dense; records located by cumulative count | exact by chunk; record `N` by binary search over `cumulative` | V0 (offset, cumulative count) | live, append-only | F1 (with a monotone cumulative column, M1-style) | D1 with 16-byte entries (§"`spans.dat` / `spans.idx` / `spantype.ns`") | unchanged |
+| `paths`, `funcs`, `types`, `varnames`, `markers`, `srcviews` (`.dat` + `.off`) | interned id: dense, writer-assigned | exact, enumeration | V1 | live, append-only | F1 | D2 (Variable-Size Record Table) | unchanged |
+| `step-map.ns` | `(path_id, line)`: sparse over a dense product, ordered | exact, ordered | V2 (step-id list), sealed | close-time | F5 | S1 (sorted, chunk fences, compressed frames) | unchanged unless a benchmark shows S2/S3 better for line-breakpoint lookups |
+| `linehits.tc` | a step's location address (`global_position_index`): the global line index in a line-only trace, a byte-offset position in a column-aware one; the keys are the addresses that were hit | exact | V2 (step-id list) | close-time, after `step-map.ns`, when enabled | F5, or F1 over the address space in a line-only trace | S2 (the `ctfs-container.md` §8a image) | F1 D2 over the global line index (line-only traces; one record per line, hit or not) against S1, S2, S3; decided by the measured fraction of addresses hit. A column-aware trace's address space is too sparse for F1 |
+| `corrmark.ns` | `XXH64` of a correlation key: sparse, uniform | exact, confirmed against the bucket | V2 (a bucket of 60-byte entries) | close-time, after `linehits.tc`, only when a marker or span coverage was declared (§"Correlation Index") | F5 | S2 (the §8a image) | S3 (a static hash) and S1; a replacement keeps the property that the image is a function of its entries |
+| `spantype.ns` | span type id: dense, writer-assigned | exact | V1 | close-time, after the span stream's last chunk | F1 (static) | a flat table (SPTY v1) | unchanged |
+| `memreads.tc` | memory address | exact | V2 | no writer | F3 or F5 | specified only | — |
+
+### What a writer does until the decision
+
+Every member above keeps the format its own section specifies. A writer MUST NOT emit a keyed layout
+from [ctfs-keyed-families.md](ctfs-keyed-families.md) §5 for any of them before §8 there records the
+decision and adds the layout. When it does, this catalogue gains the member's new format, every
+producer and consumer is updated in one rollout (`codetracer-specs`
+`milestones/CTFS-Keyed-Families.milestones.org`), and the recorders that write through the
+`codetracer_trace_writer` library advance their pins together.
+
 ## Reusable Data Abstractions
 
 These are higher-level structures built on top of CTFS internal files. They are not part of the container format but are standard patterns used by all CodeTracer recorders and readers.
@@ -32,6 +92,15 @@ entry is not the data file's length. (Both writers have always written the trail
 section described `N` entries with a fallback to the data file's size until 2026-10, and one
 downstream writer followed that reading and produced tables the libraries' readers refused.)
 
+**Appending while a reader follows.** A writer appends record `N` by writing its bytes to the data
+file and publishing the data file's entry, and only then appending the new terminal offset to the
+offset file and publishing that entry (`ctfs-container.md` §6). A reader takes the record count from
+the offset file, so it never sees a record whose bytes are not yet published. It loads the offset
+file's `Size` and entries first and the data file's `Size` after them, so the data file is at least
+as long as the last offset. While the table may still grow, the data file can be longer, by a record
+whose offset is not yet appended; a reader of a live table therefore checks
+`last offset <= data Size`, and a reader of a closed one checks equality, as above.
+
 ### Chunked Compressed Table (dat + idx)
 
 Extends fixed-size or variable-size tables with per-chunk compression. Records are grouped into chunks of `chunk_size` records, each independently compressed with Zstd.
@@ -40,6 +109,16 @@ Extends fixed-size or variable-size tables with per-chunk compression. Records a
 - **Index file** (`foo.idx`): starts with `chunk_size: u32`, then one `u64` byte offset per chunk
 
 Record N is in chunk `N / chunk_size`. The companion index provides O(1) access to any chunk's byte offset. See [ctfs-container.md](ctfs-container.md) Section 7 for full details.
+
+### Keyed Member (families that grow with the recording)
+
+One root member, or a small fixed set of them, that maps `u64` keys to fixed-size records, and through
+them to values or to container streams. A producer uses it for a family whose count grows with the
+recording, so that the fixed root directory bounds the number of families and not the size of the
+recording. The container rules are [ctfs-container.md](ctfs-container.md) §7a; the families, their
+candidate structures and how one is chosen are [ctfs-keyed-families.md](ctfs-keyed-families.md). The
+Fixed-Size Record Table and the Variable-Size Record Table above are themselves realizations of the
+dense family (F1, D1 and D2) for records that are only appended.
 
 ### Interning Tables
 
@@ -681,474 +760,31 @@ traces.
 A runtime recorder observes variables and their values, never machine addresses; a change to a
 variable is the value the next step records in `values.dat`. A runtime writer therefore records no
 memory writes and MUST NOT write `memwrites.tc` (or `memreads.tc`), and a runtime trace reader has no
-memory-write stream to read. `memwrites.tc` is a member of MCR traces (§"Multi-Core Recorder (MCR)
-Traces"), written by the native recorder's omniscient preparation and read by its replay backend;
-its layout is given there.
+memory-write stream to read. `memwrites.tc` is a member of MCR traces, written by the native
+recorder's omniscient preparation and read by its replay backend; its payload layout is given in
+`codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md` §3.10, and its image is
+`ctfs-container.md` §8a.
 
 ---
 
-## Multi-Core Recorder (MCR) Traces
+## Multi-Core Recorder (MCR) Traces (moved)
 
-| File | Abstraction | Purpose |
-|------|-------------|---------|
-| `meta.dat` | Binary metadata | Platform, tick source, timestamps, hook profile (see Metadata section) |
-| `threads.ns` | Namespace (Type B) | Per-thread event streams (keyed by thread_id) |
-| `syncord.log` | Append-only | Global synchronization ordering |
-| `geid.idx` | Fixed-size record | GEID-to-checkpoint index |
-| `cp.dat` | Var-size record | Checkpoint data (base snapshots + delta chains) |
-| `cp.off` | Offset index | Checkpoint ID to offset in `cp.dat` |
-| `cp0.regs` | Raw binary | Initial register snapshot at record-start (152 bytes typical) |
-| `cp0.mem` | Raw binary | Initial memory snapshot at record-start (sequence of `(address, size, bytes)` tuples) |
-| `cp0.fsbase` | Raw binary | Initial `fsbase`/`gsbase` (16 bytes; x86-64 Linux only) |
-| `cp0.maps` | Raw text | Verbatim `/proc/self/maps` text at cp0 capture time |
-| `debug.dat` | Raw binary | Full ELF of the recorded binary, including `.debug_*` sections |
-| `memwrites.tc` | `NSB1` namespace | Address to write history (omniscient queries); layout below |
-| `linehits.tc` | `NSB1` namespace | Source line to GEID lists (line hit queries) |
+How the Multi-Core Recorder uses CTFS is outside this specification's scope (see the scope note at the
+head of this document). On 2026-10-07 the MCR member formats that were specified here moved,
+unchanged in substance, to `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md`. The member
+layout they describe is changing: per-thread streams, checkpoints and bundled files move out of the
+root directory into keyed members (`ctfs-container.md` §7a), with each family's structure chosen by
+benchmark ([ctfs-keyed-families.md](ctfs-keyed-families.md)). What moved, and where:
 
-All files are append-only during recording.
-
-**Two flavours of MCR checkpoint state coexist in the container:**
-
-- **`cp0.*` — initial-state seed (this section).** Captured once at
-  record start by the LD_PRELOAD interposer (or any future
-  ptrace-based equivalent). Seeds the emulator before replay begins:
-  `cp0.regs` flows into `mcrSetRegisters`, `cp0.mem` into a sequence
-  of `mcrLoadMemoryRegion` calls, `cp0.fsbase`/`cp0.maps` provide
-  diagnostic / rebase context, and `debug.dat` is parsed for DWARF
-  line resolution. All are MCR-only and all are optional in the sense
-  that the replay backend falls back to degraded behaviour when they
-  are absent.
-- **`cp.dat` + `cp.off` — delta-chain checkpoints (next sub-section).**
-  Periodic snapshots written during recording so the replay engine
-  can seek to an arbitrary tick without re-emulating from cp0. Also
-  MCR-only.
-
-#### `memwrites.tc` (MCR)
-
-An `NSB1` image (`ctfs-container.md` §8a), Type B, keyed by the written address. A key's payload is
-its write records, 40 bytes each, sorted by `(interval_id, tick)`:
-
-```
-interval_id: u32 LE
-tick: u64 LE
-pc: u64 LE
-size: u32 LE          -- bytes written
-old_value: u64 LE
-new_value: u64 LE
-```
-
-It is written by the native recorder's omniscient preparation and read by the replay backend; the
-runtime trace writers do not write it (§"Memory writes are not part of a runtime trace").
-
-#### Cross-OS portability
-
-The `cp0.*` sidecars are *platform-specific captured state*: the
-recorder writes the SysV x86-64 ABI register file (`cp0.regs`), the
-contents of process-readable memory regions (`cp0.mem`), the
-filesystem path map (`cp0.maps` — currently the verbatim Linux
-`/proc/self/maps` text), and the `fs`/`gs` segment bases
-(`cp0.fsbase`). The format is one-way: the recorder writes the host's
-state at capture time; the replay backend interprets that state
-against its own (host-agnostic) emulator.
-
-Crucially, the *replay path* is host-agnostic. The
-`EmulatorReplaySession` in `db-backend` interprets the captured
-register values, installs `cp0.mem` regions into the emulator's
-memory map via `mcrLoadMemoryRegion`, and parses `cp0.maps` *as text*
-to compute the static-PC rebase delta. Nowhere on the replay path is
-there a `std::fs::read("/proc/self/maps")`, `CreateProcess()`, or
-`mach_vm_region()` call: every memory access goes through the
-emulator's internal region table, and DWARF line resolution uses the
-bundled `debug.dat` rather than touching the host filesystem. The
-emulator itself is the same Nim code compiled to either native x86-64
-or wasm32, depending on the build.
-
-Consequence: a `.ct` recorded on Linux x86-64 replays identically on
-macOS, Windows, or inside a wasm32 browser sandbox. The only host
-dependency is the architectural support in the emulator (currently
-x86-64); the host *operating system* is irrelevant. Cross-OS replay
-is therefore a property of the file format and the replay path, not a
-separate code path that needs feature-flagging.
-
-The
-`codetracer/src/db-backend/tests/xos_replay.rs` integration test
-(M-XOS-Fixture) pins this contract by replaying a Linux-recorded
-fixture (`tests/fixtures/xos/xos_hello.ct`) via
-`EmulatorReplaySession::new_from_ctfs_bytes` and asserting that the
-DAP-relevant surfaces (callstack, locals, breakpoints) come back
-populated. A true macOS-host run requires CI infra and remains
-deferred; the structural argument above explains why the Linux
-fixture is sufficient evidence that the host-decoupled replay path
-works.
-
-### Thread Streams via Namespaces
-
-Thread event streams are stored in `threads.ns`, a namespace keyed by `thread_id` (u64). This replaces the previous model of one CTFS file per thread (`t00000000001`, etc.), which was limited by MaxRootEntries. With namespaces, the thread count is unlimited -- the B-tree scales to millions of keys.
-
-#### Per-file thread streams (MCR recorder) are seekable-zstd
-
-The MCR recorder currently writes the per-file model — one `tNNN` file per thread
-(`t` + 11 zero-padded digits). These streams are **chunked, per-chunk Zstd-compressed,
-and seekable**, exactly like `steps.dat` / `calls.dat`:
-
-- `tNNN` (`.dat`): `[zstd(chunk_0)][zstd(chunk_1)]...` — each chunk is the bare
-  concatenation of raw event records (each record is self-describing: it begins with
-  an `EventHeader` whose `size` gives the full record length, so the reader walks a
-  decompressed chunk by `header.size` with no per-record length prefix).
-- Companion index **`iNNN`** (`i` + 11 digits), NOT `tNNN.idx`: CTFS keys every file
-  by the base40 encoding of its first 12 characters, and `tNNN` is already 12
-  characters, so `tNNN.idx` would collide with the data file. `iNNN` is a distinct
-  12-char key. Layout is the standard seekable-zstd companion index —
-  `[chunk_size: u32 LE][offset_0: u64 LE][offset_1: u64 LE]...` where `chunk_size` is
-  events per chunk and `offset_i` is the byte offset of chunk `i` in `tNNN`.
-
-To read event `N` of a thread: `chunk = N div chunk_size`, decompress
-`tNNN[offset[chunk] .. offset[chunk+1])`, walk `N mod chunk_size` records — O(chunk),
-never the whole stream. The `threads.ns` namespace variant (above) carries the same
-per-chunk-compressed, seekable payload keyed by `thread_id` instead of one file per
-thread; both are the seekable-zstd model, differing only in how the per-thread
-streams are addressed within the container.
-
-#### Snapshot payloads (MCR recorder) are Chunked Compressed Tables of bytes
-
-*(Added 2026-09-25, `MCR-Memory-Page-CAS.milestones.org` CAS-Z0.)*
-
-The MCR recorder's memory-snapshot payloads are stored through the same Chunked
-Compressed Table as `steps.dat` and the thread streams above — **the container's
-one compression layer; nothing snapshot-specific is layered on top** (owner
-decision, 2026-09-24: snapshots "can likely piggyback on the existing compression
-of the CTFS format (there won't be any win from double compression)").
-
-The payload classes, by LOGICAL name:
-
-| Logical name | What it holds |
+| Was here | Now in `codetracer-specs` `CTFS-Binary-Format.md` |
 |---|---|
-| `cp.<kind>.mem` | the page bytes of a stage-0 boundary snapshot (`kind` = `prein` / `entry` / `postl`) |
-| `cp.<kind>.cas` | that boundary's page-CAS hash stream (`MCR-Memory-Page-CAS.md` §3.3) |
-| `cppages.ns` | the trace's page-CAS page store (§5.1) |
-| `cp0.mem`, `cpN.mem` | a full memory snapshot, `(addr: u64, size: u64, bytes[size])*` — the initial one, or periodic checkpoint `N` |
-| `tstart.mem` | the macOS recording-start snapshot (same framing as `cp0.mem`) |
-
-Each is stored as a record-size-**1** table: every record is one byte, so
-`chunk_size` is the number of payload BYTES per chunk (the recorder uses
-1 048 576), every chunk but the last inflates to exactly `chunk_size` bytes, and
-the payload's length is `(chunks - 1) * chunk_size` plus the last frame's
-declared content size.  Random access holds: byte `o` is in chunk
-`o div chunk_size`.
-
-**Member names.**  `foo.dat` / `foo.idx` cannot be used: the logical names are
-already up to 12 characters, the most CTFS keys (§ base40 in
-[ctfs-container.md](ctfs-container.md)).  So the data and index members are named
-by replacing the extension `<ext>` with `<ext[0]>zd` and `<ext[0]>zi`:
-
-```
-cp.entry.mem -> cp.entry.mzd (data)  +  cp.entry.mzi (index)
-cp.entry.cas -> cp.entry.czd         +  cp.entry.czi
-cppages.ns   -> cppages.nzd          +  cppages.nzi
-cp3.mem      -> cp3.mzd              +  cp3.mzi
-```
-
-A name whose derived member would exceed 12 characters is refused by the
-writer, never truncated.
-
-**The legacy form, and how a reader tells the two apart.**  Traces written
-before 2026-09-25 carry the same payload RAW under the logical name.  A reader
-MUST decide the form by **which members exist**, never by inspecting bytes (a raw
-memory page can begin with the zstd frame magic):
-
-| `<logical>` | `<data>` + `<index>` | Meaning |
-|---|---|---|
-| absent | both present | compressed form — inflate |
-| present | both absent | legacy raw form — read as is |
-| present | any present | **malformed** — refuse |
-| any | exactly one present | **malformed** (half a pair) — refuse |
-| absent | both absent | the payload is absent |
-
-A writer emits exactly one form, and adds the data and index members together
-or not at all (it checks for two free root entries first; CTFS cannot remove a
-member once added).  Every frame's declared content size MUST match what the
-index implies, so a truncated or re-ordered payload fails rather than decoding
-to plausible bytes.
-
-Layouts (`cp.<kind>.lay`), register files (`cp.<kind>.reg`, `cpN.regs`) and the
-checkpoint index members stay raw: each is well under one block, and a
-compressed pair costs two members and at least four blocks where the raw member
-costs one member and two.
-
-**A payload that fits in one block is stored raw (normative since 2026-09-30,
-`MCR-Memory-Page-CAS.milestones.org` CAS-D1).**  The same arithmetic applies to
-a snapshot payload that happens to be small.  A writer MUST store a payload of
-**at most `block_size` bytes** (the container header's block size, 4096 for every
-MCR trace) in the **raw form**, under its logical name, and MUST store a payload
-of more than `block_size` bytes in the compressed form.  The threshold is on the
-PAYLOAD length, before compression, so the decision needs no trial compression
-and two writers given the same payload choose the same form.  Why exactly that
-threshold: a compressed form occupies at least one data block and one index
-block, each with its own block-map block, and a second root entry — four blocks
-where the raw member of a one-block payload occupies two (its data block and its
-block-map block) — so no payload of one block can be made smaller by
-compressing it, and the rule is exactly "compress only what compression can
-shrink by a block".  A payload of zero bytes is covered by the rule (a raw
-member of length 0); a producer that omits an empty payload altogether (the MCR
-recorder omits an empty `cp.<kind>.mem`, `MCR-Memory-Page-CAS.md` §5.1) writes
-no member at all.  In practice the payload the rule catches is a small stage-0
-boundary's `cp.<kind>.cas` (`cp.prein.cas`, ~1.5 KB on Windows).
-(The block counts above are container version 4's, where every member has a
-block-map block. Under version 5 a member of at most one block has none
-(`ctfs-container.md` §2), so the compressed form costs at least two blocks and
-the raw one-block member costs one; the threshold and its reason are unchanged.)
-
-This adds no reader obligation.  The raw form is the legacy form in the table
-above, which every reader already resolves; the form is still decided by which
-members exist, never by the bytes; and the rule is a WRITER rule only — a reader
-MUST accept either form for a payload of any length (a pre-2026-09-25 trace
-carries large payloads raw, and a writer that predates this rule carries small
-ones compressed).  Consistent with the owner decision above: there is still one
-compression layer, the container's own; this only says when it is not worth
-applying.
-
-Implementations: `codetracer-native-recorder/ct_recorder/src/ct_recorder/snapshot_payload.nim`
-(writer and reader); `tracing-formats-benchmarks/cas_dedup/ctfs.py`
-(`read_payload`, independent Python reader).
-
-### Checkpoint Packing (cp.dat + cp.off)
-
-> **Not what the MCR recorder writes (corrected 2026-09-25, CAS-Z0).**  No
-> producer in the workspace writes `cp.dat` / `cp.off`; the design below is
-> unimplemented.  The MCR recorder's periodic checkpoints are FULL snapshots in
-> five member kinds: `cpidx.idx` (`count: u32`, then `id: u32` per checkpoint),
-> `cpidxall.idx` (`count: u32`, then `(id: u32, geid: u64)` per checkpoint),
-> `cpdata.bin` (concatenated `(id: u32, geid: u64, n: u32, (tid: u32, tick: u64)[n])`
-> records, raw, no page data), `cpN.mem` (the memory, as a compressed snapshot
-> payload — above) and `cpN.regs` (`(tid: u32, len: u32, bytes[len])*`).  There
-> is no incremental chain and no delta encoding.  `Multi-Core-Recorder.md`
-> §12.3-§12.4 states the same.
-
-MCR checkpoints are packed as a variable-size record table. Each checkpoint record contains register state, thread ticks, and page data (full pages or byte-level deltas against the parent checkpoint).
-
-Checkpoints form incremental chains: a base checkpoint stores a full memory snapshot, followed by delta checkpoints storing only changed pages.
-
-**Restoring memory state at a target GEID:**
-
-1. Look up GEID in `geid.idx` to find checkpoint ID
-2. Read `cp.off[checkpoint_id]` for byte offset in `cp.dat`
-3. Follow parent chain backward to nearest base checkpoint
-4. Read base + all deltas sequentially from `cp.dat`
-5. Apply page deltas in order to reconstruct full memory state
-6. Hand register state to last-mile controller for emulation to exact target tick
-
-The variable-size record table makes this a single contiguous scan through `cp.dat`.
-
-### Initial Register Snapshot (cp0.regs)
-
-A flat, raw-bytes CTFS file carrying the GPR state of the first
-recorded thread at the moment cp0 was captured. Written by the
-LD_PRELOAD `__libc_start_main` wrapper after libc startup completes
-and just before control transfers to the user `main` (writer:
-`codetracer-native-recorder/ct_interpose/src/ct_interpose/full_snapshot.c`,
-`_ct_full_snapshot_write_regs`). Total typical size is 152 bytes (one
-thread, compact layout).
-
-**Outer wrapper** (per thread, repeated end-to-end if multiple threads
-are present; readers stop after the first thread):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| +0 | 4 | `tid` (u32 LE) -- recording-thread id; 0 for the main thread |
-| +4 | 4 | `reg_data_len` (u32 LE) -- length of the inner register body |
-| +8 | `reg_data_len` | `reg_data[reg_data_len]` -- one of the two layouts below |
-
-**Inner layout A -- compact, 144 bytes (`reg_data_len = 144`).**
-Written by the LD_PRELOAD wrapper. Eighteen `u64 LE` values in the
-exact argument order of `mcrSetRegisters`:
-
-| Index | Offset | Register |
-|-------|--------|----------|
-| 0 | 0 | `rax` |
-| 1 | 8 | `rbx` |
-| 2 | 16 | `rcx` |
-| 3 | 24 | `rdx` |
-| 4 | 32 | `rsi` |
-| 5 | 40 | `rdi` |
-| 6 | 48 | `rbp` |
-| 7 | 56 | `rsp` |
-| 8 | 64 | `r8` |
-| 9 | 72 | `r9` |
-| 10 | 80 | `r10` |
-| 11 | 88 | `r11` |
-| 12 | 96 | `r12` |
-| 13 | 104 | `r13` |
-| 14 | 112 | `r14` |
-| 15 | 120 | `r15` |
-| 16 | 128 | `rip` (resume address = the user's real `main`) |
-| 17 | 136 | `rflags` |
-
-**Inner layout B -- ptrace `user_regs_struct`, 216 bytes
-(`reg_data_len = 216`).** Written by recorders that capture state via
-`PTRACE_GETREGS` (no producer ships this today; readers accept it for
-forward compatibility). Twenty-seven `u64 LE` values in Linux's
-`<sys/user.h>` order:
-
-| Index | Offset | Register |
-|-------|--------|----------|
-| 0 | 0 | `r15` |
-| 1 | 8 | `r14` |
-| 2 | 16 | `r13` |
-| 3 | 24 | `r12` |
-| 4 | 32 | `rbp` |
-| 5 | 40 | `rbx` |
-| 6 | 48 | `r11` |
-| 7 | 56 | `r10` |
-| 8 | 64 | `r9` |
-| 9 | 72 | `r8` |
-| 10 | 80 | `rax` |
-| 11 | 88 | `rcx` |
-| 12 | 96 | `rdx` |
-| 13 | 104 | `rsi` |
-| 14 | 112 | `rdi` |
-| 15 | 120 | `orig_rax` |
-| 16 | 128 | `rip` |
-| 17 | 136 | `cs` |
-| 18 | 144 | `eflags` |
-| 19 | 152 | `rsp` |
-| 20 | 160 | `ss` |
-| 21 | 168 | `fs_base` |
-| 22 | 176 | `gs_base` |
-| 23 | 184 | `ds` |
-| 24 | 192 | `es` |
-| 25 | 200 | `fs` |
-| 26 | 208 | `gs` |
-
-Readers select the layout by inspecting `reg_data_len`. Any other
-length is rejected. Reader contract: the emulator's
-`mcrSetRegisters` consumes the decoded registers verbatim; see
-`ct_emulator/src/ct_emulator/ctfs_bridge.nim::loadInitialStateFromTrace`
-(Nim) and `codetracer/src/db-backend/src/emulator_session.rs`
-(`decode_first_thread_registers`, Rust) for the canonical decoders.
-
-### Initial Memory Snapshot (cp0.mem)
-
-A flat, raw-bytes CTFS file holding the live program memory as
-captured at cp0 time. Written by the same LD_PRELOAD interposer
-(`_ct_full_snapshot_walk` in `full_snapshot.c`). Typical size scales
-with the program's resident set: a few megabytes for trivial
-programs, ~90 MB for `inventory_service`. The recorder bounds total
-size with the soft cap `CT_FULL_SNAPSHOT_LIMIT_MB` (default 256 MB)
-which emits a warning but does not truncate.
-
-**Wire format.** A sequence of `(address, size, bytes)` tuples
-concatenated end-to-end, one tuple per readable, non-skipped
-`/proc/self/maps` entry. There is no count prefix, no per-region
-header beyond `(address, size)`, no terminator, and no padding --
-parsing stops when the file ends.
-
-Per tuple:
-
-| Offset | Size | Field |
-|--------|------|-------|
-| +0 | 8 | `address` (u64 LE) -- region start in the recorded process's VAS |
-| +8 | 8 | `size` (u64 LE) -- region length in bytes |
-| +16 | `size` | `bytes[size]` -- raw region contents read via `pread(/proc/self/mem)` |
-
-The writer drops any region for which a full read fails (e.g. EIO on
-PROT_NONE guards) and excludes regions whose pathname is in the
-recorder's skip-set (e.g. `[vvar]`, `[vsyscall]`). `[stack]` is
-included in the `__libc_start_main` wrapper's re-capture but excluded
-from the earlier library-constructor capture.
-
-Reader contract: each tuple is installed into the emulator via
-`mcrLoadMemoryRegion(address, bytes_ptr, size)`. See
-`ct_replayer/src/ct_replayer/trace_loader.nim::readMemorySnapshot`
-(Nim) and `codetracer/src/db-backend/src/emulator_session.rs`
-(Rust) for the canonical parsers.
-
-### Initial Segment Bases (cp0.fsbase)
-
-A 16-byte raw binary CTFS file holding the recording thread's
-`fsbase` and `gsbase` at cp0 time. The emulator needs `fsbase` to
-step past libc's stack-canary fetch (`mov rdi, fs:[0x28]`) inside
-`__libc_start_main`; without it the emulator faults a few hundred
-instructions into libc startup.
-
-Layout (little-endian, no header):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| +0 | 8 | `fsbase` (u64 LE) -- value from `arch_prctl(ARCH_GET_FS, ...)` |
-| +8 | 8 | `gsbase` (u64 LE) -- value from `arch_prctl(ARCH_GET_GS, ...)` |
-
-Writer: `ct_full_snapshot_write_fsbase_linux` in `full_snapshot.c`.
-A read error during recording leaves the corresponding slot zero; an
-entirely absent sidecar means the emulator defaults both bases to
-zero (pre-M-EM3 behaviour), which is correct for programs that never
-touch TLS but breaks libc startup.
-
-x86-64 Linux only. Other platforms do not currently ship this file.
-
-### Address-Space Map (cp0.maps)
-
-A raw-text CTFS file containing a verbatim, byte-for-byte copy of the
-recording process's `/proc/self/maps` at cp0 capture time. No
-filtering, no normalisation, no trailing terminator beyond whatever
-the kernel emitted.
-
-**Encoding.** UTF-8-compatible 7-bit ASCII (kernel never emits
-non-ASCII bytes in this file). One mapping per line; each line follows
-the standard Linux kernel format:
-
-```
-<start>-<end> <perms> <offset> <dev>:<inode>    <pathname>
-```
-
-where `<start>` and `<end>` are lowercase hexadecimal addresses
-without a `0x` prefix, `<perms>` is the 4-character `rwxp`/`rwxs`
-string, `<offset>` is a hex file offset, `<dev>` is the
-`<major>:<minor>` device pair (also hex), `<inode>` is a decimal
-inode number, and `<pathname>` is the resolved mapping path or a
-bracketed pseudo-name such as `[heap]`, `[stack]`, `[vvar]`, or
-`[vdso]`. Anonymous mappings have an empty pathname.
-
-The recorder buffers the file through a 128 KiB stack buffer
-(`maps_buf` in `_ct_full_snapshot_walk`) and writes the truncated
-length on overflow; in practice processes with <~1500 mappings fit
-without truncation.
-
-Reader contract: the replay backend parses this text to recover the
-ASLR load base of the main executable so it can rebase runtime PCs
-into the static address space DWARF encodes. Without `cp0.maps`,
-line resolution falls back to line 1 for relocated binaries. See
-`codetracer/src/db-backend/src/emulator_session.rs` (`parse_cp0_maps`)
-for the parser.
-
-### Bundled Debug Binary (debug.dat)
-
-A raw-binary CTFS file containing the **full ELF of the recorded
-binary**, captured at record time exactly as it exists on disk -- no
-stripping, no filtering, no repackaging. Includes the regular code /
-rodata / .eh_frame sections as well as every `.debug_*` section
-present in the recorded ELF. Typical size: a few MB for ordinary
-release builds; the recorder enforces a 64 MiB soft cap
-(`MaxDwarfBundleBytes`) and skips the bundle with a warning if the
-binary is larger.
-
-Writer: `readBinaryForDwarfBundle` in
-`codetracer-native-recorder/ct_cli/src/ct_cli/dwarf_paths_extractor.nim`,
-which `readFile`s the binary path verbatim. The bundle is then
-written to the container via `tw.writeRawFile("debug.dat", bytes)`
-from `record_cmd.nim`.
-
-Reader contract: the replay backend parses the blob with
-`DwarfIndex::from_elf_bytes` to resolve emulator PCs to
-`(file, line, function)` triples. The ELF wrapper is required (the
-parser handles both the wrapper and the embedded DWARF), and future
-milestones plan to consume `.eh_frame` from the same blob for stack
-unwinding. When `debug.dat` is absent or unreadable, the backend
-falls back to producing `(paths[0], 1)` line locations.
-
-Why bundle the whole ELF instead of just `.debug_*` sections: the
-DWARF parser already understands the ELF container and would have to
-synthesise one if handed loose sections; carrying the original file
-also keeps a single, audit-friendly artifact in the trace.
+| "Multi-Core Recorder (MCR) Traces" (the member table, the two flavours of checkpoint state) | §2, the MCR member layout; the old table is kept in Appendix A |
+| "Cross-OS portability" | §3.1 |
+| "Thread Streams via Namespaces", "Per-file thread streams (MCR recorder) are seekable-zstd" | §2.3 (the per-thread stream family); the per-file `tNNN` / `iNNN` text is kept in Appendix A |
+| "Snapshot payloads (MCR recorder) are Chunked Compressed Tables of bytes" | §2.5; the member-name derivation it gave is kept in Appendix A |
+| "Checkpoint Packing (cp.dat + cp.off)" | §2.4 (the snapshot family); the original delta-chain design is kept in Appendix A |
+| "Initial Register Snapshot (cp0.regs)", "Initial Memory Snapshot (cp0.mem)", "Initial Segment Bases (cp0.fsbase)", "Address-Space Map (cp0.maps)", "Bundled Debug Binary (debug.dat)" | §3.2 to §3.6, verbatim |
+| "`memwrites.tc` (MCR)", the payload layout added on 2026-10-08 (abb73d4) | §3.10, verbatim |
 
 ---
 
@@ -1436,7 +1072,10 @@ missing or malformed value. Rationale and migration roadmap:
 ### Extended Fields (flags bitmask)
 
 **Flag bit 0 -- MCR fields.** When set, the block below follows
-`recorder_id`. Every field is varint-encoded (no fixed-width integers):
+`recorder_id`. Every field is varint-encoded (no fixed-width integers).
+The block's byte layout stays in this document, although its subject is the MCR recorder, because
+every reader of `meta.dat` has to parse it to reach the blocks that follow it (bits 1 to 3). What the
+fields mean for an MCR recording is specified in `codetracer-specs`.
 
 ```
   tick_source: varint (TickSource enum ordinal)
@@ -1649,8 +1288,10 @@ assumes.
 
 A namespace mapping a correlation key to the markers a recording carries for
 it, so a consumer can answer "does this recording cover this span?" with a
-B-tree lookup instead of a scan of the event stream. Built **during recording**
-by every writer that observes a marker.
+B-tree lookup instead of a scan of the event stream. Its entries are collected
+**during recording** by every writer that observes a marker; the image is written
+at close (§"When it is written", below), so in the families of
+[ctfs-keyed-families.md](ctfs-keyed-families.md) it is a static index (F5).
 
 **Key.** `XXH64(seed = 0, key_bytes)`. For distributed-trace correlation
 (`kind = 0`) `key_bytes` is the 24-byte buffer `trace_id_be || span_id_be` —
@@ -1789,87 +1430,23 @@ Full contract, including why this shape was chosen over a scan:
 
 | Namespace | Key | Meaning |
 |-----------|-----|---------|
-| `linehits.tc` | global line index | Source line hit time coordinates |
-| `memwrites.tc` | memory address | Memory write time coordinates |
+| `linehits.tc` | location address (a step's `global_position_index`) | Step ids at each source location |
+| `memwrites.tc` | memory address | Memory write history; MCR traces only (§"Memory writes are not part of a runtime trace") |
 | `memreads.tc` | memory address | Memory read time coordinates |
-| `slc-mwr.ns` | slice_id | Per-thread-slice write address sets |
-| `slc-mrd.ns` | slice_id | Per-thread-slice read address sets |
-| `threads.ns` | thread_id | Per-thread event streams |
 | `corrmark.ns` | XXH64 of the correlation key | Correlation markers — which distributed-trace spans (and cross-process boundaries) this recording touches |
+
+The rows `slc-mwr.ns`, `slc-mrd.ns` and `threads.ns` were here until 2026-10-07. They are MCR members
+and moved to `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md` §2 with the scope note above;
+the per-thread streams are a dense keyed family there (§2.3), not a namespace.
 
 ---
 
-## Native Recorder Files
+## Native Recorder Files (moved)
 
-These files are used by the native recorder for binary/debug information. They may be present in `.ct` files produced by the native recorder.
-
-### `filemap.bin`
-
-Maps CTFS-internal short names to real filesystem paths for binaries, debug symbols, and source files.
-
-**Header** (8 bytes):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 4 | Magic: `46 4D 41 50` ("FMAP") |
-| 4 | 2 | Version (u16 LE). Current: 1. |
-| 6 | 2 | Entry count (u16 LE) |
-
-**Each entry**:
-
-| Field | Size | Encoding |
-|-------|------|----------|
-| `ctfs_name` | 8 | u64 LE (Base40-encoded) |
-| `entry_type` | 1 | 0 = Binary, 1 = DebugSymbol, 2 = SourceFile |
-| `flags` | 1 | bit 0: is_main_executable, bit 1: is_dynamic_linker |
-| `build_id_len` | 1 | u8 |
-| `build_id` | build_id_len | raw bytes |
-| `path_len` | 1-10 | LEB128 varint |
-| `path` | path_len | UTF-8 string |
-
-Type-specific trailing fields:
-
-- **DebugSymbol**: `binary_ref` (u64 LE) -- Base40-encoded CTFS name of parent binary
-- **SourceFile**: `compilation_dir_len` (LEB128) + `compilation_dir` (UTF-8)
-- **Binary**: no additional fields
-
-### `platform.bin`
-
-Platform description for the recording machine.
-
-**Header**: `50 4C 41 54` ("PLAT", 4 bytes)
-
-**Fixed fields** (20 bytes at offset 4):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 4 | 1 | `os`: 0=Linux, 1=macOS, 2=Windows, 3=FreeBSD |
-| 5 | 1 | `arch`: 0=x86_64, 1=aarch64, 2=riscv64 |
-| 6 | 1 | `pointer_size`: typically 8 |
-| 7 | 1 | `endianness`: 0=little-endian |
-| 8 | 4 | `page_size` (u32 LE) |
-| 12 | 2 | `kernel_major` (u16 LE) |
-| 14 | 2 | `kernel_minor` (u16 LE) |
-| 16 | 2 | `kernel_patch` (u16 LE) |
-| 18 | 6 | Reserved (zero) |
-
-**Variable fields** (after offset 24): `libc_name` and `kernel_version` as LEB128-prefixed UTF-8 strings.
-
-### `mmap.bin`
-
-Memory mapping table.
-
-**Header** (8 bytes): Magic `4D 4D 41 50` ("MMAP") + entry count (u32 LE).
-
-**Each entry** (33 bytes, fixed-size):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| +0 | 8 | `address` (u64 LE) |
-| +8 | 8 | `size` (u64 LE) |
-| +16 | 8 | `binary_ref` (u64 LE, Base40) |
-| +24 | 8 | `file_offset` (u64 LE) |
-| +32 | 1 | `permissions` (u8: bit 0=read, 1=write, 2=execute, 3=private) |
+`filemap.bin`, `platform.bin` and `mmap.bin` are members the native (MCR) recorder writes. On
+2026-10-07 they moved, with the scope note at the head of this document, to `codetracer-specs`
+`spec/Trace-Files/CTFS-Binary-Format.md` §3.7 to §3.9. `filemap.bin` changed version there
+(version 2: a bundled file is found by its entry's index, not by a member name).
 
 ---
 
@@ -1993,3 +1570,5 @@ the git history of `codetracer-trace-format-spec`.
 | 2026-09-30 | **Snapshot payloads: a payload that fits in one block is stored raw** (`MCR-Memory-Page-CAS.milestones.org` CAS-D1).  "Snapshot payloads (MCR recorder)" gains a normative writer rule: a snapshot payload of at most `block_size` bytes (4096) is stored in the raw form under its logical name, one of more than `block_size` in the compressed form; the threshold is on the uncompressed length, so the choice needs no trial compression.  A compressed form costs at least four blocks (data and index members, each with a block-map block) and two root entries where a one-block raw member costs two blocks and one entry, so compression cannot shrink such a payload.  No reader change: the raw form is the legacy form every reader already resolves, told apart by which members exist.  Measured cause: on a Windows `fx_small` page-CAS trace the boundary-A `cp.prein.cas` (1 228 bytes compressed) occupied four blocks for a ~1.5 KB payload, the two blocks that tied a page-CAS trace with the compressed legacy trace it replaces. |
 | 2026-10-01 | **Format-efficiency revision** (`measurements/2026-10-format-efficiency.md`). `meta.dat` version 6: no path list, `paths.dat` is the only list of source paths, and `flags_ext` is always present. `step-map.ns` version 2: keys delta-coded, step-id gaps run-length-coded, zstd chunks of about 64 KiB behind an uncompressed chunk table; 81 times smaller than version 1 on the corpus. Together with container version 5 (`ctfs-container.md` §2), the normative step-encoding rule and the exact `EventLogKind` in `events.dat` (`trace-events.md`). |
 | 2026-10-04 | **Framed members in a compact container** (`ctfs-container.md` §1f). A chunked compressed table, `step-map.ns` and a seekable-zstd stream keep their format in a compact container with every frame replaced by its decompressed content and every offset that located a frame locating that content; nothing else in the member changes, so a compact container is a function of the full container of the same recording. A writer may write the full profile throughout and convert at close, its threshold measured on the compact members' lengths (§1e). |
+| 2026-10-08 | **Member Catalogue, and keyed families instead of stream directories.** New §"Member Catalogue": every member a materialized-trace writer produces, its key shape, lookups, value class and lifecycle, and the abstract family it belongs to ([ctfs-keyed-families.md](ctfs-keyed-families.md)), with the realization written today and the candidates the benchmarks compare. The "Keyed Member" abstraction is added. No member's format changes. |
+| 2026-10-07 | **Scope, and the MCR material moved out** (owner decision 2026-10-07; `codetracer-specs/issues/2026-10-07-ctfs-root-directory-growth-landed-without-a-spec-change.md`). A scope note at the head says this document covers the container and the records of the open-source recorders, not how MCR uses CTFS. "Multi-Core Recorder (MCR) Traces" (the member table, cross-OS portability, thread streams, snapshot payloads, checkpoint packing, `cp0.regs`, `cp0.mem`, `cp0.fsbase`, `cp0.maps`, `debug.dat`), "Native Recorder Files" (`filemap.bin`, `platform.bin`, `mmap.bin`) and the `threads.ns` / `slc-mwr.ns` / `slc-mrd.ns` rows of the namespace summary moved to `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md`; each section left a pointer saying where. The `meta.dat` MCR field block stays, because every `meta.dat` reader parses it. New: the live append order for a variable-size record table. |
