@@ -797,7 +797,7 @@ A single binary metadata file.
 ```
 Header (12 bytes):
   magic: "CTMD" (4 bytes: 0x43, 0x54, 0x4D, 0x44)
-  version: u16 LE (6; see "Version History")
+  version: u16 LE (7; see "Version History")
   flags: u16 LE
     The flag word holds two DIFFERENT classes of bit (see "Two classes of
     flag bit" below). Section-presence bits gate the parse of a
@@ -831,13 +831,13 @@ Header (12 bytes):
 
     No bit is reserved: version 4 assigned all sixteen. A further flag goes
     in `flags_ext`.
-  flags_ext: u32 LE -- always present at version 6; see "Extended flags
+  flags_ext: u32 LE -- always present from version 6 on; see "Extended flags
     (`flags_ext`)" below.
 
 ### Extended flags (`flags_ext`)
 
 `flags_ext` is the u32 at bytes 8..12, immediately after the u16 `flags`; the
-body starts at byte 12. Version 6 always carries it, `0` included.
+body starts at byte 12. Versions 6 and 7 always carry it, `0` included.
 
 ```
   flags_ext bit 0     -- FLAG_EXT_HAS_SOURCE_RELOAD: steps.dat may contain
@@ -968,7 +968,7 @@ only one of its registration routes. Therefore:
   the native backend's RR/TTD exporter). A container whose recording names no
   source path has an empty `paths.dat` or none.
 - **A reader takes source paths from `paths.dat` only.** There is no fallback
-  to `meta.dat`, and a reader MUST NOT look for one: in a version 6 header the
+  to `meta.dat`, and a reader MUST NOT look for one: from version 6 on, in the header the
   bytes after `recorder_id` are the next flag-gated block, or nothing.
 
 Varints are unsigned LEB128 (max 10 bytes). Strings are UTF-8 without
@@ -1035,7 +1035,7 @@ missing or malformed value. Rationale and migration roadmap:
   execution-stream record (`trace-events.md` § "Source Reload Marker (Tag
   0x08)"), which marks a switch to the path versions of § "`paths.dat`
   path versions".
-- **v6** (current, 2026-10-01) -- the path list after `recorder_id` is
+- **v6** (2026-10-01) -- the path list after `recorder_id` is
   gone; `paths.dat` is the only list of source paths (§ "`meta.dat` carries
   no path list"). `flags_ext` is always present, so there is one header
   length. Readers refuse every other version, naming it: the bytes after
@@ -1068,6 +1068,18 @@ missing or malformed value. Rationale and migration roadmap:
   container layer instead, which is a correct refusal on a different field
   and reads like an unrelated failure. `ctfs-container.md` §2, "The container
   version is one gate of several", is the general statement.
+
+- **v7** (current, 2026-10-12) -- the `EventLogKind` table grows from
+  fourteen kinds to twenty-four: `WriteStderr`, `Exec`, `ReadEnv`,
+  `WriteEnv`, `Stat`, `CreateDir`, `RemoveDir`, `RemoveFile`, `Rename` and
+  `ChangeDir` (values 14-23; `trace-events.md` § "EventLogKind (u8
+  enum)"), and a recorder uses `WriteOther`/`ReadOther` only for what no
+  kind describes. The header and body are v6's, byte for byte, apart from
+  the version: what moved is the set of values `events.dat` may carry. The
+  version moved anyway so that a v6 reader refuses a v7 trace at open,
+  rather than opening it and failing on the first event record with a new
+  kind. Readers refuse every other version, naming it, v6 included;
+  fixtures are regenerated.
 
 ### Extended Fields (flags bitmask)
 
@@ -1572,3 +1584,4 @@ the git history of `codetracer-trace-format-spec`.
 | 2026-10-04 | **Framed members in a compact container** (`ctfs-container.md` §1f). A chunked compressed table, `step-map.ns` and a seekable-zstd stream keep their format in a compact container with every frame replaced by its decompressed content and every offset that located a frame locating that content; nothing else in the member changes, so a compact container is a function of the full container of the same recording. A writer may write the full profile throughout and convert at close, its threshold measured on the compact members' lengths (§1e). |
 | 2026-10-08 | **Member Catalogue, and keyed families instead of stream directories.** New §"Member Catalogue": every member a materialized-trace writer produces, its key shape, lookups, value class and lifecycle, and the abstract family it belongs to ([ctfs-keyed-families.md](ctfs-keyed-families.md)), with the realization written today and the candidates the benchmarks compare. The "Keyed Member" abstraction is added. No member's format changes. |
 | 2026-10-07 | **Scope, and the MCR material moved out** (owner decision 2026-10-07; `codetracer-specs/issues/2026-10-07-ctfs-root-directory-growth-landed-without-a-spec-change.md`). A scope note at the head says this document covers the container and the records of the open-source recorders, not how MCR uses CTFS. "Multi-Core Recorder (MCR) Traces" (the member table, cross-OS portability, thread streams, snapshot payloads, checkpoint packing, `cp0.regs`, `cp0.mem`, `cp0.fsbase`, `cp0.maps`, `debug.dat`), "Native Recorder Files" (`filemap.bin`, `platform.bin`, `mmap.bin`) and the `threads.ns` / `slc-mwr.ns` / `slc-mrd.ns` rows of the namespace summary moved to `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md`; each section left a pointer saying where. The `meta.dat` MCR field block stays, because every `meta.dat` reader parses it. New: the live append order for a variable-size record table. |
+| 2026-10-12 | **`meta.dat` version 7: exact kinds for stderr, programs, the environment and directory changes** (`trace-events.md` § "EventLogKind (u8 enum)"). Ten `EventLogKind` values are allocated, 14-23: `WriteStderr`, `Exec`, `ReadEnv`, `WriteEnv`, `Stat`, `CreateDir`, `RemoveDir`, `RemoveFile`, `Rename`, `ChangeDir`, from a survey of every recorder's use of `WriteOther`, of `WriteFile` for directory changes and of reads it recorded nothing for. A recorder uses `WriteOther`/`ReadOther` only when no kind fits. No layout changes; the version moves so that a v6 reader refuses a v7 trace at open. |

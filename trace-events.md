@@ -681,12 +681,12 @@ The `kind` byte of an `events.dat` record (and of the legacy `Event` event) is t
 | Value | Kind | Recorded for |
 |-------|------|--------------|
 | 0 | `Write` | Output to stdout, or an unspecified write |
-| 1 | `WriteFile` | A write to a named file |
-| 2 | `WriteOther` | A write to anything else -- stderr, a pipe, a socket |
+| 1 | `WriteFile` | A write to a named file's contents, copying a file onto its destination included |
+| 2 | `WriteOther` | A write no other kind describes -- a pipe, a device, a host channel |
 | 3 | `Read` | Input from stdin, or an unspecified read |
 | 4 | `ReadFile` | A read from a named file |
-| 5 | `ReadOther` | A read from anything else |
-| 6 | `ReadDir` | Reading a directory's entries |
+| 5 | `ReadOther` | A read no other kind describes |
+| 6 | `ReadDir` | Reading a directory's entries -- listing it |
 | 7 | `OpenDir` | Opening a directory |
 | 8 | `CloseDir` | Closing a directory |
 | 9 | `Socket` | A socket operation |
@@ -694,8 +694,19 @@ The `kind` byte of an `events.dat` record (and of the legacy `Event` event) is t
 | 11 | `Error` | An uncaught exception or error |
 | 12 | `TraceLogEvent` | A message the program or recorder logged into the trace |
 | 13 | `EvmEvent` | An EVM host event (Stylus, EVM recorders) |
+| 14 | `WriteStderr` | Output to stderr |
+| 15 | `Exec` | Running a program: a command, a spawned child process, an `exec` of the process image |
+| 16 | `ReadEnv` | Reading an environment variable, or testing whether one is set |
+| 17 | `WriteEnv` | Setting or removing an environment variable |
+| 18 | `Stat` | Asking about a filesystem entry without reading it -- whether it exists, its type, size, times or permissions; searching a path list for one |
+| 19 | `CreateDir` | Creating a directory, copying a directory tree onto its destination included |
+| 20 | `RemoveDir` | Removing a directory |
+| 21 | `RemoveFile` | Removing a file |
+| 22 | `Rename` | Renaming or moving a file or directory |
+| 23 | `ChangeDir` | Changing the process's current directory |
 
-Values 14-255 are unassigned.
+Values 24-255 are unassigned. Values 14-23 are allocated by `meta.dat` version 7; see
+§"The kinds of meta.dat version 7".
 
 Requirements (meta.dat version 6 onward):
 
@@ -705,6 +716,69 @@ Requirements (meta.dat version 6 onward):
   whether or not a current recorder emits it, so that every ordinal keeps its meaning.
 - **An unassigned value is refused.** A writer MUST NOT write one, and a reader MUST refuse a record
   that carries one, naming the value, rather than substitute a kind for it.
+
+Requirements (meta.dat version 7 onward):
+
+- **The exact kind, and `*Other` only when none fits.** A recorder MUST give an operation the kind
+  in the table that describes it, and MUST NOT use `WriteOther` or `ReadOther` for an operation
+  that another kind describes. Stderr is `WriteStderr`, not `WriteOther`; running a command is
+  `Exec`; an environment change is `WriteEnv`. `WriteOther` and `ReadOther` remain for a channel
+  the table has no name for, so that such an event is still recorded rather than dropped.
+- **One event, the kind of its effect on its target.** An operation that both reads and writes is
+  recorded as one event, whose kind is what it does to the entry it names last: copying a file
+  writes its destination (`WriteFile`), copying a directory tree creates its destination
+  (`CreateDir`), moving either renames it (`Rename`). Deleting is not writing: removing a file is
+  `RemoveFile`, removing a directory `RemoveDir`, removing an environment variable `WriteEnv`.
+- **Reads are events too.** An operation whose outcome the program observes -- an environment
+  lookup (`ReadEnv`), an existence test (`Stat`), a directory listing (`ReadDir`), a line from
+  stdin (`Read`) -- is recorded like the writes, so that a replay can show what the program saw.
+- **The content says what happened, the kind says what kind of thing it was.** The kind does not
+  carry the operation's arguments or result; a recorder puts those in the record's `content` (and,
+  where it has one, the stream or target in `metadata`). A reader MUST NOT infer a kind from the
+  content.
+
+#### The kinds of meta.dat version 7
+
+The ten kinds were allocated from a survey of what every recorder emitted under version 6, looking
+for an operation that the fourteen kinds could not express and that a recorder therefore stored as
+a nearer one:
+
+| Kind | What recorders stored instead (version 6) |
+|------|-------------------------------------------|
+| `WriteStderr` | `WriteOther`, by the Python, JavaScript and BEAM recorders and the PHP recorder's design for its stderr hook: stderr is the one standard stream without a kind of its own, and apart from the NimScript tracer's rows below it was the only thing any recorder stored as `WriteOther` |
+| `Exec` | `WriteOther`, by the NimScript tracer (`exec`) |
+| `WriteEnv` | `WriteOther`, by the NimScript tracer (`putEnv`, `delEnv`) |
+| `ReadEnv` | nothing: the NimScript tracer recorded no event for `getEnv` or `existsEnv` |
+| `Stat` | nothing: the NimScript tracer recorded no event for `fileExists`, `dirExists`, `getLastModificationTime` or `findExe` |
+| `CreateDir` | `WriteFile`, by the NimScript tracer (`mkDir`, `cpDir`) |
+| `RemoveDir` | `WriteFile`, by the NimScript tracer (`rmDir`) |
+| `RemoveFile` | `WriteFile`, by the NimScript tracer (`rmFile`) |
+| `Rename` | `WriteFile`, by the NimScript tracer (`mvFile`, `mvDir`) |
+| `ChangeDir` | `OpenDir`, by the NimScript tracer (`cd`), which opens nothing |
+
+What the survey left alone, and why:
+
+- **`Write` and `Read` for a contract's or VM's state.** The Cairo, Leo, TON, Miden and other
+  blockchain recorders store a storage or mapping access as `Write`/`Read` with the store named in
+  `metadata`. That is the table's "unspecified write"/"unspecified read", which those kinds have
+  always admitted; it is not a squeeze into `*Other`, and a storage kind would be a separate
+  decision about chain state, not about I/O.
+- **The native recorder's syscall log.** `codetracer-native-recorder` writes its own
+  `eventlog.dat` member with its own kind enum; it does not write `events.dat`, so this table does
+  not govern it.
+- **Remove versus delete-file-and-directory.** `RemoveFile` and `RemoveDir` are two kinds, as
+  `ReadFile` and `ReadDir` are, because they are two operations (`unlink`, `rmdir`) a debugger
+  user tells apart. `Rename` is one, because `rename` is one operation for either.
+- **The current directory, read.** Reading the process's current directory, its arguments or its
+  executable path observes the process's own state, not the outside world, and is not an I/O
+  event.
+
+**Why a version, and not just the values.** A version 6 reader already refuses a record carrying
+14-23, naming it, so it cannot mislabel one. But it refuses it only when it reaches the record:
+it opens the trace, shows its steps, and fails when the event log is paged in. Moving `meta.dat` to
+version 7 makes the same reader refuse the trace at open, by the version, with nothing shown that
+it will later have to take back. A version 7 reader reads version 7 only, as version 6 readers read
+version 6 only: pre-1.0 there is no compatibility shim, and fixtures are regenerated.
 
 **Why this is spelled out.** Until this revision the table here listed a different nine-value enum
 (`Stdout`, `Stderr`, `Stdin`, ..., `Log`) that no implementation used, and the implementations

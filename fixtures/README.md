@@ -6,7 +6,9 @@ Binary `.ct` fixture files for validating trace format implementations against t
 
 A small but representative split-stream container, written by the Nim split-stream writer
 (`codetracer-trace-format-nim`, `multi_stream_writer.nim`). It reproduces byte for byte: the
-recording id is fixed.
+recording id is fixed. Its `meta.dat` moved from version 6 to 7 with
+`codetracer-example-recordings/tools/meta-v6-to-v7`, which changes the version byte and nothing
+else; version 7 changed no other byte the writer emits for this recording.
 
 ### What it records
 
@@ -33,7 +35,7 @@ is its data block with the direct tag (§2).
   tables (`internal-files.md` §"Interning Tables")
 - `steps.dat`/`.idx`, `values.dat`/`.idx`, `calls.dat`/`.idx`, `events.dat`/`.idx` -- the runtime
   streams (`trace-events.md`); `events.dat` is empty
-- `meta.dat` -- version 6: recording id, program, args, workdir
+- `meta.dat` -- version 7: recording id, program, args, workdir
 - `step-map.ns` -- the breakpoint index, written at close
 
 It has no `events.log` or `events.fmt`: those members are not part of the format, and a reader
