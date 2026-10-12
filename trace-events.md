@@ -53,8 +53,13 @@ records that carry no position (tags 2–6 and 8) and `DeltaColumn`; a writer
 that counted only position-bearing records would attribute every call
 boundary, value and I/O event after the first such record to the wrong exec
 record, with nothing in the container to reveal the drift. A *logical* step
-count, where a tool needs one, is a derived quantity and excludes the records
-that are not steps (`DeltaColumn`, `SourceReload`).
+count, where a tool needs one, is a derived quantity: the number of step
+records (`AbsoluteStep`, `DeltaStep`), and no other exec record. `Raise`,
+`Catch`, the thread records, `DeltaColumn` and `SourceReload` are not steps
+(§"Which exec records are steps"), and a reader that reports a step count --
+`ct-print`'s totals, a C ABI accessor, a debugger's step counter -- MUST NOT
+count them. The exec-record count stays available beside it, under its own
+name, for the readers that index the other streams by it.
 
 Step records do not carry `call_key`. To find a step's enclosing call, use proportional (interpolation) search on `calls.dat` — each call record stores `[first_step_id, last_step_id]` ranges. This is O(log log C), typically 2-3 iterations, and avoids doubling the step record size.
 
