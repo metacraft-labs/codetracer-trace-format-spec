@@ -151,6 +151,23 @@ writer must not substitute the position space merely because the trace is column
 
 Records are referenced by 0-based index. Interning tables are loaded at reader startup (typically 1-5 MB total).
 
+**All four or none.** `paths`, `funcs`, `types` and `varnames` are one unit. A container MUST carry
+all eight of their members -- `paths.dat`, `paths.off`, `funcs.dat`, `funcs.off`, `types.dat`,
+`types.off`, `varnames.dat`, `varnames.off` -- or none of them. A table with no records is still
+carried: its data file is empty and its offset file is the single entry `0` (§"Variable-Size Record
+Table"). A writer MUST refuse to finish a container that holds some but not all of the eight, and a
+reader MUST refuse to open one rather than read a missing table as empty; both name the members the
+container carries and the members it lacks. A container with none of them is valid: it interns
+nothing, and a native recording that registers no source path is one. `meta.dat` bit 12 does not
+change this rule, and the presence of the members, not the bit, decides it
+(§"Stream-presence flags are a hint, not a gate"). `markers.dat` / `markers.off` are not part of the
+unit (below).
+
+The rule exists because a partial set is read two ways. One reader found `paths.dat` and refused the
+container for its missing `funcs.dat`; another answered the missing tables as empty and opened it. A
+one-off converter wrote `paths.dat` alone into two committed fixtures, and every check that read them
+through the second reader passed.
+
 **An empty name is a name.** No interned name has a minimum length: a zero-length
 `varnames.dat` record, a `types.dat` record with `lang_type_len = 0`, and a `funcs.dat`
 record with `name_len = 0` are well-formed, and recorders write them (a type a language
@@ -183,9 +200,9 @@ string, so the hot path can pass an integer.
 - **Record format:** raw label bytes, exactly as `varnames.dat`.
 - **Id assignment:** 0-based, in first-declaration order, assigned by the
   writer's `ensure_marker_id`-style operation. Ids are per-container.
-- **Written lazily.** Unlike the four tables above — which every trace
-  creates — `markers.dat` / `markers.off` appear only once a marker label is
-  actually interned. A recording that declares no marker is byte-identical to
+- **Written lazily.** Unlike the four tables above — which a container
+  carries all four or none — `markers.dat` / `markers.off` appear only once a
+  marker label is actually interned. A recording that declares no marker is byte-identical to
   one written before marker labels existed.
 - **`meta.dat` flag: bit 15**, `FLAG_HAS_CORRELATION_INDEX` — the same bit
   that covers `corrmark.ns`, **not** bit 12's `FLAG_HAS_INTERNING_TABLES` set.
@@ -204,8 +221,8 @@ Three reasons, and the first is decisive:
 2. **The marker table is meaningless without `corrmark.ns`.** They are written
    together and read together, so one bit describing "this recording carries a
    correlation index, and the label table it refers to" is the honest unit.
-   Bit 12's four tables are, by contrast, always created together and always
-   present.
+   Bit 12's four tables are, by contrast, carried all four or none
+   (§"Interning Tables"), whatever the bit says.
 3. **Bit 15 is the last bit, and one bit is all this needs.** Giving the index
    and its label table a bit each would spend the format's last two on a pair
    that is always written and read together.
@@ -1585,3 +1602,4 @@ the git history of `codetracer-trace-format-spec`.
 | 2026-10-08 | **Member Catalogue, and keyed families instead of stream directories.** New §"Member Catalogue": every member a materialized-trace writer produces, its key shape, lookups, value class and lifecycle, and the abstract family it belongs to ([ctfs-keyed-families.md](ctfs-keyed-families.md)), with the realization written today and the candidates the benchmarks compare. The "Keyed Member" abstraction is added. No member's format changes. |
 | 2026-10-07 | **Scope, and the MCR material moved out** (owner decision 2026-10-07; `codetracer-specs/issues/2026-10-07-ctfs-root-directory-growth-landed-without-a-spec-change.md`). A scope note at the head says this document covers the container and the records of the open-source recorders, not how MCR uses CTFS. "Multi-Core Recorder (MCR) Traces" (the member table, cross-OS portability, thread streams, snapshot payloads, checkpoint packing, `cp0.regs`, `cp0.mem`, `cp0.fsbase`, `cp0.maps`, `debug.dat`), "Native Recorder Files" (`filemap.bin`, `platform.bin`, `mmap.bin`) and the `threads.ns` / `slc-mwr.ns` / `slc-mrd.ns` rows of the namespace summary moved to `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md`; each section left a pointer saying where. The `meta.dat` MCR field block stays, because every `meta.dat` reader parses it. New: the live append order for a variable-size record table. |
 | 2026-10-12 | **`meta.dat` version 7: exact kinds for stderr, programs, the environment and directory changes** (`trace-events.md` § "EventLogKind (u8 enum)"). Ten `EventLogKind` values are allocated, 14-23: `WriteStderr`, `Exec`, `ReadEnv`, `WriteEnv`, `Stat`, `CreateDir`, `RemoveDir`, `RemoveFile`, `Rename`, `ChangeDir`, from a survey of every recorder's use of `WriteOther`, of `WriteFile` for directory changes and of reads it recorded nothing for. A recorder uses `WriteOther`/`ReadOther` only when no kind fits. No layout changes; the version moves so that a v6 reader refuses a v7 trace at open. |
+| 2026-10-15 | **The interning tables are carried all four or none** (§"Interning Tables"). The section said the four tables are "always created together", as rationale; it is now a MUST for writers and readers. A writer refuses to finish a container holding some but not all of the eight members, and a reader refuses to open one, naming the members carried and missing; a container with none is valid. The Nim reader used to answer a missing table as empty while the Rust readers refused the container, and two converted fixtures carrying `paths.dat` alone passed every check made through the Nim reader. |
