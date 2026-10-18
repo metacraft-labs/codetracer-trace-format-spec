@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open |
+| Status | in-progress (nixos-ci-bare-002:fix-nim-sharded-root-entry-offset-omits-free) |
 | Recorded | 2026-10-05 |
 | Observed in | codetracer-trace-format-nim @ 7e06d011 and 7967c179 |
 | Area | codetracer_ctfs/types.nim: fileEntryOffset and rootBlockCount |
