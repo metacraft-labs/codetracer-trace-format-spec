@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open |
+| Status | in-progress (nixos-ci-bare-004:fix-nim-span-helper-comments-recommend-prese) |
 | Recorded | 2026-10-06 |
 | Observed in | codetracer-trace-format-nim @ 19cad035585cbc0845b84ddc11aa3b824825dfaa |
 | Area | `MetaDatContents.hasSpanStream`; `hasSpanStreamFiles` |
