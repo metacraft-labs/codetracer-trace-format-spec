@@ -1,7 +1,9 @@
 # Nim CTFS Sharded Root Layout Repair
 
-**Status:** ✓ Root layout repaired — `codetracer-trace-format-nim` b5b5fb4 (`agents`). The public
-reader header admission section below is still planned.
+**Status:** ✓ Done — `codetracer-trace-format-nim` b5b5fb4 and e67e2fd (`agents`). The section
+"Public reader header admission" below is not part of this repair: it is the direction recorded for
+a separate open issue, `issues/2026-10-05-nim-header-safe-lookup-masks-container-refusal.md`, and is
+kept here only because that issue cites it.
 
 ## What changed, and why the first version of this plan was wrong
 
