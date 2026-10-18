@@ -35,6 +35,19 @@ The reader MUST validate before using the identity, without reopening a path, se
 
 Replay selects the validated entry call and applies its existing first-executable-step semantics. If the member is absent, replay MUST preserve the previous entry selection exactly, including an absorbed legacy EVM root body, genuine outer/root-only bodies, callless/event-only recordings and ordinary Python, Ruby, JavaScript and BEAM behavior. Source parsing, constant step indices, child ordinal or variable absence are not substitutes for recorded entry authority.
 
+### Legacy entry selection
+
+"The previous entry selection" is this rule, stated here so it can be preserved. The entry is the first call in user source, except that the `<toplevel>` root (call key 0) is skipped when it **wraps** the program. It wraps the program when a step of a nested call comes before the root runs any code of its own. Walking forward from the root's entry step, the only root steps allowed before that nested step are:
+
+- exec records with no source position, such as a thread start, which still occupy step ids;
+- steps at the entry step's own path and line, provided the call that opens next is defined at that same path and line. Such a step is an anchor: the JavaScript recorder emits a step at the callee's definition line in the caller's frame before every call, and it starts the recording at the position of its first step, which is the anchor before `<module>`.
+
+The walk gives up after eight root steps. A root still positioning by then does not wrap the program.
+
+Any other root step means the root runs its own body, so it does not wrap the program. This is the absorbed-entry shape, and replay opens on the root. Both conditions of the anchor bullet matter here. An absorbed body may start on the entry line and then call a helper defined elsewhere. The EVM recorder defines each external call's function at the caller's line, so a body that ran one line before an external call stands at the definition position of the call that opens. Replay also opens on the root when the recording has no other call. Within the selected call, replay opens on the first executable step.
+
+An earlier replay implementation looked only at the step after the root's entry step. On a JavaScript recording that step is a thread record, followed by the `<module>` anchor, so the root was never recognised as a wrapper. The recording then opened on the synthetic entry step, and the first step over ran past the whole program. That was a defect, not legacy behavior to preserve. The rule above is the selection that the "ordinary JavaScript behavior" requirement refers to.
+
 Canonical `--full` emits a present validated identity as `metadata.entry` with keys `call_key`, `function_id`, `entry_step`. An absent identity adds no key and preserves the whole legacy document. Path stripping and every other field retain their existing semantics.
 
 ## Compatibility and rollout
