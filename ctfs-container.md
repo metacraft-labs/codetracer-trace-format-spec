@@ -284,12 +284,18 @@ Which structure each family uses is chosen by benchmark ([ctfs-keyed-families.md
 >   `ff17c78`, which contains it). Until CKF-8 removes it, a container
 >   written through those revisions can carry a `MaxRootEntries` larger than the
 >   one it was created with, and blocks that moved.
-> - **Not conforming: readers and a library that still account for the removed
->   free list root area.** `codetracer_ctfs`'s `rootBlockCount` reserves `R`
->   (7 classes) and its compact converter skips it; `cas_dedup/ctfs.py`, the
->   wasm recorder's Go reader and a recorder test helper skip `R` computed with
->   8 classes. No producer shards, so no recording is read differently; they
->   follow in `CTFS-Keyed-Families` CKF-4 and CKF-6.
+> - **Conforming since b5b5fb4: `codetracer_ctfs` neither reserves nor skips
+>   the removed free list root area.** `rootBlockCount`, `growRootDirectory`
+>   and the compact converter's full-container reader start the entries at the
+>   end of the header for every `max_shards`, so a sharded container is
+>   byte-for-byte the unsharded one except byte 7. Pinned by
+>   `tests/test_root_directory_overflow.nim`,
+>   `tests/test_root_directory_grows.nim` and
+>   `tests/test_compact_container_layout.nim`.
+> - **Not conforming: readers that still skip the removed free list root
+>   area.** `cas_dedup/ctfs.py`, the wasm recorder's Go reader and a recorder
+>   test helper skip `R` computed with 8 classes. No producer shards, so no
+>   recording is read differently; they follow in `CTFS-Keyed-Families` CKF-6.
 > - **Not conforming: rewriting or truncating a published member.**
 >   `codetracer_ctfs` offers `truncateFileContent` and `rewriteFileContent`, and
 >   the MCR recorder uses them to republish its live `corrmark.ns` on every span
