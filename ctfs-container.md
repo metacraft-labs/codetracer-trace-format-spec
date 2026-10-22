@@ -1068,6 +1068,15 @@ flush the file does not yet publish), never behind it, and the file is exactly a
 "Durability" requires whether or not the page survives. A new record is written whole into the file
 before it is reachable from the page or the file (§7a, rule 3).
 
+**What counts as a seal.** A seal is one pass of steps 3 and 4 that writes at least one changed
+root entry, record or in-place index word to the file: one whose value differs from what the file
+last held. A pass that writes nothing changed is not a seal and increments nothing. Writing the
+header and the empty root region when the container is created ("Lifetime", below) publishes no
+member, so it is not a seal either. The container's first seal is the first one that publishes a
+member. Both `seal_epoch`s start at `0` when the page is created and count exactly the seals: a
+writer slot's counts that writer's seals, and the page's counts every writer's. On a new
+container's page, `seal_epoch = 0` means the file publishes no member yet.
+
 #### Reading
 
 **An attached reader** reads every word that can change in place from the page:
