@@ -293,9 +293,14 @@ Which structure each family uses is chosen by benchmark ([ctfs-keyed-families.md
 >   `tests/test_root_directory_grows.nim` and
 >   `tests/test_compact_container_layout.nim`.
 > - **Not conforming: readers that still skip the removed free list root
->   area.** `cas_dedup/ctfs.py`, the wasm recorder's Go reader and a recorder
->   test helper skip `R` computed with 8 classes. No producer shards, so no
->   recording is read differently; they follow in `CTFS-Keyed-Families` CKF-6.
+>   area.** The wasm recorder's Go reader and a recorder test helper skip `R`
+>   computed with 8 classes. No producer shards, so no recording is read
+>   differently; they follow in `CTFS-Keyed-Families` CKF-6 and CKF-5.
+> - **Conforming since tracing-formats-benchmarks `add27d4` (2026-10-22):
+>   `cas_dedup/ctfs.py`.** Entry `i` at `16 + 24 * i` for every `max_shards`,
+>   `MaxRootEntries = 0` auto-filled, and a block pointer into `[1, root_blocks)`
+>   refused like a null, at the entry and inside a mapping. Pinned by
+>   `tests/test_ctfs_root.py` (`just cas-ctfs-root-test`).
 > - **Not conforming: rewriting or truncating a published member.**
 >   `codetracer_ctfs` offers `truncateFileContent` and `rewriteFileContent`, and
 >   the MCR recorder uses them to republish its live `corrmark.ns` on every span
