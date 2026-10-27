@@ -53,14 +53,27 @@ carrying them is refused.
 | `spantype.ns` | span type id: dense, writer-assigned | exact | V1 | close-time, after the span stream's last chunk | F1 (static) | a flat table (SPTY v1) | unchanged |
 | `memreads.tc` | memory address | exact | V2 | no writer | F3 or F5 | specified only | — |
 
-### What a writer does until the decision
+### The decision (2026-10-26): no member of a materialized trace changes format
 
-Every member above keeps the format its own section specifies. A writer MUST NOT emit a keyed layout
-from [ctfs-keyed-families.md](ctfs-keyed-families.md) §5 for any of them before §8 there records the
-decision and adds the layout. When it does, this catalogue gains the member's new format, every
-producer and consumer is updated in one rollout (`codetracer-specs`
-`milestones/CTFS-Keyed-Families.milestones.org`), and the recorders that write through the
-`codetracer_trace_writer` library advance their pins together.
+[ctfs-keyed-families.md](ctfs-keyed-families.md) §8 records the benchmark decisions (`CKF-3`). They
+change no member above. Every member keeps the format its own section specifies. A writer MUST NOT
+emit a keyed layout from that document's §5.8 for any of them. The rows that were open:
+
+- **`linehits.tc`** stays S2, the §8a image, in every trace. The benchmark decided F1 (a D2 record per
+  global line) for line-only traces with 10% or more of their lines hit. That decision is conditional
+  on the distribution of hit fractions, which no corpus measured. So the owner deferred it on
+  2026-10-26, to a follow-up that measures the scripting recorders' corpus traces ([ctfs-keyed-families.md](ctfs-keyed-families.md) §8.2 DR-7, §8.3 O-1).
+- **`corrmark.ns`** stays S2, the §8a image built at close. DR-6's H1 live index, with S3 built at
+  close, is MCR's correlation index, written while it records. It is specified in `codetracer-specs`
+  `spec/Trace-Files/CTFS-Binary-Format.md` §2.8 under its own member names. This member is not
+  affected.
+- **`step-map.ns`, the `.idx` and `.off` tables, `spantype.ns`:** unchanged. No candidate beats them in
+  the benchmark's grid.
+
+Because nothing here changed, the recorders that write through the `codetracer_trace_writer` library
+need no pin advance for `CKF-3` (`codetracer-specs` `milestones/CTFS-Keyed-Families.milestones.org`,
+`CKF-7`). If O-1 later adopts F1, this catalogue gains `linehits.tc`'s new format. Every producer and
+consumer is then updated in one rollout, and those recorders advance their pins together.
 
 ## Reusable Data Abstractions
 

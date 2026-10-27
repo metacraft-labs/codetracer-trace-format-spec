@@ -1042,11 +1042,73 @@ The page is a header and a set of mirror slots, all fields little-endian and 8-b
 | root mirror | one slot per root entry: `seq`, `Size`, `MapBlock`, `Name` |
 | record mirror | slots for in-place-updated records of keyed members: a table of mirror extents `(member entry index, first record number, record count, first slot)`, and the slots themselves, each `seq` followed by the record's in-place words |
 
-The capacity is fixed at creation and RECOMMENDED to be generous (16 MiB virtual by default): POSIX
-shared memory and Windows pagefile-backed sections commit physical pages only when touched, and a
-macOS shared-memory object cannot be resized after its first `ftruncate`. A record whose mirror slot
-cannot be allocated because the page is full is followed by attached readers at seal granularity,
-as a reader that cannot attach follows it; the page records that it overflowed.
+The capacity is fixed at creation, and it is RECOMMENDED to be generous: **16 MiB virtual by default**
+(confirmed by `CKF-3` on 2026-10-26, below). POSIX shared memory and Windows pagefile-backed sections
+commit physical pages only when they are touched, and a macOS shared-memory object cannot be resized
+after its first `ftruncate`. When a record's mirror slot cannot be allocated because the page is full,
+attached readers follow that record at seal granularity, as a reader that cannot attach does, and the
+page records that it overflowed.
+
+*Why 16 MiB.* In the benchmark the default never overflowed. Its resident size was 184 KiB with up to
+2,047 threads' records mirrored, and 504 to 824 KiB at 10,000. Publishing through it changed a seal's
+p99 by −1.2 to +0.7 µs, and cost an update 0.1 µs at p99 (`tracing-formats-benchmarks` `agents`
+`4855de2`, `results/ctfs_keyed/REPORT.md` §4 and §12; [ctfs-keyed-families.md](ctfs-keyed-families.md)
+§8.2, DR-3 and DR-12).
+
+#### The page: byte layout (version 1, normative since 2026-10-26)
+
+Every field is a little-endian `u64` at an 8-byte-aligned offset, unless stated. It is accessed with
+the atomics named below. The layout is the one the benchmark measured (`ctfs_keyed/src/page.rs:4-44`
+at `4855de2`), with the root mirror sized by the container's root (the benchmark fixed it at 170
+entries).
+
+| Offset | Field |
+|---|---|
+| 0 | `magic_version`: the bytes `CTLP`, then `version: u32` = 1. Written last at creation, with release |
+| 8 | `identity`: 32 bytes ("Identity" below) |
+| 40 | `capacity`: the page's size in bytes |
+| 48 | `state`: `0` creating, `1` live, `2` closed, `3` abandoned |
+| 56 | `seal_epoch`: the page's seals, all writers ("What counts as a seal") |
+| 64 | `overflowed`: the number of mirror allocations refused for want of space |
+| 72 - 127 | zero |
+| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` to `+63` zero |
+| 1152 | `NextFreeBlock` |
+| 1160 + 8·f | family counter `f`, for `f` in `0 .. 15`: a dense key family whose keys are assigned live (§7a). Which family owns which counter is the producer's catalogue's choice |
+| 1288 | `mirror_bump`: the page offset of the first free mirror-slot byte. Starts at `slots_off` |
+| 1296 | `extents_used`: the extent-table entries claimed so far |
+| 1304 - 4095 | zero |
+| 4096 + 32·e | root mirror slot `e`, one per root entry of the container (`MaxRootEntries` after auto-fill, §1): `+0` `seq`, `+8` `Size`, `+16` `MapBlock`, `+24` `Name` |
+| `extents_off` + 48·x | record-mirror extent `x`, for `x` in `0 .. 255`: `+0` member entry index, `+8` first record number, `+16` record count, `+24` `slot_off` (the page offset of its first slot), `+32` `words` (payload words per slot; nonzero once the extent is valid, stored last with release), `+40` zero |
+| `slots_off` .. `capacity` | mirror slots: slot `i` of an extent at `slot_off + i * (8 + 8 * words)`, holding `seq`, then `words` payload words |
+
+`extents_off = 4096 + 4096 * ceil(32 * MaxRootEntries / 4096)` and
+`slots_off = extents_off + 12288`. For the one-block root of 170 entries, they are 12288 and 24576.
+
+- **Identity** packs as 32 bytes, which are also the input of the name's SHA-256 (`page.rs:47-85`):
+  - Windows: `VolumeSerialNumber` as `u64`, then the 16-byte `FileId`, then 8 zero bytes.
+  - Linux: `st_dev`, `st_ino`, `stx_btime.tv_sec` as `u64`, then `stx_btime.tv_nsec` as `u32` and 4
+    zero bytes. The birth time is zero where `statx` does not report it.
+  - macOS: `st_dev`, `st_ino`, then `st_birthtimespec`'s seconds and nanoseconds, packed like Linux's
+    birth time.
+- **The heartbeat** is nanoseconds of the machine's monotonic clock, which every process on the
+  machine shares: `CLOCK_MONOTONIC` on Linux, `QueryPerformanceCounter` scaled to nanoseconds on
+  Windows, `mach_continuous_time` scaled on macOS (not measured: `CKF-2` had no macOS host,
+  [ctfs-keyed-families.md](ctfs-keyed-families.md) §8.3 O-10). The process start time is the operating system's
+  creation time for the pid (`page.rs:88-119`).
+- **Claiming a writer slot** is a compare-exchange of the slot's state from `0` to `1`, tried on slots
+  0 to 15 in order. That is a bounded scan, not a retry loop. It is followed by the pid, the start time
+  and the heartbeat, stored with release (`page.rs:192-204`). A slot is never reused within a page's
+  life. **A page has 16 writer slots**, so a W2 or hybrid container has at most 15 producer processes
+  besides its coordinator, and a 16th registration fails, naming the container. Whether W2 keeps its
+  advantage beyond that is unmeasured, and a page whose writer table is sized at creation is the
+  candidate that would lift the limit ([ctfs-keyed-families.md](ctfs-keyed-families.md) §8.3, O-3).
+- **Claiming a mirror extent** is a fetch-add on `extents_used` and on `mirror_bump` by the extent's
+  bytes. Either one past its end is an overflow: the writer increments `overflowed`, and follows those
+  records in the file only (`page.rs:286-302`). A writer claims extents in the record ranges its
+  family's realization names. The per-thread and node mirrors of
+  [ctfs-keyed-families.md](ctfs-keyed-families.md) §5.8 claim ranges of 4096 records.
+- **The root mirror** is stored as `seq` odd, then `Name`, `MapBlock` and `Size` in that order, then
+  `seq` even (`page.rs:269-281`). A reader reads `Size` and `MapBlock` from it under §6's "Reading".
 
 #### Writing through the page
 
@@ -1106,11 +1168,33 @@ torn-read rule:
 - Where the member's format can validate content it does: a chunk index's offsets are monotone and
   below the data member's `Size`; a frame decodes to its declared size (§7, "Reading the last
   chunk"); an offset table's last entry does not exceed its data member's `Size`.
-- Its results are **provisional until the container is closed**. A torn read that both reads agree on
-  is not excluded, only made improbable; after close the file is static and a re-read is exact. It
-  learns that the container is closed out of band (a server that attaches on the writer's machine
-  and says so, or the end of the recording reported by the tool that made it) or by quiescence: the
-  file's length and root region unchanged over an interval the reader states.
+- Its results are **provisional until the container is closed**. A torn value that both reads agree
+  on is not excluded, and the validations above do not catch it. Measured (`CKF-2`, KF-R): under
+  byte-split seal writes, a file-only follower accepted torn values in 0.01% to 0.5% of its reads
+  (1,864 to 100,495 on Windows ReFS and 3,171 to 246,172 on Linux ext4, per 30 s run), and 91.7% to
+  100% of them passed content validation. Under one write call per entry or record it accepted none in
+  5.3·10^7 reads on ReFS and 1.4·10^8 on ext4. That is the file system's behaviour, not a guarantee:
+  POSIX and Windows promise nothing about a concurrent `pread` against a `pwrite`, and network file
+  systems and HTTP range servers promise less (`tracing-formats-benchmarks` `agents` `4855de2`,
+  `results/ctfs_keyed/REPORT.md` §12 and §12.2). After close the file is static, and a re-read is
+  exact. The follower learns that the container is closed in one of two ways. A server that attaches
+  on the writer's machine says so, or the tool that made the recording reports its end. Otherwise it
+  goes by quiescence: the file's length and root region unchanged over an interval the reader states.
+- **What a file-only follower is guaranteed (normative, decided 2026-10-26, DR-12).** Every value it
+  accepts before close was, at some instant, the bytes at that offset in the file. It also passes §4's
+  pointer checks and the member's content validation. Nothing more is guaranteed: the value may be a
+  torn mix of two publications that no writer published. So:
+  - A consumer whose results must be correct before close MUST attach to the page: directly, or
+    through a server on the writer's machine that attaches and serves only page-validated state. Such
+    consumers include a replay, an omniscient lookup, and any answer to a query.
+  - Every other follower is a **progress view**. It MUST label every result it shows before close as
+    provisional, and re-validate it after close (or after salvage of an abandoned container).
+    Monitoring tools that show sizes, progress or thread counts are such followers.
+  - What this costs: a browser or other HTTP follower of a live recording goes through an attaching
+    server, or sees provisional state. So does a reader in another network namespace, in a container
+    without the writer's shared memory, in another Windows logon session, or over SMB or NFS. The
+    writer pays nothing: no checksum and no sequence word in the file (§6, "Rejected: sequence counters
+    on disk"; [ctfs-keyed-families.md](ctfs-keyed-families.md) §8.2, DR-12).
 - A server that serves a container being written to remote readers (an HTTP range source of a live
   recording) SHOULD run on the writer's machine, attach to the page, and serve only state it read
   consistently there, so that its clients are not subject to this rule.
@@ -1216,7 +1300,7 @@ block's **content** can still change in place, in exactly these cases:
 | A member's last data block, while `Size` is not a block multiple | bytes past `Size` are filled in (the pending block above) | the member's writer; also a closed-container extension (§5) |
 | A mapping block | a slot that was `0` is set, once, in increasing index order; a set slot never changes | the member's writer |
 | A keyed member's record blocks | a record's in-place words, at seals (§7a) | the keyed member's writer |
-| A keyed member's index blocks | only the words its realization names as updated in place: fill-once slots, node words, root slots ([ctfs-keyed-families.md](ctfs-keyed-families.md) §4.3) | the keyed member's writer |
+| A keyed member's index blocks | only the words its realization names as updated in place: fill-once slots, node words, root slots ([ctfs-keyed-families.md](ctfs-keyed-families.md) §4.3), and the slots a split's hole fill rewrites (§5.8.0 there) | the keyed member's writer |
 | A namespace's page 0 | the root slots (§8) | the namespace's writer |
 
 Everything else is written once. So a cache keyed by block number:
@@ -1264,8 +1348,15 @@ dead block, because it never reaches one.
 
 A **container writer** is a process that allocates blocks of the container, writes member bytes, or
 publishes root entries. Two architectures, and a hybrid, are specified. In every one the live
-coordination page is the shared state; a producer uses W1 unless the benchmark decision of
-[ctfs-keyed-families.md](ctfs-keyed-families.md) §8 admits W2 or the hybrid for it.
+coordination page is the shared state. A producer uses W1 unless the benchmark decision of
+[ctfs-keyed-families.md](ctfs-keyed-families.md) §8 admits W2 or the hybrid for it. That decision
+(2026-10-26, DR-11) admits W2 where the producing processes may make file-system calls, with up to 15
+producer processes: the page has 16 writer slots, and one is the coordinator's ("The page: byte
+layout"). Elsewhere it admits W1g, which is W1 with chunks compressed by the producers into shared
+memory and written by the one writer. The producer it was measured for is MCR, whose arms
+`codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md` §2.1 assigns. A W2 producer may move its per-chunk work to helper
+threads of its own: the bytes the container receives are the same, so that is the producer's choice,
+not the format's ([ctfs-keyed-families.md](ctfs-keyed-families.md) §6.2).
 
 **W1: one container writer.** One process writes the container and hosts the page: it creates the
 page, is its only registered writer, and keeps `NextFreeBlock` and every family counter there (its
@@ -1481,9 +1572,11 @@ of a member is zero beyond its `Size`.
   hand finished chunks to one appender in a deterministic order), which costs the latency W2 exists to
   save. A writer that drains several producers (rings of several threads) appends in the order it
   happens to drain them, which also depends on timing even with one appending thread; the MCR
-  recorder is such a writer and does not claim the property. Whether MCR containers should be
-  byte-reproducible, and so whether W2 may ever be admitted for a producer that claims it, is an open
-  question for the owner ([ctfs-keyed-families.md](ctfs-keyed-families.md) §9).
+  recorder is such a writer and does not claim the property. The owner decided on 2026-10-26 that
+  MCR containers are not byte-reproducible while they are recorded. A canonical, byte-reproducible
+  form is produced on demand, by a repack at close or on export, for caching and deduplication
+  ([ctfs-keyed-families.md](ctfs-keyed-families.md) §9; its placement order is that document's
+  §8.3, O-12). *(Until 2026-10-26 this was an open question for the owner.)*
 
 ### Background Compression Writer
 
@@ -1569,11 +1662,14 @@ then bounds the number of families, not the length or width of a recording.
 
 Which structure maps keys to records is chosen per family, by benchmark, among the families and
 candidate realizations of [ctfs-keyed-families.md](ctfs-keyed-families.md). That document also gives
-the cost model (§2), the properties of the data (§3) and the decisions (§8). **Until a family's
-realization is decided and its byte layout added there, no writer emits a keyed member for it**, and
-the members a producer writes today stay as they are (the member catalogues say which:
-[internal-files.md](internal-files.md) §"Member Catalogue", and for MCR `codetracer-specs`
-`spec/Trace-Files/CTFS-Binary-Format.md` §2).
+the cost model (§2), the properties of the data (§3) and the decisions (§8). **A writer emits a keyed
+member only in a realization that document's §8 assigns to the family, in the byte layout of its
+§5.8.** It does so from its producer's rollout. Until then, the members a producer writes today stay as
+they are. The member catalogues say which: [internal-files.md](internal-files.md) §"Member Catalogue",
+and for MCR `codetracer-specs` `spec/Trace-Files/CTFS-Binary-Format.md` §2. The decision was recorded
+on 2026-10-26 (`CKF-3`). It changes no member of a materialized trace, and assigns realizations to
+MCR's families. Until that date this paragraph read: "Until a family's realization is decided and its
+byte layout added there, no writer emits a keyed member for it".
 
 The rules below hold for every keyed member, whatever its realization (normative):
 
@@ -1607,6 +1703,10 @@ The rules below hold for every keyed member, whatever its realization (normative
    between refreshes a record never disappears, its key never changes, and a keyed stream's `size`
    never decreases. A reader that observes any of these MUST refuse the member as damaged, naming the
    member and the key.
+   A keyed member that is absent, or whose members have `Size` 0 because no seal has published it, is
+   an empty family, not damage ([ctfs-keyed-families.md](ctfs-keyed-families.md) §5.8.0). An index
+   word that a realization names as shrinking (a node's `count` after a split, behind a published
+   high key or bucket address) is not a record that disappeared.
 9. **Profiles.** A keyed member whose records hold container block numbers has no meaning in a
    compact container (§1d), which has none. A writer converting a container that holds one into the
    compact profile MUST either convert it by the compact form its realization defines or refuse,
