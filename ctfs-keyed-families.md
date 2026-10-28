@@ -896,6 +896,41 @@ record, appended when that record is appended (fill-once) (`src/workloads/kfv.rs
 - **B2** is the `NSB1` copy-on-write tree of `ctfs-container.md` §8, with its "Live and incremental
   publication" commit: a commit appends only the pages it changed and flips a root slot.
 
+#### 5.8.9 The canonical repack: its placement order (normative, 2026-10-28; closes §8.3 O-12)
+
+A canonical repack copies every live member of a closed container into a new container, whose bytes
+are a function of the source's content and not of the recording's timing. It reads only content:
+member names, keys, digests, snapshot ordinals, `ct_tid`s, and the order of a correlation key's
+entries. It never reads the source's slot assignment, its block placement, a page store's
+first-stored order, an H1 table's split history, or the seals the source was written in.
+
+1. **The header** declares what the source declares: its `BlockSize` and its `MaxRootEntries` as
+   declared (`0` stays `0`). It is version 5, with no encryption and no shards.
+2. **The members that belong to no keyed family**, in ascending order of name. Each is appended
+   whole, in one append, so its blocks are placed as §5 of `ctfs-container.md` places one append.
+   All of them are published by one seal.
+3. **The keyed families**, in ascending order of their record member's name (`bundle.rec`,
+   `corrmark.rec`, `cppages.rec`, `snap.rec`, `threads.rec`). Each is rebuilt from its logical
+   content by its own writer, in one seal:
+   - bundled files in `filemap.bin` order, each file's streams copied whole;
+   - the correlation index, its records in ascending key order and each key's entries in their
+     declared order, H1 built by inserting the records in that order, and S3 built after them;
+   - the page store, its records in ascending `(key, digest)` order, the heap in record order in
+     frames of 4 MiB, and B1 built by inserting the records in that order;
+   - snapshots in ordinal order, each one's parts copied whole in part-slot order, then its
+     `positions`;
+   - threads in ascending `ct_tid` order, segments reserved in ascending segment order, and each
+     thread's `events` stream copied whole, then its `index` stream.
+
+Record numbers in the output are therefore functions of content too, which is why a family whose
+records other records reference by number cannot be reordered this way. None of the families above
+has one: snapshot rows name pages by digest, not by page-store record.
+
+The output holds no dead block: a repack is the one reclamation the format has
+(`ctfs-container.md` §6, "Dead space").
+
+*What "a function of content" covers.* The repack makes the layout canonical for a given logical content. It cannot make two recordings' content equal when the content itself differs: for example, under the recording-wide ctTid allocator of `MPMT-G1` two recordings of one program can number the same threads differently, because thread creation in different processes races. Two containers repack to identical bytes exactly when their logical content (names, keys, digests, ordinals, `ct_tid`s, and each stream's bytes) is identical.
+
 ---
 
 ## 6. Writer Architectures And What They Do To Families
@@ -1345,6 +1380,12 @@ Each item names its decision record. None blocks `CKF-4`. Each says what changes
   - *What closes it:* the order specified here, and a test. Two recordings of one execution, whose
     live containers differ, repack to byte-identical containers. A mutation arm leaves one
     timing-dependent order in place, and must be caught.
+  - *Proposed (2026-10-28, `CKF-4N`):* the order of §5.8.9, implemented by
+    `codetracer-trace-format-nim` `repack.nim` and tested by `test_dead_space` (two live containers
+    of one execution, differing in member creation order, seal points, the page store's
+    first-stored order, the correlation keys' first-seen order and thread creation order, and one
+    carrying dead blocks, repack to byte-identical containers; the arms that keep the source's slot
+    order or the page store's first-stored order are caught). Adopted as normative on 2026-10-28; this item is closed.
 
 ---
 
