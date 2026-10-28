@@ -717,10 +717,22 @@ The writer keeps each node's physical slot order in memory, so that phase C can 
 **Lookup** (`src/families/btree.rs:208-279`):
 
 1. Read the header (from the page when attached).
-2. Descend from `w0`. At each node, if `key >= high` and `right != 0`, move to node `right - 1` on the
-   same level. Otherwise, at a leaf, scan slots `[0, count)` for the key; at an internal node, take the
-   child by the rule above.
+2. Descend from `w0`. At each node, if `key > high` and `right != 0`, move to node `right - 1` on the
+   same level. Otherwise, at an internal node, take the `ref` of the largest `key[j]` that is below
+   both `key` and `high`, or `first` when there is none. At a leaf, collect the slots of `[0, count)`
+   that hold the key; then, while `key >= high` and `right != 0`, move to node `right - 1` and
+   collect there too.
 3. Confirm every candidate against its record (§4.4).
+
+*Why the descent differs from the internal-node rule above (2026-10-28, `CKF-4N`).* Several entries
+may share a key, and a split cuts the sorted entries at index 127. When the entries at 126 and 127
+hold the same key `K`, the left node keeps some of `K`'s entries and takes `high = K`, and the
+right node gets the rest. A descent that moves right at `key >= high`, or that takes the largest
+separator at or below the key, never visits the left node, and misses those entries. The descent
+above starts at the leftmost leaf that can hold `K` and walks right through every leaf whose
+`high` is `K`. For a key held once it reads one node more than the former rule, and only when the
+key is a separator. The writer and the bytes are unchanged; the benchmark's reader
+(`src/families/btree.rs:208-279`) used the former rule, and its keys never collided.
 
 A reader refuses as damage a `count` above 254, or a `kind` other than 0 or 1.
 
