@@ -990,7 +990,8 @@ and its new value (`0x00FF` and `0x0100` tear to `0x01FF`) and send a reader pas
 in practice for aligned words on local file systems, and that is all.
 
 **The rule: while a container is being written, its live state lives in shared memory.** Every
-container that is being written has a **live coordination page** (below, "the page"): a
+container that is being written has a **live coordination page** (below, "the page"), unless its
+writer is a file-only writer ("How a writer's liveness is judged", below): a
 shared-memory region, one per container, that holds the container's live root state and the live
 copies of every word updated in place, each under a sequence counter. Writers publish there first;
 readers on the same machine attach to it and read consistent values with the ordinary memory
@@ -1037,7 +1038,7 @@ The page is a header and a set of mirror slots, all fields little-endian and 8-b
 | Part | Holds |
 |---|---|
 | header | magic `CTLP`, version, the container identity, the page's capacity, `state` (`creating`, `live`, `closed`, `abandoned`), and `seal_epoch`, incremented after every seal's file writes complete |
-| writers | one slot per writer process: process id, process start time (to tell a reused pid apart), a heartbeat updated at least once per second while it writes, and the `seal_epoch` of its last completed seal |
+| writers | one slot per writer process: process id, process start time (to tell a reused pid apart), a heartbeat, the `seal_epoch` of its last completed seal, and the slot's liveness rule: a hosted writer's heartbeat is updated at least once per second while it writes; an in-guest writer's only at its seals ("How a writer's liveness is judged") |
 | allocation | `NextFreeBlock`; one counter per dense key family whose keys are assigned live (§7a); a bump counter for mirror slots |
 | root mirror | one slot per root entry: `seq`, `Size`, `MapBlock`, `Name` |
 | record mirror | slots for in-place-updated records of keyed members: a table of mirror extents `(member entry index, first record number, record count, first slot)`, and the slots themselves, each `seq` followed by the record's in-place words |
@@ -1071,7 +1072,7 @@ entries).
 | 56 | `seal_epoch`: the page's seals, all writers ("What counts as a seal") |
 | 64 | `overflowed`: the number of mirror allocations refused for want of space |
 | 72 - 127 | zero |
-| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` to `+63` zero |
+| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` liveness (`0` heartbeat, `1` process; "How a writer's liveness is judged"), `+48` to `+63` zero |
 | 1152 | `NextFreeBlock` |
 | 1160 + 8·f | family counter `f`, for `f` in `0 .. 15`: a dense key family whose keys are assigned live (§7a). Which family owns which counter is the producer's catalogue's choice |
 | 1288 | `mirror_bump`: the page offset of the first free mirror-slot byte. Starts at `slots_off` |
@@ -1096,8 +1097,9 @@ entries).
   [ctfs-keyed-families.md](ctfs-keyed-families.md) §8.3 O-10). The process start time is the operating system's
   creation time for the pid (`page.rs:88-119`).
 - **Claiming a writer slot** is a compare-exchange of the slot's state from `0` to `1`, tried on slots
-  0 to 15 in order. That is a bounded scan, not a retry loop. It is followed by the pid, the start time
-  and the heartbeat, stored with release (`page.rs:192-204`). A slot is never reused within a page's
+  0 to 15 in order. That is a bounded scan, not a retry loop. It is followed by the slot's liveness,
+  the pid, the start time and the heartbeat, the heartbeat stored with release (`page.rs:192-204`; the
+  liveness word was added on 2026-10-29, after the benchmark). A slot is never reused within a page's
   life. **A page has 16 writer slots**, so a W2 or hybrid container has at most 15 producer processes
   besides its coordinator, and a 16th registration fails, naming the container. Whether W2 keeps its
   advantage beyond that is unmeasured, and a page whose writer table is sized at creation is the
@@ -1212,7 +1214,8 @@ torn-read rule:
   Windows the section disappears when its last handle closes). Readers still mapping the old page see
   `closed`.
 - **A writer that dies.** A writer is dead when its pid no longer names a process with its recorded
-  start time, or its heartbeat is older than 10 seconds. Its members stop growing; the file holds
+  start time, or, when its slot's liveness is `heartbeat`, its heartbeat is older than 10 seconds
+  ("How a writer's liveness is judged", below). Its members stop growing; the file holds
   them through that writer's last seal, by the durability rule, with nothing else needed. Under W2 a
   surviving writer or the coordinator marks the slot dead, settles the dead writer's odd `seq` words
   in the page to the last value whose payload the crash rule accepts (below), and carries on.
@@ -1228,6 +1231,63 @@ torn-read rule:
   (**prefix-valid**); a stream reference is (§2's `MapBlock`-before-`Size` order), and so is a
   single-word value. For a prefix-valid record the settled value is the page's payload; otherwise it
   is the last value the file holds. Nothing in the file ever depends on a `seq`.
+
+#### How a writer's liveness is judged: hosted, in-guest and file-only writers
+
+A writer hosts the page in one of three ways. It chooses one when it creates or joins the
+container, and the choice is recorded in its writer slot.
+
+- **Hosted** (the default, liveness `0`, `heartbeat`). A writer that owns its process: the recorder's
+  own process, a compiler, a test. A heartbeat thread of its own stores the monotonic clock into its
+  slot at least once per second (every 200 ms in `codetracer-trace-format-nim`). The writer is dead
+  when its pid no longer names a process with its start time, or when its heartbeat is older than 10
+  seconds. The heartbeat is what catches a writer whose pid a reader cannot judge, such as a writer
+  in another pid namespace that shares the reader's shared memory.
+- **In-guest** (liveness `1`, `process`). A writer that runs inside a process another tool records,
+  where every thread and every system call is part of the recording. The macOS recorder's injected
+  and cooperative writers are such writers: there the trace writer runs in the recorded process,
+  while on Linux and Windows it runs in the recorder's parent process. A record/replay recorder cannot
+  accept a thread that replay does not reproduce, or a system call issued outside the paths it
+  excludes from capture. So an in-guest writer:
+  1. creates **no thread**, ever;
+  2. makes every operating-system call the page needs at creation: computing the identity, opening
+     and sizing the object, mapping it, reading its own process start time and, on macOS, the clock's
+     timebase. A recorder places that call inside the window it excludes from capture, as it does for
+     the container's own creation;
+  3. afterwards touches the page only with memory stores and loads and with reads of the monotonic
+     clock (`CLOCK_MONOTONIC` through the vDSO, `mach_continuous_time` through the commpage,
+     `QueryPerformanceCounter`), and only inside the seals it already makes. It stores its heartbeat at
+     each seal, as step 4's last store, and nowhere else. At close it unmaps the page and removes its
+     name, as any writer does;
+  4. is judged **by its pid and start time alone**. A reader does not apply the 10-second rule to a
+     slot whose liveness is `process`, because a recorded program may make no seal for minutes (it is
+     waiting, or stopped in a debugger) and is alive all that time. A dead in-guest writer is found
+     dead as soon as its pid no longer names a process with its start time; the page is then reaped
+     as under "Every writer dies".
+
+  An in-guest writer gives attached readers everything a hosted one gives them, including the
+  correctness that a consumer needs before close ("Reading"). It gives up only the heartbeat's
+  detection of a writer whose pid the reader cannot judge, which does not arise where the page is
+  shared within one pid namespace. That is always the case on macOS, where it is needed.
+- **File-only** (no page). A writer that cannot afford even the page's creation in its process, or
+  that writes in memory and has no file identity. It creates no page and no thread. Every reader is
+  then a reader that cannot attach: it follows the file at seal granularity under the torn-read rule,
+  and its results are provisional until close ("Reading", DR-12). A consumer that must be correct
+  before close cannot follow such a container live; it waits for close. A file-only writer remains
+  subject to every other rule of this section: one write per entry or record, data before the entry
+  that publishes it, and the seal's order.
+
+*Compatibility.* The liveness word occupies bytes that version 1 of the layout reserved as zero, and
+`0` is the rule every page used before. Pages written by a hosted writer are therefore unchanged, and
+the version stays `1`. A reader that predates the word applies the heartbeat rule to an in-guest slot.
+It may then judge a quiet guest dead and reap its page. Readers opened after that read the file alone,
+which is safe but provisional. A reader MUST honour the word.
+
+*Why the in-guest writer keeps the page.* The alternative was to make every in-guest writer
+file-only. That would leave the macOS recording with no reader that is correct before close: a live
+replay, an omniscient lookup or a query would wait for the recording to end. The page costs the guest
+one creation outside capture and plain stores inside the seals. The heartbeat thread was the only
+part of the page that a recorded process cannot carry.
 
 ### Reader Protocol: Opening And Following A Container (normative)
 
