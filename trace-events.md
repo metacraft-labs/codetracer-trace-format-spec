@@ -233,6 +233,21 @@ out for. Derive it from `children_keys` instead and it holds for every fixture:
 walk the assembled events and refuse any `call_exit` whose call still has an
 unclosed child. See `conformance-testing.md` §"Assert names, not counts".
 
+**An assembler that writes the stream out MUST stream it.** Its peak memory MUST
+be bounded by the container's own contents (the decompressed streams and
+interning tables, plus per-record indexes over them), not by the size of the
+output: it MUST NOT hold the assembled document, or a rendering of it, whole
+before writing it. Placing the call and IO records among the steps MUST NOT cost
+a scan of every record per step: it needs a lookup by step, built once. The
+rendered output of a real program is many times the container's size, because
+each step repeats its variables in full. A whole-document assembler therefore
+fails on ordinary input, not on unusual input. `ct-print --full` once used about
+32 GB and 20 minutes on an 11 MB Python trace of `import black` (309,587 steps,
+37,485 calls), with the document held as a tree and every call record scanned at
+every step. This rule is about how the stream is produced and does not change
+its content: a streamed `--full` or `--events` is byte-identical to the
+whole-document rendering of the same container.
+
 #### 4. IO Event Stream (`events.dat`) — I/O events for the event log pane
 
 | Field | Type |
