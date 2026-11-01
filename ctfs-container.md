@@ -1072,7 +1072,7 @@ entries).
 | 56 | `seal_epoch`: the page's seals, all writers ("What counts as a seal") |
 | 64 | `overflowed`: the number of mirror allocations refused for want of space |
 | 72 - 127 | zero |
-| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` liveness (`0` heartbeat, `1` process; "How a writer's liveness is judged"), `+48` to `+63` zero |
+| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` liveness (`0` heartbeat, `1` process; "How a writer's liveness is judged"), `+48` pid namespace and `+56` time namespace ("Claiming a writer slot"; a pid namespace of `0` is unstated) |
 | 1152 | `NextFreeBlock` |
 | 1160 + 8·f | family counter `f`, for `f` in `0 .. 15`: a dense key family whose keys are assigned live (§7a). Which family owns which counter is the producer's catalogue's choice |
 | 1288 | `mirror_bump`: the page offset of the first free mirror-slot byte. Starts at `slots_off` |
@@ -1098,12 +1098,22 @@ entries).
   creation time for the pid (`page.rs:88-119`).
 - **Claiming a writer slot** is a compare-exchange of the slot's state from `0` to `1`, tried on slots
   0 to 15 in order. That is a bounded scan, not a retry loop. It is followed by the slot's liveness,
-  the pid, the start time and the heartbeat, the heartbeat stored with release (`page.rs:192-204`; the
-  liveness word was added on 2026-10-29, after the benchmark). A slot is never reused within a page's
-  life. **A page has 16 writer slots**, so a W2 or hybrid container has at most 15 producer processes
-  besides its coordinator, and a 16th registration fails, naming the container. Whether W2 keeps its
-  advantage beyond that is unmeasured, and a page whose writer table is sized at creation is the
-  candidate that would lift the limit ([ctfs-keyed-families.md](ctfs-keyed-families.md) §8.3, O-3).
+  the namespaces, the pid, the start time and the heartbeat, the heartbeat stored with release
+  (`page.rs:192-204`; the liveness word was added on 2026-10-29 and the namespace words on 2026-11-01,
+  all after the benchmark). The **namespaces** name where the slot's pid and start time mean
+  something. On Linux the pid namespace is the inode number behind `/proc/self/ns/pid` and the time
+  namespace the one behind `/proc/self/ns/time` (`st_ino` from `stat` on each path); the time
+  namespace matters because the start time a process reads for a pid is shifted into the reader's own
+  time namespace. The time namespace is `0` on a kernel that has none. The pid namespace is `0`
+  (unstated) on a platform that has no pid namespaces, when the writer cannot read either word, and
+  when `/proc` is not a /proc of the writer's own pid namespace (`/proc/self` does not name the
+  writer's pid): there the pid and start time the writer records prove nothing to anyone. The words
+  are read at each claim, never cached, because a process created into a new pid namespace would
+  inherit its parent's cached answer. Only a sweeper reads them ("A page no process opens").
+  A slot is never reused within a page's life. **A page has 16 writer slots**, so a W2 or hybrid
+  container has at most 15 producer processes besides its coordinator, and a 16th registration
+  fails, naming the container. Whether W2 keeps its advantage beyond that is unmeasured, and a page
+  whose writer table is sized at creation is the candidate that would lift the limit ([ctfs-keyed-families.md](ctfs-keyed-families.md) §8.3, O-3).
 - **Claiming a mirror extent** is a fetch-add on `extents_used` and on `mirror_bump` by the extent's
   bytes. Either one past its end is an overflow: the writer increments `overflowed`, and follows those
   records in the file only (`page.rs:286-302`). A writer claims extents in the record ranges its
@@ -1226,6 +1236,33 @@ torn-read rule:
   values into the file's entries when the page shows a later `Size` than the file and every byte that
   `Size` covers is in the file (writer step 1 put it there before the page published it); salvage is
   an improvement, never a requirement of durability.
+- **A page no process opens.** The next process to open the container may never come: a recorder
+  killed with SIGKILL leaves its page behind, and the next recording writes another container at
+  another path. So any process on the machine MAY **sweep** pages whose writers are all proven dead,
+  without opening their containers; the next recorder run after a SIGKILL does. Proven dead, for a
+  sweeper, is strictly narrower than a reader's judgement, because a sweeper has no container in hand.
+  A sweeper removes a page only when all of these hold:
+  1. its magic and version are ones the sweeper knows;
+  2. its `state` is not `creating`;
+  3. at least one writer slot was claimed;
+  4. every slot whose state is `live` states a pid namespace that is not `0` and equals the sweeper's
+     own, states the sweeper's own time namespace, and that slot's pid no longer names a process with
+     its recorded start time.
+
+  A slot that states another pid or time namespace, or no pid namespace (`0`, as every page written
+  before the words does), keeps the page, and so does a slot whose writer is alive. The heartbeat
+  plays no part: the pid of a writer in another pid namespace means nothing to the sweeper, the start
+  time of a writer in another time namespace reads differently to it, and a quiet in-guest writer is
+  alive. A leak is a cost someone can name later; a deleted live page breaks a recording now. This is
+  the rule the recorder already applies to its stale rings, which a recorder in a child pid namespace
+  once broke by removing every ring on the host. The sweeper sets `state = abandoned` and removes the
+  name, as under "Every writer dies". Before it removes the name it checks that the name still names
+  the object it inspected (the same inode), so that it does not remove a page another process created
+  under that name since. POSIX has no conditional unlink, so a page recreated between that check and
+  the removal is still removed; the window is two system calls wide, and only a container whose own
+  page was dead can fall in it. A reader's reap and the replacement of an abandoned page at creation
+  have the same window. Sweeping is defined on Linux only: POSIX shared memory cannot be
+  enumerated on macOS, and a Windows section goes with its last handle.
 - **The crash rule.** A writer that dies between the odd and even stores of an update leaves `seq`
   odd. A record kind states whether every prefix of its payload stores is itself a valid record
   (**prefix-valid**); a stream reference is (§2's `MapBlock`-before-`Size` order), and so is a
@@ -1251,9 +1288,9 @@ container, and the choice is recorded in its writer slot.
   excludes from capture. So an in-guest writer:
   1. creates **no thread**, ever;
   2. makes every operating-system call the page needs at creation: computing the identity, opening
-     and sizing the object, mapping it, reading its own process start time and, on macOS, the clock's
-     timebase. A recorder places that call inside the window it excludes from capture, as it does for
-     the container's own creation;
+     and sizing the object, mapping it, reading its own process start time and namespaces and, on
+     macOS, the clock's timebase. A recorder places that call inside the window it excludes from
+     capture, as it does for the container's own creation;
   3. afterwards touches the page only with memory stores and loads and with reads of the monotonic
      clock (`CLOCK_MONOTONIC` through the vDSO, `mach_continuous_time` through the commpage,
      `QueryPerformanceCounter`), and only inside the seals it already makes. It stores its heartbeat at
@@ -1282,6 +1319,12 @@ container, and the choice is recorded in its writer slot.
 the version stays `1`. A reader that predates the word applies the heartbeat rule to an in-guest slot.
 It may then judge a quiet guest dead and reap its page. Readers opened after that read the file alone,
 which is safe but provisional. A reader MUST honour the word.
+
+*Compatibility of the namespace words.* They too occupy bytes that version 1 reserved as zero, and a
+pid namespace of `0` means "unstated". A page written before the words, or by a writer that cannot
+place itself, is therefore never swept: a sweeper keeps any page with a live slot that states `0`.
+Only a sweeper reads the words, so readers and writers that predate them are unaffected, and the
+version stays `1`.
 
 *Why the in-guest writer keeps the page.* The alternative was to make every in-guest writer
 file-only. That would leave the macOS recording with no reader that is correct before close: a live
