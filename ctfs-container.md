@@ -1356,9 +1356,11 @@ writer, moved into the time namespace. The sweeper's stricter proof requirements
 
 *Compatibility.* The liveness word occupies bytes that version 1 of the layout reserved as zero;
 the version stays `1`. Liveness `0` is a **legacy heartbeat on the writer's namespace-local monotonic
-clock**. A reader MAY judge its age only when both processes have known namespaces and the writer
-states the reader's own time namespace, converting it to the machine clock by subtracting the reader's offset (or comparing on the local
-clock). Otherwise it retains that writer unless its comparable process identity proves death.
+clock**. On Linux, a reader MAY judge its age only when both processes have known namespaces and
+the writer states the reader's own time namespace, converting it to the machine clock by subtracting
+the reader's offset (or comparing on the local clock). Otherwise it retains that writer unless its
+comparable process identity proves death. On macOS and Windows the namespace-local and machine
+clocks coincide, so legacy heartbeats remain directly comparable.
 Liveness `1` remains process-only; liveness `2` explicitly identifies a machine-clock heartbeat.
 An unknown liveness value is retained rather than assigned a clock or timeout rule.
 
