@@ -1027,9 +1027,17 @@ The file's footprint does not change: no sequence word is stored in the file, th
   (`fstat`/`statx`, or the handle's file id), derives the name and tries to open the object
   read-only. It **attaches** only if the object exists, its magic and version are ones it reads, the
   identity stored in the page equals the identity of the file it opened, and the page's state is
-  `live`. Anything else -- no object, a mismatch, `closed`, `abandoned` -- means "not attached", and
-  the reader follows the file alone (below). The full identity in the page, not the hash in the
-  name, is what binds the page to the file; a name collision or a reused inode is caught there.
+  `live`. Anything else -- no object, one too small for the page layout the container's root
+  directory implies, a mismatch, `creating`, `closed`, `abandoned` -- means "not attached", and the
+  reader follows the file alone (below). The full identity in the page, not the hash in the name, is
+  what binds the page to the file; a name collision or a reused inode is caught there.
+  A page still `creating` is what a creator killed between laying out the page and setting
+  `state = live` leaves ("Lifetime", "Creation"): its magic and identity can be valid while no writer
+  is registered. Such a page, like every other refused one, is refused as ordinary input: the
+  reader MUST NOT fail on it in any other way, and reads nothing from the page after it has let the
+  mapping go. (A reader that formatted its refusal from the page after unmapping it crashed on
+  exactly this page, measured 2026-11-02 in `codetracer-trace-format-nim`'s
+  `tests/test_live_page_lifetime.nim`, block 4.)
 
 #### The page: contents
 
@@ -1176,7 +1184,15 @@ torn-read rule:
 
 - It reads each in-place word it depends on twice, the second read issued after the first completes,
   and accepts a value only when both reads agree, the value is not below the last one it accepted
-  (`Size` never decreases), and every block number it resolves passes §4's checks.
+  (`Size` never decreases), and every block number it resolves passes §4's checks. When the two
+  reads disagree, a seal wrote the word between them, so it reads the pair again, a bounded number of
+  times (8 is RECOMMENDED, as for an attached reader), and otherwise keeps the last value it accepted
+  for this refresh; a member it has never accepted stays invisible to it until a later refresh. A
+  reader that gives up after one disagreeing pair keeps a stale `Size` (or misses a member at open)
+  whenever a seal lands inside that pair, which a writer that seals continuously makes routine
+  (measured 2026-11-02 on aarch64-darwin: the follower section of `codetracer-trace-format-nim`'s
+  `tests/test_keyed_b1.nim` at `daf6e37` failed 3 runs in 10, its file-only follower finding no
+  records or a node past `Size`).
 - Where the member's format can validate content it does: a chunk index's offsets are monotone and
   below the data member's `Size`; a frame decodes to its declared size (§7, "Reading the last
   chunk"); an offset table's last entry does not exceed its data member's `Size`.

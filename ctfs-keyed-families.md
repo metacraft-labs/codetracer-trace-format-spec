@@ -739,9 +739,23 @@ A reader refuses as damage a `count` above 254, or a `kind` other than 0 or 1.
 A link to a node whose block lies past the node member's `Size` as the reader last read it, or a
 descent that visits more nodes than that `Size` holds, may mean only that the reader's view is stale.
 Phase A publishes new nodes before phase B links them, but a reader can read the `Size` before phase A
-and the link after phase B. So the reader first re-reads the header and the member's entry and
-descends again, and only if it recurs is it damage. *(The benchmark's reader checked only `count`,
-`src/families/btree.rs:199-206`.)*
+and the link after phase B. So, on such a link (the header's `w0`, a `right`, or a child), the reader
+re-reads the node member's entry, *after* it has read the link, and follows the link if the `Size` it
+now holds covers it: phase A's `Size` write returns before phase B writes any link to the new nodes,
+so an entry read after the link covers it. If the link is still past the re-read `Size`, or the
+descent visits more nodes than `Size` holds, the reader re-reads the header and the member's entry
+and descends again, and only if that recurs is it damage. *(The benchmark's reader checked only
+`count`, `src/families/btree.rs:199-206`.)*
+
+*Why the entry is re-read after the link (2026-11-02).* The rule above first said only "re-reads the
+header and the member's entry and descends again". A reader that re-reads the entry first and then
+the header and the links of its second descent loses to a seal that completes in between: the second
+descent meets the newer seal's links with the older `Size`, and the reader reports damage in an
+undamaged container. A writer that seals continuously makes this routine for a file-only follower
+(`ctfs-container.md` §6, "Reading"); `codetracer-trace-format-nim`'s `tests/test_keyed_b1.nim`
+reproduces it deterministically. Re-reading after the link has no such window. A file-only follower
+that still meets a link past the re-read `Size` may have read a torn value; like its other results
+before close, its refusal is provisional (`ctfs-container.md` §6, DR-12).
 
 A lookup that finds nothing re-reads the header and descends once more before it answers "absent"
 (§5.3, "Live reader").
