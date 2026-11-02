@@ -1080,7 +1080,7 @@ entries).
 | 56 | `seal_epoch`: the page's seals, all writers ("What counts as a seal") |
 | 64 | `overflowed`: the number of mirror allocations refused for want of space |
 | 72 - 127 | zero |
-| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` liveness (`0` heartbeat, `1` process; "How a writer's liveness is judged"), `+48` pid namespace and `+56` time namespace ("Claiming a writer slot"; a pid namespace of `0` is unstated) |
+| 128 + 64·w | writer slot `w`, for `w` in `0 .. 15`: `+0` pid, `+8` process start time, `+16` heartbeat, `+24` that writer's `seal_epoch`, `+32` slot state (`0` free, `1` live, `2` finished, `3` dead), `+40` liveness (`0` legacy namespace-local heartbeat, `1` process, `2` machine-clock heartbeat; "How a writer's liveness is judged"), `+48` pid namespace and `+56` time namespace ("Claiming a writer slot"; a pid namespace of `0` is unstated) |
 | 1152 | `NextFreeBlock` |
 | 1160 + 8·f | family counter `f`, for `f` in `0 .. 15`: a dense key family whose keys are assigned live (§7a). Which family owns which counter is the producer's catalogue's choice |
 | 1288 | `mirror_bump`: the page offset of the first free mirror-slot byte. Starts at `slots_off` |
@@ -1099,11 +1099,21 @@ entries).
     zero bytes. The birth time is zero where `statx` does not report it.
   - macOS: `st_dev`, `st_ino`, then `st_birthtimespec`'s seconds and nanoseconds, packed like Linux's
     birth time.
-- **The heartbeat** is nanoseconds of the machine's monotonic clock, which every process on the
-  machine shares: `CLOCK_MONOTONIC` on Linux, `QueryPerformanceCounter` scaled to nanoseconds on
+- **The heartbeat** for a new hosted writer (`liveness = 2`) is nanoseconds of the machine's
+  monotonic clock, which every process on the machine shares: on Linux, `CLOCK_MONOTONIC` **minus the calling process's time-namespace
+  monotonic offset**, and `QueryPerformanceCounter` scaled to nanoseconds on
   Windows, `mach_continuous_time` scaled on macOS (not measured: `CKF-2` had no macOS host,
   [ctfs-keyed-families.md](ctfs-keyed-families.md) §8.3 O-10). The process start time is the operating system's
-  creation time for the pid (`page.rs:88-119`).
+  creation time for the pid (`page.rs:88-119`). On Linux, both `CLOCK_MONOTONIC` and the start time
+  reported by `/proc/<pid>/stat` are shifted into the reading process's time namespace. The
+  heartbeat therefore uses the initial time namespace's clock, so readers and writers in different
+  time namespaces sharing the page measure the same age. A writer learns its monotonic offset at
+  each slot claim and uses it for every heartbeat, including the heartbeat thread and seal stores.
+  `/proc/self/timens_offsets` describes the namespace of future children: it is usable for the
+  caller only when `/proc/self/ns/time` and `time_for_children` name the same namespace. If the
+  caller cannot establish its offset, a writer uses `process` liveness and a reader does not judge
+  heartbeat age. A kernel without time namespaces has offset zero. Offset discovery never adds
+  system calls to an in-guest writer's seals.
 - **Claiming a writer slot** is a compare-exchange of the slot's state from `0` to `1`, tried on slots
   0 to 15 in order. That is a bounded scan, not a retry loop. It is followed by the slot's liveness,
   the namespaces, the pid, the start time and the heartbeat, the heartbeat stored with release
@@ -1117,7 +1127,8 @@ entries).
   when `/proc` is not a /proc of the writer's own pid namespace (`/proc/self` does not name the
   writer's pid): there the pid and start time the writer records prove nothing to anyone. The words
   are read at each claim, never cached, because a process created into a new pid namespace would
-  inherit its parent's cached answer. Only a sweeper reads them ("A page no process opens").
+  inherit its parent's cached answer. Readers use the namespaces when judging start time
+  ("How a writer's liveness is judged"), and sweepers use both words ("A page no process opens").
   A slot is never reused within a page's life. **A page has 16 writer slots**, so a W2 or hybrid
   container has at most 15 producer processes besides its coordinator, and a 16th registration
   fails, naming the container. Whether W2 keeps its advantage beyond that is unmeasured, and a page
@@ -1239,8 +1250,9 @@ torn-read rule:
   file, every odd `seq` settled), sets `state = closed`, and removes the name (`shm_unlink`; on
   Windows the section disappears when its last handle closes). Readers still mapping the old page see
   `closed`.
-- **A writer that dies.** A writer is dead when its pid no longer names a process with its recorded
-  start time, or, when its slot's liveness is `heartbeat`, its heartbeat is older than 10 seconds
+- **A writer that dies.** A writer is dead when its comparable pid and start time no longer name
+  the recorded process, or, when its slot uses either heartbeat kind and the reader can compare
+  its clock, its heartbeat is older than 10 seconds
   ("How a writer's liveness is judged", below). Its members stop growing; the file holds
   them through that writer's last seal, by the durability rule, with nothing else needed. Under W2 a
   surviving writer or the coordinator marks the slot dead, settles the dead writer's odd `seq` words
@@ -1290,12 +1302,23 @@ torn-read rule:
 A writer hosts the page in one of three ways. It chooses one when it creates or joins the
 container, and the choice is recorded in its writer slot.
 
-- **Hosted** (the default, liveness `0`, `heartbeat`). A writer that owns its process: the recorder's
-  own process, a compiler, a test. A heartbeat thread of its own stores the monotonic clock into its
+A reader, attaching co-writer, reaper and creator replacing an abandoned page apply the same
+liveness rule. On Linux they compare the recorded start time with `/proc/<pid>/stat` **only when
+the slot states their own nonzero pid namespace and their own time namespace**. A different or
+unknown namespace does not prove the writer dead: the pid may name a different process, or the
+start time would be read on a different clock. A hosted writer is then judged by its heartbeat
+alone, on the machine clock defined above; an in-guest writer is kept alive. In particular, an
+observer in another time namespace MUST NOT abandon, unlink, replace or settle a live writer's
+page because its start time differs. This rule also applies when the observer, rather than the
+writer, moved into the time namespace. The sweeper's stricter proof requirements remain unchanged
+("A page no process opens").
+
+- **Hosted** (the default, liveness `2`, machine-clock heartbeat). A writer that owns its process:
+  the recorder's own process, a compiler, a test. A heartbeat thread of its own stores the monotonic clock into its
   slot at least once per second (every 200 ms in `codetracer-trace-format-nim`). The writer is dead
-  when its pid no longer names a process with its start time, or when its heartbeat is older than 10
-  seconds. The heartbeat is what catches a writer whose pid a reader cannot judge, such as a writer
-  in another pid namespace that shares the reader's shared memory.
+  when a comparable pid and start time no longer name it, or when its heartbeat is older than 10
+  seconds on a clock the reader can place. The heartbeat is what catches a writer whose pid a reader
+  cannot judge, such as a writer in another pid namespace that shares the reader's shared memory.
 - **In-guest** (liveness `1`, `process`). A writer that runs inside a process another tool records,
   where every thread and every system call is part of the recording. The macOS recorder's injected
   and cooperative writers are such writers: there the trace writer runs in the recorded process,
@@ -1315,8 +1338,9 @@ container, and the choice is recorded in its writer slot.
   4. is judged **by its pid and start time alone**. A reader does not apply the 10-second rule to a
      slot whose liveness is `process`, because a recorded program may make no seal for minutes (it is
      waiting, or stopped in a debugger) and is alive all that time. A dead in-guest writer is found
-     dead as soon as its pid no longer names a process with its start time; the page is then reaped
-     as under "Every writer dies".
+     dead as soon as its comparable pid and start time no longer name it; the page is then reaped
+     as under "Every writer dies". Across time namespaces its liveness remains unknown, so its page
+     is retained rather than reaped.
 
   An in-guest writer gives attached readers everything a hosted one gives them, including the
   correctness that a consumer needs before close ("Reading"). It gives up only the heartbeat's
@@ -1330,17 +1354,25 @@ container, and the choice is recorded in its writer slot.
   subject to every other rule of this section: one write per entry or record, data before the entry
   that publishes it, and the seal's order.
 
-*Compatibility.* The liveness word occupies bytes that version 1 of the layout reserved as zero, and
-`0` is the rule every page used before. Pages written by a hosted writer are therefore unchanged, and
-the version stays `1`. A reader that predates the word applies the heartbeat rule to an in-guest slot.
-It may then judge a quiet guest dead and reap its page. Readers opened after that read the file alone,
-which is safe but provisional. A reader MUST honour the word.
+*Compatibility.* The liveness word occupies bytes that version 1 of the layout reserved as zero;
+the version stays `1`. Liveness `0` is a **legacy heartbeat on the writer's namespace-local monotonic
+clock**. A reader MAY judge its age only when both processes have known namespaces and the writer
+states the reader's own time namespace, converting it to the machine clock by subtracting the reader's offset (or comparing on the local
+clock). Otherwise it retains that writer unless its comparable process identity proves death.
+Liveness `1` remains process-only; liveness `2` explicitly identifies a machine-clock heartbeat.
+An unknown liveness value is retained rather than assigned a clock or timeout rule.
+
+A reader predating the liveness word applies a heartbeat timeout even to a quiet in-guest slot;
+one predating machine-clock heartbeats may compare them on a namespace-local clock. Such readers
+must be upgraded before sharing pages across time namespaces. In the initial time namespace the
+old and machine clocks coincide. Reader refusal or loss of a page still falls back to the file,
+which is safe but provisional. A reader MUST honour the liveness word.
 
 *Compatibility of the namespace words.* They too occupy bytes that version 1 reserved as zero, and a
 pid namespace of `0` means "unstated". A page written before the words, or by a writer that cannot
 place itself, is therefore never swept: a sweeper keeps any page with a live slot that states `0`.
-Only a sweeper reads the words, so readers and writers that predate them are unaffected, and the
-version stays `1`.
+A reader that predates these namespace checks can still judge a foreign writer dead; it must be
+upgraded before sharing pages across time namespaces. The layout version stays `1`.
 
 *Why the in-guest writer keeps the page.* The alternative was to make every in-guest writer
 file-only. That would leave the macOS recording with no reader that is correct before close: a live
