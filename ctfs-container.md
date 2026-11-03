@@ -2318,3 +2318,46 @@ and the sizes outside this table are untested by every implementation.
 | 1024 | 128 | 127 | ~35 TB |
 | 2048 | 256 | 255 | ~280 TB |
 | 4096 | 512 | 511 | ~133 PB |
+
+## Implementation
+
+### Prerequisite root publication in the Nim writer
+
+The root entries described in [Root Publication](#root-publication) become visible independently.
+The seal epoch records completion; it is not a transaction barrier around the whole root. A
+producer's durability proof therefore accounts for the publication order of members that depend
+on other members, as well as the data-before-entry order within each member. Slot creation order
+does not itself establish those dependencies.
+
+The [Nim container writer](https://github.com/metacraft-labs/codetracer-trace-format-nim/blob/4ca78ed1ce0e556e639c8389f85f2c7d56313cb7/src/codetracer_ctfs/container.nim), at
+`4ca78ed`, exposes `setRootPublicationOrder(names)` for this purpose. Existing changed entries
+whose names occur in the list are published first, in list order; the other changed entries retain
+slot order. Missing or unchanged names cause no write. The producer establishes completeness of
+its prerequisites before publication. Member handles, root slots and the wire format are unchanged.
+An empty list restores the default order.
+
+The policy applies to root-member publication through `publish`, `syncEntry` and `syncAllEntries`,
+including nested calls. Names and duplicates are checked before replacing the policy. A changed
+root layout is refused while the policy is active, because a whole-root rewrite cannot preserve
+this per-entry ordering. A failed prerequisite data or root write prevents later dependent root
+entries from being published in either the file or its live coordination page.
+
+If an ordered root write fails after a before-seal observer has seen an intent, that writer is
+terminal: retrying would duplicate the pending intent. It neither completes the seal nor advances
+its epoch, and clearing the policy cannot enable a retry. Payload failures before an intent, and
+ordered writers without a before-seal observer, retain the existing retry behavior.
+
+`abortCtfs` releases the output file, live page and observer registration without publishing staged
+entries. Its result describes resource release, not completion of a recording. Teardown is
+idempotent: an abandoned writer cannot unregister a successor that reused its path. These are
+implementation APIs over the existing publication and lifetime rules; they add no format field or
+reader requirement.
+
+## Key Integration Tests
+
+- [Nim root-publication ordering tests](https://github.com/metacraft-labs/codetracer-trace-format-nim/blob/4ca78ed1ce0e556e639c8389f85f2c7d56313cb7/tests/test_root_publication_order.nim)
+  inspect every individual file-write and attached-page prefix, including an actual writer kill.
+  They also exercise failed writes, pending observed intents, recoverable pre-intent failures,
+  non-publishing abort, descriptor/page release and observer ownership when a path is reused.
+- [Nim changed-entry publication tests](https://github.com/metacraft-labs/codetracer-trace-format-nim/blob/4ca78ed1ce0e556e639c8389f85f2c7d56313cb7/tests/test_root_publication_writes_changed_entries.nim)
+  check that publication writes changed entries without rewriting the header or unchanged entries.
